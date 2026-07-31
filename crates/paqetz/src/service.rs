@@ -118,10 +118,23 @@ pub(crate) fn has_systemd() -> bool {
 /// The unit that keeps the tunnel running.
 ///
 /// `doctor` runs first, so a host that cannot work fails at start with a
-/// diagnosis rather than at run time with silence. `Restart=on-failure` covers
-/// the transient cases; a configuration error is not transient and exits
-/// non-zero, which systemd will keep retrying — hence `StartLimitBurst`, so a
-/// broken configuration stops rather than looping forever.
+/// diagnosis rather than at run time with silence.
+///
+/// # Why there is no start limit
+///
+/// The obvious arrangement — restart on failure, give up after five tries — is
+/// wrong for this, and dangerously so. The failures a tunnel actually hits at
+/// start-up are transient: the network is not up yet at boot, the peer is
+/// briefly unreachable, a route appears a moment later. Five tries at five
+/// seconds is twenty-five seconds, so a host that reboots slightly slower than
+/// expected comes back with a permanently dead tunnel — which, for a machine
+/// reached *through* that tunnel, means it does not come back at all.
+///
+/// So transient failures retry indefinitely, and the one failure that genuinely
+/// cannot fix itself is separated out by exit code instead: a configuration
+/// that does not parse exits 78, and `RestartPreventExitStatus` stops the unit
+/// on exactly that. A typo stops immediately with a clear status; a slow boot
+/// waits and recovers.
 #[must_use]
 pub(crate) fn tunnel_unit(binary: &str, config: &str) -> String {
     format!(
@@ -130,15 +143,23 @@ pub(crate) fn tunnel_unit(binary: &str, config: &str) -> String {
          Documentation=https://github.com/gitpoemer/paqetz\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
-         StartLimitIntervalSec=300\n\
-         StartLimitBurst=5\n\
+         \n\
+         # No start limit: the failures this hits at boot are transient, and a\n\
+         # unit that gives up after five tries turns a slow boot into a tunnel\n\
+         # that never comes back. The failure that cannot fix itself is caught\n\
+         # by RestartPreventExitStatus below instead.\n\
+         StartLimitIntervalSec=0\n\
          \n\
          [Service]\n\
          Type=simple\n\
          ExecStartPre={binary} doctor -c {config}\n\
          ExecStart={binary} run -c {config}\n\
          Restart=on-failure\n\
-         RestartSec=5\n\
+         RestartSec=10\n\
+         \n\
+         # 78 is what this exits with when the configuration cannot work. That\n\
+         # will still be true in ten seconds, so stop rather than loop.\n\
+         RestartPreventExitStatus=78\n\
          \n\
          # Raw sockets and a TUN device; the firewall rules need CAP_NET_ADMIN.\n\
          # Nothing else does, so nothing else is granted.\n\
@@ -265,11 +286,26 @@ mod tests {
 
     #[test]
     fn a_broken_configuration_stops_rather_than_looping() {
-        // Restart=on-failure alone would retry a config error forever, at five
-        // seconds a time, filling the journal and never succeeding.
+        // Separated by exit code, not by a retry count -- see the type docs.
         let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
-        assert!(u.contains("StartLimitBurst"), "{u}");
-        assert!(u.contains("StartLimitIntervalSec"), "{u}");
+        assert!(u.contains("RestartPreventExitStatus=78"), "{u}");
+    }
+
+    #[test]
+    fn a_transient_failure_retries_indefinitely() {
+        // The dangerous alternative: five tries at five seconds means a host
+        // that boots slowly comes back with a dead tunnel, and a host reached
+        // through that tunnel does not come back at all.
+        let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
+        assert!(u.contains("Restart=on-failure"), "{u}");
+        assert!(
+            u.contains("StartLimitIntervalSec=0"),
+            "the rate limit must be disabled: {u}"
+        );
+        assert!(
+            !u.contains("StartLimitBurst"),
+            "a burst limit would reintroduce the giving-up behaviour: {u}"
+        );
     }
 
     #[test]

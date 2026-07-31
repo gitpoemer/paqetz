@@ -179,12 +179,26 @@ enum FirewallAction {
     Status,
 }
 
+/// Exit code for a configuration that cannot work, borrowed from `sysexits.h`.
+///
+/// Distinguished from every other failure so the service manager can tell the
+/// two apart. A malformed configuration will be just as malformed in five
+/// seconds, so restarting is pointless; a peer that is unreachable because the
+/// network has not finished coming up will not be, so restarting is the whole
+/// point. Returning the same code for both forces a choice between a service
+/// that loops forever on a typo and one that gives up on a boot race.
+const EXIT_CONFIG: u8 = 78;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
-            ExitCode::FAILURE
+            if e.downcast_ref::<config::Error>().is_some() {
+                ExitCode::from(EXIT_CONFIG)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
