@@ -7,7 +7,7 @@
 //! buffer sizes, and no `role` field — which side initiates follows from
 //! whether a peer has an endpoint.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 
 use paqetz_core::{PrivateKey, PublicKey};
@@ -18,6 +18,8 @@ use serde::Deserialize;
 pub(crate) struct Config {
     /// This end's settings.
     pub(crate) interface: Interface,
+    /// An optional SOCKS5 front end, for debugging (phase 4).
+    pub(crate) socks5: Option<Socks5>,
     /// The peer. Exactly one, for now — the peer *table* exists so that
     /// supporting more is a configuration change rather than a rewrite, but a
     /// second entry is rejected until the routing work in phase 2 lands.
@@ -53,6 +55,23 @@ pub(crate) struct Interface {
     pub(crate) datapath: Datapath,
     /// Which transmit path to use.
     pub(crate) transmit: TransmitPath,
+}
+
+/// The SOCKS5 debugging front end.
+///
+/// Off unless configured. It is a convenience for pointing one program at the
+/// tunnel without touching the routing table, and it is the one place in the
+/// design that holds per-flow state — so it is opt-in rather than assumed.
+#[derive(Debug, Clone)]
+pub(crate) struct Socks5 {
+    /// Where to listen. Loopback unless there is a deliberate reason otherwise.
+    pub(crate) listen: SocketAddr,
+    /// The firewall mark stamped on its outbound connections.
+    pub(crate) mark: u32,
+    /// The routing table the policy rule points at.
+    pub(crate) table: u32,
+    /// Credentials clients must present, if any.
+    pub(crate) credentials: Option<(String, String)>,
 }
 
 /// How packets move between the device and the wire.
@@ -173,6 +192,22 @@ impl Bits for u32 {
 struct RawConfig {
     interface: RawInterface,
     peer: RawPeer,
+    #[serde(default)]
+    socks5: Option<RawSocks5>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSocks5 {
+    listen: String,
+    #[serde(default)]
+    mark: Option<u32>,
+    #[serde(default)]
+    table: Option<u32>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +408,44 @@ impl Config {
             }
         };
 
+        let socks5 = match raw.socks5 {
+            None => None,
+            Some(r) => {
+                let listen: SocketAddr = r
+                    .listen
+                    .parse()
+                    .map_err(|e| invalid("socks5.listen", format!("{:?}: {e}", r.listen)))?;
+                let credentials = match (r.username, r.password) {
+                    (None, None) => None,
+                    (Some(u), Some(p)) => Some((u, p)),
+                    _ => {
+                        return Err(invalid(
+                            "socks5",
+                            "username and password must be given together, or neither",
+                        ));
+                    }
+                };
+                // Non-zero by default: a mark of zero means the connections are
+                // not steered anywhere, so the proxy would work perfectly and
+                // send everything out the ordinary route -- the failure that is
+                // hardest to notice, because nothing appears wrong.
+                let mark = r.mark.unwrap_or(0x51);
+                if mark == 0 {
+                    return Err(invalid(
+                        "socks5.mark",
+                        "zero would leave connections on the host's normal route \
+                         rather than steering them into the tunnel",
+                    ));
+                }
+                Some(Socks5 {
+                    listen,
+                    mark,
+                    table: r.table.unwrap_or(51),
+                    credentials,
+                })
+            }
+        };
+
         let listen_port = raw.interface.listen_port.unwrap_or(0);
         if endpoint.is_none() && listen_port == 0 {
             return Err(invalid(
@@ -383,6 +456,7 @@ impl Config {
         }
 
         Ok(Self {
+            socks5,
             interface: Interface {
                 private_key,
                 address,
@@ -494,6 +568,45 @@ tunnel_address = "10.7.0.2"
         assert_eq!(c.interface.profile.name, "linux-6");
         assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Midstream);
         assert!(c.interface.manage_firewall);
+    }
+
+    #[test]
+    fn socks5_is_off_unless_configured() {
+        assert!(Config::parse(CLIENT).expect("parse").socks5.is_none());
+    }
+
+    #[test]
+    fn a_socks5_section_is_read_with_sensible_defaults() {
+        let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\n");
+        let s = Config::parse(&text).expect("parse").socks5.expect("socks5");
+        assert_eq!(s.listen.port(), 1080);
+        assert!(s.listen.ip().is_loopback());
+        assert_ne!(s.mark, 0, "a zero mark would steer nothing");
+        assert!(s.credentials.is_none());
+    }
+
+    #[test]
+    fn a_zero_socks5_mark_is_refused() {
+        // It would produce a proxy that works and quietly bypasses the tunnel.
+        let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\nmark = 0\n");
+        let err = Config::parse(&text).expect_err("must be rejected");
+        assert!(err.to_string().contains("normal route"), "got: {err}");
+    }
+
+    #[test]
+    fn half_a_credential_pair_is_refused() {
+        for half in ["username = \"a\"", "password = \"b\""] {
+            let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\n{half}\n");
+            assert!(
+                Config::parse(&text).is_err(),
+                "{half} alone should be rejected"
+            );
+        }
+        let both = format!(
+            "{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\nusername = \"a\"\npassword = \"b\"\n"
+        );
+        let s = Config::parse(&both).expect("parse").socks5.expect("socks5");
+        assert_eq!(s.credentials, Some(("a".to_owned(), "b".to_owned())));
     }
 
     #[test]

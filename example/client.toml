@@ -57,3 +57,24 @@ tunnel_address = "10.7.0.1"
 # stop the kernel resetting the flow, so turning this off means applying the
 # output of `paqetz firewall plan` yourself.
 #manage_firewall = true
+
+# --- Optional SOCKS5 front end (debugging) ---
+#
+# Off unless this section is present. It lets one program be pointed at the
+# tunnel without touching the routing table -- useful for `curl` and for a
+# proxy-aware application, while the rest of the host carries on as normal.
+#
+# No userspace TCP stack is involved: connections are ordinary kernel sockets
+# with SO_MARK set, and a policy route steers marked traffic into the tunnel.
+# paqetz installs and removes that route itself.
+#
+# This is the one place in the design that holds per-flow state, which is why it
+# is opt-in and described as a debugging convenience rather than the way to run
+# this. L3 -- routing traffic through the device -- is the production path.
+#
+#[socks5]
+#listen = "127.0.0.1:1080"
+#mark = 0x51        # firewall mark stamped on outbound connections
+#table = 51         # routing table the policy rule points at
+#username = "..."   # optional; both or neither
+#password = "..."

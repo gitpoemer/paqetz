@@ -96,6 +96,9 @@ datapath = "${DATAPATH}"
 public_key = "${SRV_PUB}"
 endpoint = "${SRV_OUTER}:${PORT}"
 tunnel_address = "${SRV_INNER}"
+
+[socks5]
+listen = "127.0.0.1:1080"
 EOF
 
 # --- namespaces -------------------------------------------------------------
@@ -296,6 +299,61 @@ else
     bad "a fragmented UDP datagram does not round-trip"
 fi
 
+# --- the SOCKS5 front end ---------------------------------------------------
+log "SOCKS5 front end"
+cat > "${WORK}/socks_client.py" <<'PYEOF'
+"""A minimal SOCKS5 client: CONNECT, then echo a payload through it."""
+import socket
+import sys
+
+proxy_host, proxy_port, target, port, size = (
+    sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+)
+s = socket.create_connection((proxy_host, proxy_port), timeout=10)
+s.settimeout(10)
+
+s.sendall(bytes([5, 1, 0]))                       # greeting, no auth
+if s.recv(2) != bytes([5, 0]):
+    sys.exit("greeting refused")
+
+octets = bytes(int(x) for x in target.split("."))
+s.sendall(bytes([5, 1, 0, 1]) + octets + port.to_bytes(2, "big"))
+reply = s.recv(4)
+if len(reply) < 2 or reply[1] != 0:
+    sys.exit(f"connect refused, reply code {reply[1] if len(reply) > 1 else '?'}")
+s.recv(6)                                          # bound address and port
+
+payload = bytes((i * 3 + 1) & 0xFF for i in range(size))
+s.sendall(payload)
+s.shutdown(socket.SHUT_WR)
+got = bytearray()
+while len(got) < size:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    got += chunk
+if bytes(got) != payload:
+    sys.exit(f"mismatch: sent {size}, got {len(got)}")
+PYEOF
+
+# The echo server from the TCP section is still listening.
+sudo ip netns exec "${SRV_NS}" python3 "${WORK}/echo_server.py" >/dev/null 2>&1 &
+sleep 1
+
+if timeout 20 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/socks_client.py" 127.0.0.1 1080 "${SRV_INNER}" 7777 4096 \
+        >/dev/null 2>&1; then
+    ok "a connection through the SOCKS5 front end reaches the tunnel"
+else
+    bad "the SOCKS5 front end does not reach the tunnel"
+fi
+
+if sudo ip netns exec "${CLI_NS}" ip rule show 2>/dev/null | grep -q "fwmark 0x51"; then
+    ok "the policy route steering marked traffic is installed"
+else
+    bad "the policy route was not installed"
+fi
+
 # --- the wire looks like TCP ------------------------------------------------
 log "what the wire looks like"
 sudo ip netns exec "${SRV_NS}" timeout 4 \
@@ -436,6 +494,12 @@ if sudo ip netns exec "${SRV_NS}" nft list table ip paqetz >/dev/null 2>&1; then
     bad "firewall rules were left behind after shutdown"
 else
     ok "firewall rules were removed on shutdown"
+fi
+
+if sudo ip netns exec "${CLI_NS}" ip rule show 2>/dev/null | grep -q "fwmark 0x51"; then
+    bad "the policy route was left behind after shutdown"
+else
+    ok "the policy route was removed on shutdown"
 fi
 
 # --- results ----------------------------------------------------------------

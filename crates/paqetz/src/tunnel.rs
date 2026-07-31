@@ -291,6 +291,12 @@ impl Tunnel {
         Ok(())
     }
 
+    /// A handle to the flag that stops every loop, including any front end
+    /// started alongside the tunnel.
+    pub(crate) fn running_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.running)
+    }
+
     /// Asks the loops to stop.
     pub(crate) fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);

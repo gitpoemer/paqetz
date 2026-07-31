@@ -140,6 +140,9 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // name is only settled here: the initiating side takes an ephemeral one.
     // Scoping the rules to anything else — the peer's port, say — would leave
     // the kernel free to reset the very traffic they exist to protect.
+    let socks5 = cfg.socks5.clone();
+    let device = cfg.interface.device.clone();
+
     let tunnel = Tunnel::start(cfg)?;
     let port = tunnel.local_port();
     println!("paqetz: outer port {port}");
@@ -163,7 +166,39 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // The SOCKS5 front end, if asked for. Started after the device exists,
+    // since the policy route it needs points at that device.
+    let policy = match socks5 {
+        None => None,
+        Some(cfg) => {
+            let policy = paqetz_net4::route::Policy {
+                mark: cfg.mark,
+                table: cfg.table,
+            };
+            policy.apply(&device)?;
+
+            let running = tunnel.running_flag();
+            let listener = paqetz_net4::Config {
+                listen: cfg.listen,
+                mark: cfg.mark,
+                credentials: cfg.credentials,
+            };
+            std::thread::Builder::new()
+                .name("socks5-accept".to_owned())
+                .spawn(move || {
+                    if let Err(e) = paqetz_net4::serve(listener, running) {
+                        eprintln!("socks5: {e}");
+                    }
+                })?;
+            Some(policy)
+        }
+    };
+
     let result = tunnel.run();
+
+    if let Some(policy) = policy {
+        policy.revert(&device);
+    }
 
     // Leave the host as we found it, whether or not the tunnel ended cleanly.
     if let Some(fw) = fw
