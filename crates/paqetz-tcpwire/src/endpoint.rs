@@ -32,6 +32,31 @@ use crate::profile::OsProfile;
 use crate::segment::{self, Fields, Kind, Segment};
 use crate::{Error, Result};
 
+/// How the synthetic conversation begins.
+///
+/// This is a real trade-off, and which way it should go depends on the network,
+/// not on first principles. See `docs/decisions/D14-carrier-mode.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Carrier {
+    /// Never emit a SYN. Both ends derive each other's initial sequence number
+    /// from the tunnel handshake, so sequencing is exact from the first packet
+    /// without any segment being exchanged to establish it.
+    ///
+    /// This is paqet's behaviour and the default, for two reasons. A middlebox
+    /// that builds flow state on SYN never creates any, so the flow is never
+    /// inspected; and the responder never answers an unauthenticated segment,
+    /// so the port stays indistinguishable from filtered.
+    #[default]
+    Midstream,
+
+    /// Emit a real SYN / SYN+ACK / ACK exchange before any data.
+    ///
+    /// Preferable against a middlebox that *drops* mid-stream flows rather than
+    /// ignoring them. Costs a round trip at startup, and means the responder
+    /// answers a segment it cannot authenticate — see the decision record.
+    Handshake,
+}
+
 /// Which side of the synthetic connection this endpoint is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -56,6 +81,37 @@ pub enum Phase {
     Closed,
 }
 
+/// Everything needed to construct an [`Endpoint`].
+///
+/// `isn`, `peer_isn`, and `ts_base` are supplied by the caller rather than
+/// generated here, so this crate needs no RNG and stays deterministic under
+/// test. In [`Carrier::Midstream`] they are derived from the tunnel handshake,
+/// which is what lets both ends agree on sequence numbers without exchanging a
+/// SYN.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// Our address and port.
+    pub local: (Ipv4Addr, u16),
+    /// The peer's address and port.
+    pub remote: (Ipv4Addr, u16),
+    /// Fingerprint to present.
+    pub profile: OsProfile,
+    /// Which side of the conversation we are.
+    pub role: Role,
+    /// Whether to perform a synthetic handshake.
+    pub carrier: Carrier,
+    /// Our initial sequence number.
+    pub isn: u32,
+    /// The peer's initial sequence number.
+    ///
+    /// Required under [`Carrier::Midstream`]. Ignored under
+    /// [`Carrier::Handshake`], where it is learned from the peer's SYN.
+    pub peer_isn: u32,
+    /// Offset added to the clock to form the TCP timestamp, so the timestamp
+    /// clock does not start near zero and reveal process start.
+    pub ts_base: u32,
+}
+
 /// One end of a synthetic TCP conversation with one peer.
 ///
 /// This is per-peer state, and there is no per-flow state anywhere (D4): a
@@ -66,6 +122,7 @@ pub struct Endpoint {
     remote: (Ipv4Addr, u16),
     profile: OsProfile,
     role: Role,
+    carrier: Carrier,
     phase: Phase,
 
     local_isn: u32,
@@ -92,32 +149,31 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Creates an endpoint.
-    ///
-    /// `isn` and `ts_base` should be random; the caller supplies them so this
-    /// crate stays free of an RNG and remains deterministic under test.
     #[must_use]
-    pub const fn new(
-        local: (Ipv4Addr, u16),
-        remote: (Ipv4Addr, u16),
-        profile: OsProfile,
-        role: Role,
-        isn: u32,
-        ts_base: u32,
-    ) -> Self {
+    pub const fn new(cfg: Config) -> Self {
+        // Under Midstream there is no SYN to send, none to wait for, and none
+        // to account for in the sequence space: both ends already know where
+        // the other's numbering starts.
+        let midstream = matches!(cfg.carrier, Carrier::Midstream);
         Self {
-            local,
-            remote,
-            profile,
-            role,
-            phase: Phase::Idle,
-            local_isn: isn,
-            remote_isn: None,
+            local: cfg.local,
+            remote: cfg.remote,
+            profile: cfg.profile,
+            role: cfg.role,
+            carrier: cfg.carrier,
+            phase: if midstream {
+                Phase::Established
+            } else {
+                Phase::Idle
+            },
+            local_isn: cfg.isn,
+            remote_isn: if midstream { Some(cfg.peer_isn) } else { None },
             sent: 0,
             received: 0,
-            ts_base,
+            ts_base: cfg.ts_base,
             peer_ts_val: 0,
             counter: 0,
-            syn_counted: false,
+            syn_counted: midstream,
         }
     }
 
@@ -149,6 +205,12 @@ impl Endpoint {
         self.remote = remote;
     }
 
+    /// The carrier mode in force.
+    #[must_use]
+    pub const fn carrier(&self) -> Carrier {
+        self.carrier
+    }
+
     /// The profile in force.
     #[must_use]
     pub const fn profile(&self) -> &OsProfile {
@@ -173,13 +235,17 @@ impl Endpoint {
 
     /// Writes the segment that should be sent next for the handshake, if any.
     ///
-    /// Returns `Ok(None)` when the handshake needs nothing from this side right
-    /// now. The caller drives retransmission: a lost SYN simply means calling
+    /// Always `Ok(None)` under [`Carrier::Midstream`], which is the point of
+    /// that mode. Otherwise returns `Ok(None)` when the handshake needs nothing
+    /// from this side right now. The caller drives retransmission: a lost SYN simply means calling
     /// this again, which is why the phase does not advance on a repeat.
     ///
     /// # Errors
     /// Returns [`Error::Short`] if `out` cannot hold the segment.
     pub fn handshake(&mut self, out: &mut [u8], now: u64) -> Result<Option<usize>> {
+        if matches!(self.carrier, Carrier::Midstream) {
+            return Ok(None);
+        }
         let kind = match (self.role, self.phase) {
             (Role::Initiator, Phase::Idle | Phase::SynSent) => Kind::Syn,
             (Role::Responder, Phase::SynReceived) => Kind::SynAck,
@@ -374,12 +440,37 @@ mod tests {
     const CLIENT: (Ipv4Addr, u16) = (Ipv4Addr::new(192, 168, 1, 10), 41000);
     const SERVER: (Ipv4Addr, u16) = (Ipv4Addr::new(203, 0, 113, 5), 9999);
 
+    const CLIENT_ISN: u32 = 1_000_000;
+    const SERVER_ISN: u32 = 9_000_000;
+
+    fn cfg(role: Role, carrier: Carrier, profile: OsProfile) -> Config {
+        let initiator = matches!(role, Role::Initiator);
+        Config {
+            local: if initiator { CLIENT } else { SERVER },
+            remote: if initiator { SERVER } else { CLIENT },
+            profile,
+            role,
+            carrier,
+            isn: if initiator { CLIENT_ISN } else { SERVER_ISN },
+            peer_isn: if initiator { SERVER_ISN } else { CLIENT_ISN },
+            ts_base: if initiator { 5_000 } else { 7_000 },
+        }
+    }
+
+    /// A handshaking client, since most tests here exercise the handshake path.
     fn client() -> Endpoint {
-        Endpoint::new(CLIENT, SERVER, LINUX_6, Role::Initiator, 1_000_000, 5_000)
+        Endpoint::new(cfg(Role::Initiator, Carrier::Handshake, LINUX_6))
     }
 
     fn server() -> Endpoint {
-        Endpoint::new(SERVER, CLIENT, LINUX_6, Role::Responder, 9_000_000, 7_000)
+        Endpoint::new(cfg(Role::Responder, Carrier::Handshake, LINUX_6))
+    }
+
+    fn midstream_pair() -> (Endpoint, Endpoint) {
+        (
+            Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6)),
+            Endpoint::new(cfg(Role::Responder, Carrier::Midstream, LINUX_6)),
+        )
     }
 
     /// Emits into a scratch buffer and parses the result back.
@@ -503,7 +594,11 @@ mod tests {
 
     #[test]
     fn sequence_numbers_wrap_like_real_tcp() {
-        let mut c = Endpoint::new(CLIENT, SERVER, LINUX_6, Role::Initiator, u32::MAX - 5, 0);
+        let mut c = Endpoint::new(Config {
+            isn: u32::MAX - 5,
+            ts_base: 0,
+            ..cfg(Role::Initiator, Carrier::Handshake, LINUX_6)
+        });
         let mut s = server();
         connect(&mut c, &mut s);
 
@@ -744,14 +839,99 @@ mod tests {
 
     #[test]
     fn a_profile_without_timestamps_omits_and_ignores_them() {
-        let mut c = Endpoint::new(CLIENT, SERVER, WINDOWS_11, Role::Initiator, 1, 999);
-        let mut s = Endpoint::new(SERVER, CLIENT, WINDOWS_11, Role::Responder, 2, 888);
+        let mut c = Endpoint::new(cfg(Role::Initiator, Carrier::Handshake, WINDOWS_11));
+        let mut s = Endpoint::new(cfg(Role::Responder, Carrier::Handshake, WINDOWS_11));
         connect(&mut c, &mut s);
 
         let packet = emitted(|b| c.data(b"x", b, 1234));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.ts_val, None);
         assert!(s.on_receive(&seg).is_some());
+    }
+
+    #[test]
+    fn midstream_is_the_default_and_emits_no_syn() {
+        assert_eq!(Carrier::default(), Carrier::Midstream);
+
+        let (mut c, _s) = midstream_pair();
+        let mut buf = vec![0u8; 2048];
+        assert_eq!(
+            c.handshake(&mut buf, 0).expect("handshake"),
+            None,
+            "midstream must never put a SYN on the wire"
+        );
+        assert!(c.is_established(), "and data may flow immediately");
+    }
+
+    #[test]
+    fn midstream_sequencing_is_exact_from_the_very_first_packet() {
+        // The property that makes a handshake unnecessary: both ends already
+        // know where the other's numbering starts, so the first data segment is
+        // already consistent.
+        let (mut c, mut s) = midstream_pair();
+
+        let packet = emitted(|b| c.data(b"first ever packet", b, 0));
+        let seg = parse_ipv4(&packet).expect("parse");
+        assert_eq!(seg.seq, CLIENT_ISN);
+        assert_eq!(
+            seg.ack, SERVER_ISN,
+            "acknowledging the peer from packet one"
+        );
+
+        s.on_receive(&seg);
+        let reply = emitted(|b| s.data(b"reply", b, 1));
+        let reply_seg = parse_ipv4(&reply).expect("parse");
+        assert_eq!(reply_seg.seq, SERVER_ISN);
+        assert_eq!(reply_seg.ack, CLIENT_ISN.wrapping_add(17));
+    }
+
+    #[test]
+    fn midstream_stays_consistent_over_a_long_exchange() {
+        let (mut c, mut s) = midstream_pair();
+        for i in 0..500u32 {
+            let payload = i.to_be_bytes();
+            let packet = emitted(|b| c.data(&payload, b, u64::from(i)));
+            s.on_receive(&parse_ipv4(&packet).expect("parse"));
+            let reply = emitted(|b| s.data(&payload, b, u64::from(i)));
+            c.on_receive(&parse_ipv4(&reply).expect("parse"));
+        }
+        assert_eq!(c.next_ack(), Some(s.next_seq()));
+        assert_eq!(s.next_ack(), Some(c.next_seq()));
+    }
+
+    #[test]
+    fn midstream_never_answers_an_unauthenticated_segment() {
+        // The probe-resistance property. A stranger's SYN must produce nothing:
+        // replying would confirm to a prober that something is listening, which
+        // is exactly what the tunnel handshake's silence is designed to avoid.
+        let (_c, mut s) = midstream_pair();
+        let mut buf = vec![0u8; 2048];
+
+        let n = segment::emit(
+            Kind::Syn,
+            &LINUX_6,
+            &Fields {
+                src: (Ipv4Addr::new(198, 51, 100, 9), 1234),
+                dst: SERVER,
+                seq: 42,
+                ack: 0,
+                window: 64240,
+                ip_id: 7,
+                ts_val: 1,
+                ts_ecr: 0,
+            },
+            &[],
+            &mut buf,
+        )
+        .expect("emit probe");
+        let probe = parse_ipv4(&buf[..n]).expect("parse");
+
+        assert!(s.on_receive(&probe).is_none());
+        assert_eq!(
+            s.handshake(&mut buf, 0).expect("handshake"),
+            None,
+            "a probe must not draw a SYN+ACK"
+        );
     }
 
     #[test]

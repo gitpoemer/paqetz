@@ -17,12 +17,14 @@
 //!
 //! Fixed, because each was a signature:
 //!
-//! - **A synthetic handshake.** paqet's flows began mid-stream with `PSH,ACK`
-//!   and never carried a SYN, so every flow was permanently half-open from the
-//!   network's point of view. See [`endpoint`].
 //! - **Byte-accurate sequencing.** paqet computed `seq` from a packet counter,
 //!   unrelated to the bytes it had sent. Here `seq` and `ack` are exactly the
-//!   bytes sent and received.
+//!   bytes sent and received — and, crucially, this holds whether or not a
+//!   handshake is performed. Under the default [`Carrier::Midstream`] both ends
+//!   derive each other's initial sequence number from the tunnel handshake, so
+//!   the flow is coherent from its first packet without a SYN ever being sent.
+//!   A synthetic SYN exchange is available via [`Carrier::Handshake`]; see
+//!   `docs/decisions/D14-carrier-mode.md` for why it is not the default.
 //! - **No flag cycling.** paqet cycled TCP flags from a configured list because
 //!   its sequence numbers were invented and no combination was more coherent
 //!   than another. With a real connection underneath, random flags would now
@@ -39,7 +41,7 @@ pub mod endpoint;
 pub mod profile;
 pub mod segment;
 
-pub use endpoint::{Endpoint, Phase, Role};
+pub use endpoint::{Carrier, Config, Endpoint, Phase, Role};
 pub use profile::OsProfile;
 pub use segment::{Kind, Segment};
 
