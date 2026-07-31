@@ -103,6 +103,10 @@ pub(crate) enum Error {
     /// The carrier rejected something.
     #[error("carrier: {0}")]
     Wire(#[from] paqetz_tcpwire::Error),
+
+    /// A configuration was valid but names something not yet built.
+    #[error("{0}")]
+    Unsupported(&'static str),
 }
 
 /// Result alias for this module.
@@ -121,6 +125,17 @@ impl Tunnel {
     /// # Errors
     /// Returns the first failure, with context describing what was attempted.
     pub(crate) fn start(cfg: Config) -> Result<Self> {
+        if matches!(cfg.interface.carrier, paqetz_tcpwire::Carrier::Handshake) {
+            // The carrier can emit SYN/SYN+ACK/ACK, but nothing here drives that
+            // exchange or retries a lost SYN yet. Refusing is better than
+            // starting a tunnel whose first data segment fails with
+            // "not established". See docs/decisions/D14-carrier-mode.md.
+            return Err(Error::Unsupported(
+                "carrier = \"handshake\" is not implemented yet; \
+                 use the default \"midstream\"",
+            ));
+        }
+
         let local_public =
             paqetz_core::keys::public_from_private(cfg.interface.private_key.as_bytes());
 
@@ -185,6 +200,16 @@ impl Tunnel {
             started: Instant::now(),
             running: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// The outer port this end actually receives on.
+    ///
+    /// Not known from the configuration alone: the initiating side takes an
+    /// ephemeral port at start-up, and the firewall rules have to name the port
+    /// the kernel would otherwise send resets from — which is this one, not the
+    /// peer's.
+    pub(crate) const fn local_port(&self) -> u16 {
+        self.local.1
     }
 
     /// Milliseconds since the tunnel started.
@@ -411,18 +436,28 @@ impl Tunnel {
         })?;
         let (session, msg2) = pending.accept(index, now)?;
 
-        // We learn our own outer address from where the peer sent to.
-        let local = (seg.dst.0, seg.dst.1);
-        let mut carrier = Carrier::new(paqetz_tcpwire::Config {
-            local,
-            remote: seg.src,
-            profile: self.cfg.interface.profile,
-            role: Role::Responder,
-            carrier: self.cfg.interface.carrier,
-            isn: isn_r,
-            peer_isn: isn_i,
-            ts_base,
-        });
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // As on the initiating side: a rekey must not restart the conversation
+        // underneath it, so the carrier is built once and then kept.
+        if state.carrier.is_none() {
+            // We learn our own outer address from where the peer sent to.
+            state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
+                local: (seg.dst.0, seg.dst.1),
+                remote: seg.src,
+                profile: self.cfg.interface.profile,
+                role: Role::Responder,
+                carrier: self.cfg.interface.carrier,
+                isn: isn_r,
+                peer_isn: isn_i,
+                ts_base,
+            }));
+        }
+
+        let Some(carrier) = state.carrier.as_mut() else {
+            return Ok(());
+        };
+        carrier.set_remote(seg.src);
         // Fold in the segment that carried msg1, so our acknowledgement counts
         // the bytes the peer actually sent.
         carrier.on_receive(seg);
@@ -430,13 +465,10 @@ impl Tunnel {
         let written = carrier.data(&msg2, reply, now)?;
         let dst = seg.src.0;
 
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.session = Some(session);
-            state.pending = None;
-            state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
-            state.carrier = Some(carrier);
-        }
+        state.session = Some(session);
+        state.pending = None;
+        state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
+        drop(state);
 
         let Some(out) = reply.get(..written) else {
             return Ok(());
@@ -576,24 +608,33 @@ impl Tunnel {
             epoch,
         )?;
 
-        let (isn_i, isn_r, ts_base) =
-            noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
-        let mut carrier = Carrier::new(paqetz_tcpwire::Config {
-            local: self.local,
-            remote: (*peer.ip(), peer.port()),
-            profile: self.cfg.interface.profile,
-            role: Role::Initiator,
-            carrier: self.cfg.interface.carrier,
-            isn: isn_i,
-            peer_isn: isn_r,
-            ts_base,
-        });
+        // The carrier is per *connection*, not per session. A rekey replaces
+        // the keys above it and must leave the conversation underneath
+        // untouched: rebuilding it would restart the sequence numbering on an
+        // unchanged five-tuple every couple of minutes, which is exactly the
+        // discontinuity byte-accurate sequencing exists to avoid.
+        if state.carrier.is_none() {
+            let (isn_i, isn_r, ts_base) =
+                noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
+            state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
+                local: self.local,
+                remote: (*peer.ip(), peer.port()),
+                profile: self.cfg.interface.profile,
+                role: Role::Initiator,
+                carrier: self.cfg.interface.carrier,
+                isn: isn_i,
+                peer_isn: isn_r,
+                ts_base,
+            }));
+        }
 
+        let Some(carrier) = state.carrier.as_mut() else {
+            return Ok(());
+        };
         let written = carrier.data(&msg1, frame, now)?;
         let dst = *peer.ip();
 
         state.pending = Some(initiator);
-        state.carrier = Some(carrier);
         state.last_handshake = now;
         drop(state);
 

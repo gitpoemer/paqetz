@@ -107,26 +107,7 @@ fn pubkey() -> Result<(), Box<dyn std::error::Error>> {
 
 fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(path)?;
-
-    // The rules are load-bearing, not advisory (D9): without them the kernel
-    // resets the flow. Installing them here means one less way for a setup to
-    // fail silently.
-    let fw = if cfg.interface.manage_firewall {
-        let port = effective_port(&cfg);
-        match Firewall::detect(port) {
-            Ok(fw) => {
-                fw.apply()?;
-                Some(fw)
-            }
-            Err(e) => {
-                eprintln!("warning: {e}");
-                eprintln!("the tunnel will run, but the kernel may reset it");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let manage_firewall = cfg.interface.manage_firewall;
 
     tunnel::install_signal_handlers();
 
@@ -142,7 +123,34 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
-    let result = Tunnel::start(cfg).and_then(Tunnel::run);
+    // Sockets and the device come up first, because the port the rules must
+    // name is only settled here: the initiating side takes an ephemeral one.
+    // Scoping the rules to anything else — the peer's port, say — would leave
+    // the kernel free to reset the very traffic they exist to protect.
+    let tunnel = Tunnel::start(cfg)?;
+    let port = tunnel.local_port();
+    println!("paqetz: outer port {port}");
+
+    // The rules are load-bearing, not advisory (D9): without them the kernel
+    // resets the flow. Installing them here means one less way for a setup to
+    // fail silently.
+    let fw = if manage_firewall {
+        match Firewall::detect(port) {
+            Ok(fw) => {
+                fw.apply()?;
+                Some(fw)
+            }
+            Err(e) => {
+                eprintln!("warning: {e}");
+                eprintln!("the tunnel will run, but the kernel may reset it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = tunnel.run();
 
     // Leave the host as we found it, whether or not the tunnel ended cleanly.
     if let Some(fw) = fw
@@ -159,7 +167,11 @@ fn firewall(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(path)?;
-    let port = effective_port(&cfg);
+    let port = effective_port(&cfg).ok_or(
+        "this end takes an ephemeral outer port at start-up, so its rules \
+         cannot be named ahead of time. `run` installs them itself; to manage \
+         them by hand, set interface.listen_port to a fixed port.",
+    )?;
 
     // `plan` must work on a host with neither tool installed — printing what to
     // run by hand is exactly what it is for.
@@ -182,19 +194,16 @@ fn firewall(
     Ok(())
 }
 
-/// The outer port the firewall rules must cover.
+/// The outer port the firewall rules must cover, when it is knowable.
 ///
-/// For the side that waits, that is its listen port. For the side that
-/// initiates, the port is ephemeral and chosen at start-up, so the rules cannot
-/// be scoped to it ahead of time — the peer's port is used instead, which is
-/// what its own kernel would otherwise reset.
-const fn effective_port(cfg: &Config) -> u16 {
-    if cfg.interface.listen_port != 0 {
-        cfg.interface.listen_port
-    } else if let Some(endpoint) = cfg.peer.endpoint {
-        endpoint.port()
+/// The rules have to name the port *this* kernel would send resets from, which
+/// is the port we receive on — not the peer's. An end that takes an ephemeral
+/// port does not know it until start-up, so there is nothing to return.
+const fn effective_port(cfg: &Config) -> Option<u16> {
+    if cfg.interface.listen_port == 0 {
+        None
     } else {
-        0
+        Some(cfg.interface.listen_port)
     }
 }
 
@@ -237,14 +246,15 @@ tunnel_address = "10.7.0.2"
 "#,
         )
         .expect("parse");
-        assert_eq!(effective_port(&cfg), 9999);
+        assert_eq!(effective_port(&cfg), Some(9999));
     }
 
     #[test]
-    fn the_initiator_scopes_rules_to_the_peers_port() {
-        // Our own port is ephemeral and not known until start-up, so it cannot
-        // be used; the traffic the kernel would reset is addressed to the
-        // peer's port anyway.
+    fn an_ephemeral_end_has_no_port_to_plan_for() {
+        // The rules must name the port *this* kernel would send resets from.
+        // With an ephemeral port that is unknown until start-up, so `firewall`
+        // says so rather than printing rules for the peer's port, which would
+        // protect nothing.
         let cfg = Config::parse(
             r#"
 [interface]
@@ -258,6 +268,6 @@ tunnel_address = "10.7.0.1"
 "#,
         )
         .expect("parse");
-        assert_eq!(effective_port(&cfg), 9999);
+        assert_eq!(effective_port(&cfg), None);
     }
 }
