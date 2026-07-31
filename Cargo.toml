@@ -26,12 +26,16 @@ paqetz-fw = { path = "crates/paqetz-fw" }
 paqetz-net4 = { path = "crates/paqetz-net4" }
 
 # Crypto — one suite, no agility (D1).
-chacha20poly1305 = { version = "0.10", default-features = false }
-chacha20 = { version = "0.9", default-features = false }
-x25519-dalek = { version = "2", default-features = false }
-blake2 = { version = "0.10", default-features = false }
-rand_core = { version = "0.6", default-features = false }
-zeroize = { version = "1", default-features = false }
+# `snow` supplies the Noise IK handshake and the stateless transport cipher,
+# which is why chacha20poly1305 is not a direct dependency: the AEAD is reached
+# through the negotiated Noise suite. `chacha20` is used only for the header
+# mask (D7), `blake2` only for key derivation and mac1.
+snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+chacha20 = "0.9"
+blake2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
 
 # Syscalls. No async runtime on the datapath (§8.3, thread-per-core).
 libc = "0.2"
