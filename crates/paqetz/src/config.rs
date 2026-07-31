@@ -65,6 +65,17 @@ pub(crate) struct Interface {
     ///
     /// The client side of the same arrangement.
     pub(crate) route_all: bool,
+    /// Install a policy route so sockets carrying this firewall mark use the
+    /// tunnel, and everything else does not.
+    ///
+    /// This is how a proxy in front of the tunnel — Xray and anything else that
+    /// can set `SO_MARK` on its outbound sockets — sends only the traffic it is
+    /// forwarding through the tunnel, while its own inbound connections keep
+    /// the host's ordinary path. `route_all` cannot express that: it would
+    /// capture the replies to the proxy's own users too, and break them.
+    pub(crate) route_marked: Option<u32>,
+    /// The routing table the mark rule points at.
+    pub(crate) route_table: u32,
     /// Whether to move packets in batches.
     pub(crate) datapath: Datapath,
     /// Which transmit path to use.
@@ -269,6 +280,10 @@ struct RawInterface {
     gateway: Option<bool>,
     #[serde(default)]
     route_all: Option<bool>,
+    #[serde(default)]
+    route_marked: Option<u32>,
+    #[serde(default)]
+    route_table: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +537,17 @@ impl Config {
                 health_interval: raw.interface.health_interval.unwrap_or(60),
                 gateway: raw.interface.gateway.unwrap_or(false),
                 route_all: raw.interface.route_all.unwrap_or(false),
+                route_marked: match raw.interface.route_marked {
+                    Some(0) => {
+                        return Err(invalid(
+                            "interface.route_marked",
+                            "zero is not a usable mark: an unmarked socket is every \
+                             socket, so the rule would capture the host's own traffic",
+                        ));
+                    }
+                    other => other,
+                },
+                route_table: raw.interface.route_table.unwrap_or(51),
             },
             peer: Peer {
                 public_key,
@@ -630,6 +656,27 @@ tunnel_address = "10.7.0.2"
         let c = Config::parse(CLIENT).expect("parse");
         assert!(!c.interface.gateway);
         assert!(!c.interface.route_all);
+    }
+
+    #[test]
+    fn a_mark_route_can_be_asked_for_without_socks5() {
+        // The arrangement a proxy in front of the tunnel needs: only what it
+        // marks goes through, so its own inbound connections are unaffected.
+        let text = CLIENT.replace("[peer]", "route_marked = 81\n\n[peer]");
+        let c = Config::parse(&text).expect("parse");
+        assert_eq!(c.interface.route_marked, Some(81));
+        assert_eq!(c.interface.route_table, 51);
+        assert!(c.socks5.is_none(), "no listener is needed for this");
+        assert!(!c.interface.route_all, "and the whole host is not captured");
+    }
+
+    #[test]
+    fn a_zero_mark_route_is_refused() {
+        // Every socket is unmarked by default, so a rule on mark zero would
+        // capture the host's own traffic -- including the tunnel's.
+        let text = CLIENT.replace("[peer]", "route_marked = 0\n\n[peer]");
+        let err = Config::parse(&text).expect_err("must be rejected");
+        assert!(err.to_string().contains("every"), "got: {err}");
     }
 
     #[test]

@@ -100,3 +100,19 @@ tunnel_address = "10.7.0.1"
 # with rx flat means packets arrive and fail to authenticate -- a key mismatch,
 # or a scanner. ring-drops climbing means the capture buffer is too small.
 #health_interval = 60
+
+# --- Sending only some traffic through the tunnel ---
+#
+# `route_all = true` captures everything this host sends. That is wrong when a
+# proxy runs in front of the tunnel: it would capture the replies the proxy owes
+# its own users and send them into the tunnel instead.
+#
+# Instead, have the proxy mark its outbound sockets and route only those. Xray
+# does this with `streamSettings.sockopt.mark`. Nothing is proxied by paqetz and
+# no per-flow state exists anywhere -- the kernel routes.
+#
+#route_marked = 81   # sockets with this firewall mark use the tunnel
+#route_table = 51    # the routing table the rule points at
+#
+# For a program that cannot set a socket mark, use the [socks5] listener below
+# instead. See docs/09-deployment.md for which to choose.

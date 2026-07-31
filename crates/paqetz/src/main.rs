@@ -199,6 +199,13 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let socks5 = cfg.socks5.clone();
     let device = cfg.interface.device.clone();
     let want_gateway = cfg.interface.gateway;
+    let mark_route = cfg
+        .interface
+        .route_marked
+        .map(|mark| paqetz_net4::route::Policy {
+            mark,
+            table: cfg.interface.route_table,
+        });
     let want_routes = cfg.interface.route_all;
     let subnet = cfg.tunnel_subnet();
     let peer_endpoint = cfg.peer.endpoint;
@@ -225,6 +232,29 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         None
+    };
+
+    // A policy route for marked sockets, if asked for. This is the L3 way to
+    // send *some* of a host's traffic through the tunnel: whatever sets the
+    // mark goes through, everything else does not — including the inbound
+    // connections of a proxy sitting in front of it, which `route_all` would
+    // capture and break.
+    let marked = match mark_route {
+        None => None,
+        Some(policy) => match policy.apply(&device) {
+            Ok(()) => {
+                log::info!(
+                    "sockets marked {} route through {device} (table {})",
+                    policy.mark,
+                    policy.table
+                );
+                Some(policy)
+            }
+            Err(e) => {
+                log::error!("could not install the mark route: {e}");
+                None
+            }
+        },
     };
 
     // The SOCKS5 front end, if asked for. Started after the device exists,
@@ -321,6 +351,9 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         gw.revert(turned_on);
     }
     if let Some(policy) = policy {
+        policy.revert(&device);
+    }
+    if let Some(policy) = marked {
         policy.revert(&device);
     }
 
