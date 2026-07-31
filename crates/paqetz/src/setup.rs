@@ -9,6 +9,13 @@
 //! So the keys are never handed over loose. Both pairs are generated at once and
 //! written straight into two finished configuration files, with the addresses
 //! already mirrored and each file labelled with the host it belongs on.
+//!
+//! Which leaves the second host. Whichever end runs `setup` first produces both
+//! files; running it again on the other end must *use* the file it was handed
+//! rather than generate a second pair, or it replaces the key the first host was
+//! told to expect and produces exactly the silence described above. So `setup`
+//! looks for that file, and offers to take it pasted in if it is not on disk
+//! yet. Neither end is privileged here: either may go first.
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead as _, Write as _};
@@ -251,6 +258,206 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
 
+    // Before anything is generated: if this host already has its file, or the
+    // operator is holding it, that is the one to use. Generating would mint a
+    // new keypair and overwrite the copy, leaving the two ends with keys that
+    // do not match.
+    let egress = match adopt(dir, role)? {
+        Some(cfg) => cfg.interface.egress.clone(),
+        None => generate(dir, role)?,
+    };
+
+    // Keeping the tunnel running, for the host that will actually run one.
+    if let Some(role) = role {
+        let source = dir.join(role.file());
+        if crate::service::has_systemd() {
+            if yes_no(
+                &format!(
+                    "\n7. Install paqetz as a system service on this host,\n   \
+                     running {}, so it starts at boot and restarts on failure?",
+                    role.file()
+                ),
+                true,
+            )? {
+                let binary = crate::service::install_binary("/usr/local/bin")?;
+                let config = "/etc/paqetz/paqetz.toml";
+                let contents = std::fs::read_to_string(&source)?;
+                crate::service::write_file(std::path::Path::new(config), &contents, 0o600)?;
+                println!("    wrote {config}");
+                crate::service::install_unit(
+                    "paqetz",
+                    &crate::service::tunnel_unit(&binary, config),
+                    true,
+                )?;
+                println!("\n   Check it with: systemctl status paqetz");
+                println!("   Follow it with: journalctl -u paqetz -f");
+            }
+        } else {
+            println!("\n7. No systemd on this host, so nothing to install.");
+            println!("   Run it however this system starts things:");
+            println!("     paqetz run -c {}", source.display());
+        }
+
+        // WARP, if the server was configured to egress through it, is brought
+        // up by wg-quick rather than by us -- but enabling its unit is one
+        // command and forgetting it is the obvious mistake.
+        if let Some(iface) = egress.as_ref()
+            && crate::service::has_systemd()
+            && yes_no(
+                &format!(
+                    "\n   Enable wg-quick@{iface} so the egress interface comes\n   \
+                     up at boot? It must already be configured; paqetz does not\n   \
+                     create it."
+                ),
+                false,
+            )?
+        {
+            match crate::service::run_elevated(
+                "systemctl",
+                &["enable", "--now", &format!("wg-quick@{iface}")],
+            ) {
+                Ok(()) => println!("    enabled wg-quick@{iface}"),
+                Err(e) => println!("    could not enable it: {e}"),
+            }
+        }
+    }
+
+    // The one step that changes this host, asked for separately and last.
+    let pending = paqetz_fw::tune::pending();
+    if pending.is_empty() {
+        println!("This host's kernel settings already suit a tunnel.");
+    } else {
+        println!(
+            "5. This host has {} kernel setting(s) worth changing",
+            pending.len()
+        );
+        println!("   for a tunnel. `paqetz tune` shows each one and why.");
+        if yes_no("   Apply them now?", false)? {
+            paqetz_fw::tune::apply()?;
+            println!("   Applied, and written to {}.", paqetz_fw::tune::PATH);
+        } else {
+            println!("   Skipped. Run `paqetz tune --apply` later if you want them.");
+        }
+    }
+
+    println!("\nOn the other host:");
+    println!("  paqetz doctor -c <file>     # checks, changes nothing");
+    println!("  paqetz run    -c <file>");
+    println!("\nOr copy paqetz there and run `paqetz setup` again, answering");
+    println!("with the other end at step 0.");
+    Ok(())
+}
+
+/// Whether a configuration is the one for this end.
+///
+/// The client is the side that knows where to connect; the server waits to be
+/// contacted. That is the structural difference between the two files, and it
+/// is enough to catch one being pasted onto the wrong host — which leaves both
+/// ends believing they are the same one, and no tunnel.
+fn is_for(cfg: &crate::config::Config, role: Role) -> bool {
+    cfg.peer.endpoint.is_some() == matches!(role, Role::Client)
+}
+
+/// Reads a pasted configuration, ending at a line holding only a full stop.
+///
+/// Not end-of-file: the questions that follow still need stdin, and closing it
+/// here would take the rest of the wizard with it.
+fn read_pasted() -> io::Result<String> {
+    let stdin = io::stdin();
+    let mut text = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.lock().read_line(&mut line)? == 0 || line.trim() == "." {
+            break;
+        }
+        text.push_str(&line);
+    }
+    Ok(text)
+}
+
+/// A configuration for this host to use instead of generating a new pair.
+///
+/// Whichever end runs `setup` first writes both files; the second end should
+/// use the one it was handed rather than mint another. Generating on the second
+/// host replaces the keypair the first one was told to expect, and because a
+/// responder stays silent toward a peer it does not know — deliberately, so it
+/// cannot be probed — the result is a tunnel that never comes up and gives no
+/// reason. This is symmetric: it does not matter which end went first.
+fn adopt(
+    dir: &Path,
+    role: Option<Role>,
+) -> Result<Option<crate::config::Config>, Box<dyn std::error::Error>> {
+    // `neither` is generating files for other hosts, so there is nothing here
+    // to adopt and nothing this host would run.
+    let Some(role) = role else { return Ok(None) };
+    let path = dir.join(role.file());
+
+    let found = match std::fs::read_to_string(&path) {
+        Ok(text) => crate::config::Config::parse(&text).ok(),
+        Err(_) => None,
+    };
+
+    if let Some(cfg) = found {
+        println!("\n   {} is already here, and it is a valid", path.display());
+        println!("   configuration for this end. If it came from the other");
+        println!("   host, this is the one to use — generating would replace");
+        println!("   the key that host expects.");
+        if !is_for(&cfg, role) {
+            println!("\n   Careful: it looks like the file for the OTHER end.");
+        }
+        if yes_no("   Use it?", true)? {
+            return Ok(Some(cfg));
+        }
+        println!("   Generating a new pair instead. The other host will need");
+        println!("   its new file too.");
+        return Ok(None);
+    }
+
+    if !yes_no(
+        &format!(
+            "\n   Do you already have this host's {}, from setup on the\n   \
+             other end? Say yes to paste it in rather than generate a new\n   \
+             pair that would not match.",
+            role.file()
+        ),
+        false,
+    )? {
+        return Ok(None);
+    }
+
+    loop {
+        println!("\n   Paste it, then a line holding only a full stop.");
+        let text = read_pasted()?;
+        match crate::config::Config::parse(&text) {
+            Ok(cfg) => {
+                if !is_for(&cfg, role)
+                    && !yes_no(
+                        "\n   That looks like the OTHER end's file. Use it anyway?",
+                        false,
+                    )?
+                {
+                    return Ok(None);
+                }
+                write_private(&path, &text)?;
+                println!("   Wrote {}", path.display());
+                return Ok(Some(cfg));
+            }
+            Err(e) => {
+                println!("\n   That does not parse: {e}");
+                if !yes_no("   Paste it again?", true)? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Asks the questions that produce a fresh pair, and writes both files.
+///
+/// Returns the server's egress interface, if one was chosen, since enabling it
+/// at boot is asked about later.
+fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let endpoint = loop {
         let answer = ask(
             "1. Where will the client reach the server?\n   \
@@ -454,85 +661,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    // Keeping the tunnel running, for the host that will actually run one.
-    if let Some(role) = role {
-        let source = dir.join(role.file());
-        if crate::service::has_systemd() {
-            if yes_no(
-                &format!(
-                    "\n7. Install paqetz as a system service on this host,\n   \
-                     running {}, so it starts at boot and restarts on failure?",
-                    role.file()
-                ),
-                true,
-            )? {
-                let binary = crate::service::install_binary("/usr/local/bin")?;
-                let config = "/etc/paqetz/paqetz.toml";
-                let contents = std::fs::read_to_string(&source)?;
-                crate::service::write_file(std::path::Path::new(config), &contents, 0o600)?;
-                println!("    wrote {config}");
-                crate::service::install_unit(
-                    "paqetz",
-                    &crate::service::tunnel_unit(&binary, config),
-                    true,
-                )?;
-                println!("\n   Check it with: systemctl status paqetz");
-                println!("   Follow it with: journalctl -u paqetz -f");
-            }
-        } else {
-            println!("\n7. No systemd on this host, so nothing to install.");
-            println!("   Run it however this system starts things:");
-            println!("     paqetz run -c {}", source.display());
-        }
-
-        // WARP, if the server was configured to egress through it, is brought
-        // up by wg-quick rather than by us -- but enabling its unit is one
-        // command and forgetting it is the obvious mistake.
-        if let Some(iface) = egress.as_ref()
-            && crate::service::has_systemd()
-            && yes_no(
-                &format!(
-                    "\n   Enable wg-quick@{iface} so the egress interface comes\n   \
-                     up at boot? It must already be configured; paqetz does not\n   \
-                     create it."
-                ),
-                false,
-            )?
-        {
-            match crate::service::run_elevated(
-                "systemctl",
-                &["enable", "--now", &format!("wg-quick@{iface}")],
-            ) {
-                Ok(()) => println!("    enabled wg-quick@{iface}"),
-                Err(e) => println!("    could not enable it: {e}"),
-            }
-        }
-    }
-
-    // The one step that changes this host, asked for separately and last.
-    let pending = paqetz_fw::tune::pending();
-    if pending.is_empty() {
-        println!("This host's kernel settings already suit a tunnel.");
-    } else {
-        println!(
-            "5. This host has {} kernel setting(s) worth changing",
-            pending.len()
-        );
-        println!("   for a tunnel. `paqetz tune` shows each one and why.");
-        if yes_no("   Apply them now?", false)? {
-            paqetz_fw::tune::apply()?;
-            println!("   Applied, and written to {}.", paqetz_fw::tune::PATH);
-        } else {
-            println!("   Skipped. Run `paqetz tune --apply` later if you want them.");
-        }
-    }
-
-    println!("\nOn the other host:");
-    println!("  paqetz doctor -c <file>     # checks, changes nothing");
-    println!("  paqetz run    -c <file>");
-    println!("\nOr copy paqetz there and run `paqetz setup` again, answering");
-    println!("with the other end at step 0.");
-    Ok(())
+    Ok(egress)
 }
 
 /// Reads one answer, treating a closed stdin as an error rather than as an
@@ -713,6 +842,22 @@ mod tests {
         .expect("render");
         let client = crate::config::Config::parse(&pair.client).expect("parse");
         assert_eq!(client.socks5.expect("socks5").listen.port(), 1080);
+    }
+
+    #[test]
+    fn each_file_is_recognised_by_the_end_it_belongs_to() {
+        let pair = render(&plan()).expect("render");
+        let server = crate::config::Config::parse(&pair.server).expect("parse");
+        let client = crate::config::Config::parse(&pair.client).expect("parse");
+
+        assert!(is_for(&client, Role::Client));
+        assert!(is_for(&server, Role::Server));
+        assert!(
+            !is_for(&server, Role::Client),
+            "adopting the server's file on the client leaves both ends waiting \
+             to be contacted, and neither one connecting"
+        );
+        assert!(!is_for(&client, Role::Server));
     }
 
     #[test]
