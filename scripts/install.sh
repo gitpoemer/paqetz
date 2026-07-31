@@ -40,16 +40,17 @@ need() {
 need curl
 need uname
 
-# Static musl everywhere. It runs whatever the host's glibc is, which for a
-# tool that lands on unfamiliar VPSes matters more than the smaller size of a
-# dynamically linked build.
+# Static musl wherever there is one: it runs whatever the host's glibc is, which
+# for a tool that lands on unfamiliar VPSes matters more than the smaller size of
+# a dynamically linked build. riscv64 is the exception -- no static build is
+# published for it -- so it gets the glibc one.
 detect_target() {
     arch=$(uname -m)
     case "$arch" in
         x86_64|amd64)   echo "x86_64-unknown-linux-musl" ;;
         aarch64|arm64)  echo "aarch64-unknown-linux-musl" ;;
         armv7l|armv7)   echo "armv7-unknown-linux-musleabihf" ;;
-        riscv64)        echo "riscv64gc-unknown-linux-musl" ;;
+        riscv64)        echo "riscv64gc-unknown-linux-gnu" ;;
         i686|i386)      echo "i686-unknown-linux-musl" ;;
         *)              die "no build published for $arch" ;;
     esac

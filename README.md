@@ -46,9 +46,9 @@ Linux, and `CAP_NET_ADMIN` + `CAP_NET_RAW` (root will do).
 curl -fsSL https://raw.githubusercontent.com/gitpoemer/paqetz/main/scripts/install.sh | sudo sh && sudo paqetz setup
 ```
 
-That installs the static binary for this architecture and walks the setup one
-question at a time — keys, addresses, whether the server is a way out, whether
-to keep it running as a service.
+That installs the binary for this architecture — static everywhere but riscv64 —
+and walks the setup one question at a time: keys, addresses, whether the server
+is a way out, whether to keep it running as a service.
 
 The installer verifies the download against the checksum published with the
 release, and **aborts if that checksum cannot be fetched**. It is still a script

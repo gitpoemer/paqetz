@@ -117,10 +117,16 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             cross: true
             static: true
-          # Rare, but the hardware exists and the build costs nothing.
-          - target: riscv64gc-unknown-linux-musl
+          # Rare, but the hardware exists. This is the one target that cannot be
+          # static: rust-std for riscv64 musl still wants libgcc_s, so it needs
+          # a musl cross toolchain that neither `cross` nor Debian ships. The
+          # gnu target has an image and builds cleanly, and a riscv64 board is
+          # running Debian in practice anyway.
+          - target: riscv64gc-unknown-linux-gnu
             cross: true
-            static: true
+            static: false
+            platform: linux/riscv64
+            image: debian:stable-slim
           # For a 32-bit x86 host, which is now unusual enough that anyone on
           # one will not find a build anywhere else.
           - target: i686-unknown-linux-musl
