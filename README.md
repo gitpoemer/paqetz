@@ -40,25 +40,49 @@ idea it keeps and whose architecture it does not.
 
 ## Quick start
 
-Both ends need Linux, and `CAP_NET_ADMIN` + `CAP_NET_RAW` (root will do).
+Linux, and `CAP_NET_ADMIN` + `CAP_NET_RAW` (root will do).
 
 ```bash
-cargo build --release
-./target/release/paqetz init 203.0.113.5:9999 --socks5 127.0.0.1:1080
+curl -fsSL https://raw.githubusercontent.com/gitpoemer/paqetz/main/scripts/install.sh | sudo sh && sudo paqetz setup
 ```
 
-That writes `server.toml` and `client.toml` with both keypairs already matched
-and the inner addresses mirrored — so the keys are never handled loose, which is
-where they get transposed. Copy each file to the host named in its first line,
-then on each:
+That installs the static binary for this architecture and walks the setup one
+question at a time — keys, addresses, whether the server is a way out, whether
+to keep it running as a service.
+
+The installer verifies the download against the checksum published with the
+release, and **aborts if that checksum cannot be fetched**. It is still a script
+piped into a root shell, so if you would rather read it first — which is the
+right instinct — that works too:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/gitpoemer/paqetz/main/scripts/install.sh -o install.sh
+less install.sh
+sudo sh install.sh
+```
+
+<details>
+<summary>Or build it yourself</summary>
+
+```bash
+cargo build --release            # target/release/paqetz
+./target/release/paqetz setup
+```
+
+</details>
+
+`setup` writes both configuration files with the keypairs already matched and
+the inner addresses mirrored, so the keys are never handled loose — which is
+where they get transposed, and a transposed key produces silence rather than an
+error. Copy the other file to the other host and run `paqetz setup` there.
+
+Non-interactively:
+
+```bash
+paqetz init 203.0.113.5:9999 --socks5 127.0.0.1:1080
 paqetz doctor -c paqetz.toml    # read-only; changes nothing
 paqetz run    -c paqetz.toml
 ```
-
-`paqetz setup` asks the same questions one at a time, explains each, and offers
-to tune the host's kernel settings at the end.
 
 Two settings turn a tunnel that is *up* into one that is *useful*:
 `gateway = true` on the server forwards and translates the client's traffic, and
