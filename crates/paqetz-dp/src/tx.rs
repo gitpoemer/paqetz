@@ -42,16 +42,7 @@ impl RawTx {
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             libc::IPPROTO_TCP,
         )
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::PermissionDenied && !sys::is_root() {
-                io::Error::new(
-                    e.kind(),
-                    "opening a raw transmit socket requires CAP_NET_RAW (try running as root)",
-                )
-            } else {
-                e
-            }
-        })?;
+        .map_err(|e| sys::explain_privilege(e, "opening a raw transmit socket", "CAP_NET_RAW"))?;
 
         let on: libc::c_int = 1;
         // SAFETY: IP_HDRINCL takes an int.
@@ -127,19 +118,6 @@ impl std::os::fd::AsRawFd for RawTx {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "opens a raw socket; run with --ignored in a throwaway namespace"]
-    fn opening_without_privilege_explains_why() {
-        if sys::is_root() {
-            return;
-        }
-        let err = RawTx::open().expect_err("must fail unprivileged");
-        assert!(
-            err.to_string().contains("CAP_NET_RAW"),
-            "the message should say what is missing, got: {err}"
-        );
-    }
 
     #[test]
     #[ignore = "opens a raw socket; run with --ignored in a throwaway namespace"]

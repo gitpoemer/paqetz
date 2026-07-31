@@ -142,13 +142,27 @@ pub fn if_nametoindex(name: &str) -> io::Result<u32> {
     }
 }
 
-/// Whether the process is running as root.
+/// Rewrites a permission error to name the capability that was missing.
 ///
-/// Used only to give a clear diagnostic before a syscall fails with `EPERM`.
+/// Deliberately does *not* consult the effective uid. Being root is neither
+/// necessary nor sufficient: a container can run as root with `CAP_NET_RAW`
+/// dropped, and a non-root process can hold it through file capabilities or an
+/// ambient set. Naming the capability is therefore correct in every case, and
+/// keeping the function pure is what lets it be tested at all — the earlier
+/// version short-circuited when root, so under `sudo` its tests asserted
+/// nothing.
+///
+/// Errors other than permission denied are passed through untouched.
 #[must_use]
-pub fn is_root() -> bool {
-    // SAFETY: `geteuid` takes no arguments and cannot fail.
-    unsafe { libc::geteuid() == 0 }
+pub fn explain_privilege(err: io::Error, action: &str, capability: &str) -> io::Error {
+    if err.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(
+            err.kind(),
+            format!("{action} requires {capability}; grant it or run as root"),
+        )
+    } else {
+        err
+    }
 }
 
 /// The `ifreq` structure, as the network ioctls expect it.
@@ -280,6 +294,33 @@ mod tests {
         // If this shrinks below what the kernel reads, the ioctls scribble past
         // the end of the struct.
         assert!(size_of::<IfReq>() >= libc::IFNAMSIZ + 16);
+    }
+
+    #[test]
+    fn a_permission_error_names_the_missing_capability() {
+        let err = io::Error::from(io::ErrorKind::PermissionDenied);
+        let explained = explain_privilege(err, "opening a capture socket", "CAP_NET_RAW");
+        assert_eq!(explained.kind(), io::ErrorKind::PermissionDenied);
+        let text = explained.to_string();
+        assert!(text.contains("CAP_NET_RAW"), "got: {text}");
+        assert!(text.contains("opening a capture socket"), "got: {text}");
+    }
+
+    #[test]
+    fn other_errors_pass_through_untouched() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::InvalidInput,
+        ] {
+            let explained =
+                explain_privilege(io::Error::from(kind), "doing a thing", "CAP_NET_ADMIN");
+            assert_eq!(explained.kind(), kind);
+            assert!(
+                !explained.to_string().contains("CAP_NET_ADMIN"),
+                "a {kind:?} error must not be described as a permission problem"
+            );
+        }
     }
 
     #[test]

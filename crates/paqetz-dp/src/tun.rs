@@ -69,16 +69,8 @@ impl Tun {
         // syscall and cannot leave a descriptor behind.
         let mut req = IfReq::new(name)?;
 
-        let fd = sys::open("/dev/net/tun", libc::O_RDWR | libc::O_CLOEXEC).map_err(|e| {
-            if e.kind() == io::ErrorKind::PermissionDenied && !sys::is_root() {
-                io::Error::new(
-                    e.kind(),
-                    "opening /dev/net/tun requires CAP_NET_ADMIN (try running as root)",
-                )
-            } else {
-                e
-            }
-        })?;
+        let fd = sys::open("/dev/net/tun", libc::O_RDWR | libc::O_CLOEXEC)
+            .map_err(|e| sys::explain_privilege(e, "opening /dev/net/tun", "CAP_NET_ADMIN"))?;
 
         req.set_flags(flags::IFF_TUN | flags::IFF_NO_PI);
         // SAFETY: TUNSETIFF expects a pointer to an `ifreq`, which `IfReq` is
@@ -197,19 +189,6 @@ mod tests {
         let too_long = "z".repeat(64);
         let err = Tun::create(&too_long).expect_err("must be rejected");
         assert!(err.to_string().contains("too long"), "got: {err}");
-    }
-
-    #[test]
-    #[ignore = "opens /dev/net/tun; run with --ignored in a throwaway namespace"]
-    fn creating_a_device_without_privilege_explains_why() {
-        if sys::is_root() {
-            return;
-        }
-        let err = Tun::create("paqetz-test").expect_err("must fail unprivileged");
-        assert!(
-            err.to_string().contains("CAP_NET_ADMIN"),
-            "the message should say what is missing, got: {err}"
-        );
     }
 
     #[test]

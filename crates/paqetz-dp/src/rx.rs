@@ -62,18 +62,8 @@ impl PacketRx {
         // ETH_P_ALL would also deliver non-IP frames, which the filter would
         // then have to reject; ETH_P_IP narrows it before the filter runs.
         let proto = i32::from(ETH_P_IP_BE);
-        let fd = sys::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, proto).map_err(
-            |e| {
-                if e.kind() == io::ErrorKind::PermissionDenied && !sys::is_root() {
-                    io::Error::new(
-                        e.kind(),
-                        "opening a capture socket requires CAP_NET_RAW (try running as root)",
-                    )
-                } else {
-                    e
-                }
-            },
-        )?;
+        let fd = sys::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, proto)
+            .map_err(|e| sys::explain_privilege(e, "opening a capture socket", "CAP_NET_RAW"))?;
         let raw = fd.as_raw_fd();
 
         // Attach the filter *before* binding. Between bind and attach a socket
@@ -194,19 +184,6 @@ impl std::os::fd::AsRawFd for PacketRx {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "opens a raw socket; run with --ignored in a throwaway namespace"]
-    fn opening_without_privilege_explains_why() {
-        if sys::is_root() {
-            return;
-        }
-        let err = PacketRx::open("lo", 9999).expect_err("must fail unprivileged");
-        assert!(
-            err.to_string().contains("CAP_NET_RAW"),
-            "the message should say what is missing, got: {err}"
-        );
-    }
 
     #[test]
     fn a_missing_interface_fails_before_the_socket_is_opened() {
