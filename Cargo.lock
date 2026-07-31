@@ -243,6 +243,9 @@ dependencies = [
 [[package]]
 name = "paqetz-fw"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "paqetz-net4"
