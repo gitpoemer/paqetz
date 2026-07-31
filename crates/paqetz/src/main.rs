@@ -6,6 +6,7 @@
 mod config;
 mod doctor;
 mod log;
+mod setup;
 mod stats;
 mod tunnel;
 
@@ -54,6 +55,42 @@ enum Command {
     /// Read-only: creates, changes, and removes nothing.
     Doctor,
 
+    /// Generate a matched pair of configuration files.
+    ///
+    /// Both keypairs at once, written straight into two finished files with
+    /// the addresses already mirrored — so the keys are never handled loose,
+    /// which is where they get transposed.
+    Init {
+        /// Where the client will reach the server, as `host:port`.
+        endpoint: String,
+        /// Where to write the two files.
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+        /// Do not make the server a way out to the internet.
+        #[arg(long)]
+        no_gateway: bool,
+        /// Route all the client's traffic through the tunnel.
+        #[arg(long)]
+        route_all: bool,
+        /// Add a SOCKS5 listener on the client at this address.
+        #[arg(long, value_name = "ADDR")]
+        socks5: Option<String>,
+    },
+
+    /// Set up a tunnel, one question at a time.
+    Setup {
+        /// Where to write the two files.
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+    },
+
+    /// Show kernel settings worth changing for a tunnel, and why.
+    Tune {
+        /// Apply them, rather than only printing them.
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Inspect or change the firewall rules the tunnel needs.
     Firewall {
         #[command(subcommand)]
@@ -90,6 +127,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Keygen => keygen(),
         Command::Pubkey => pubkey(),
         Command::Run => start(&cli.config),
+        Command::Init {
+            endpoint,
+            out,
+            no_gateway,
+            route_all,
+            socks5,
+        } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5),
+        Command::Setup { out } => setup::interactive(&out),
+        Command::Tune { apply } => tune(apply),
         Command::Doctor => {
             if doctor::run(&cli.config) {
                 Ok(())
@@ -152,6 +198,10 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // the kernel free to reset the very traffic they exist to protect.
     let socks5 = cfg.socks5.clone();
     let device = cfg.interface.device.clone();
+    let want_gateway = cfg.interface.gateway;
+    let want_routes = cfg.interface.route_all;
+    let subnet = cfg.tunnel_subnet();
+    let peer_endpoint = cfg.peer.endpoint;
 
     let mut tunnel = Tunnel::start(cfg)?;
     tunnel.watch_config(path.to_path_buf());
@@ -205,8 +255,71 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Forwarding and translation, so the peer's traffic can reach beyond this
+    // host. Without it the two ends reach each other and nothing else, which
+    // looks exactly like a broken tunnel while nothing is broken.
+    let gateway = if want_gateway {
+        let gw = paqetz_fw::gateway::Gateway {
+            device: device.clone(),
+            subnet,
+        };
+        match gw.apply() {
+            Ok(turned_on) => {
+                log::info!(
+                    "forwarding and address translation for {}/{}",
+                    subnet.0,
+                    subnet.1
+                );
+                Some((gw, turned_on))
+            }
+            Err(e) => {
+                log::error!("could not set up forwarding: {e}");
+                log::error!("the tunnel will carry traffic between the two ends only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Routes that send this host's traffic through the tunnel, with the
+    // tunnel's own endpoint excepted so it does not try to route through
+    // itself and collapse.
+    let routes = match (want_routes, peer_endpoint) {
+        (true, Some(endpoint)) => {
+            let (gw, dev) = default_route()?;
+            let r = paqetz_fw::gateway::TunnelRoutes {
+                device: device.clone(),
+                endpoint: *endpoint.ip(),
+                original_gateway: gw,
+                original_device: dev,
+            };
+            match r.apply() {
+                Ok(()) => {
+                    log::info!("routing this host's traffic through {device}");
+                    Some(r)
+                }
+                Err(e) => {
+                    log::error!("could not install routes: {e}");
+                    None
+                }
+            }
+        }
+        (true, None) => {
+            log::warn_!("route_all needs a peer endpoint; this end waits to be contacted");
+            None
+        }
+        (false, _) => None,
+    };
+
     let result = tunnel.run();
 
+    if let Some(routes) = routes {
+        routes.revert();
+    }
+    if let Some((gw, turned_on)) = gateway {
+        gw.revert(turned_on);
+    }
     if let Some(policy) = policy {
         policy.revert(&device);
     }
@@ -219,6 +332,62 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     result.map_err(Into::into)
+}
+
+/// The gateway and interface of the host's default route.
+fn default_route() -> Result<(Option<std::net::Ipv4Addr>, String), Box<dyn std::error::Error>> {
+    let table = std::fs::read_to_string("/proc/net/route")?;
+    for line in table.lines().skip(1) {
+        let mut f = line.split_whitespace();
+        let (Some(iface), Some(dest), Some(gw), Some(flags)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let up = u32::from_str_radix(flags, 16).unwrap_or(0) & 0x0001 != 0;
+        if dest != "00000000" || !up {
+            continue;
+        }
+        // The address columns are little-endian hexadecimal.
+        let raw = u32::from_str_radix(gw, 16).unwrap_or(0).swap_bytes();
+        let gateway = if raw == 0 {
+            None
+        } else {
+            Some(std::net::Ipv4Addr::from(raw.to_be_bytes()))
+        };
+        return Ok((gateway, iface.to_owned()));
+    }
+    Err("no default route, so there is nothing to route around".into())
+}
+
+fn tune(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let pending = paqetz_fw::tune::pending();
+    if pending.is_empty() {
+        println!("Every setting already has the value a tunnel wants.");
+        return Ok(());
+    }
+
+    println!("{} setting(s) would change:\n", pending.len());
+    for (setting, current) in &pending {
+        println!("  {} = {}", setting.key, setting.value);
+        println!(
+            "      now: {}",
+            current.as_deref().unwrap_or("(not set on this kernel)")
+        );
+        println!("      why: {}\n", setting.reason);
+    }
+
+    if !apply {
+        println!("Nothing was changed. Re-run with --apply to write them to");
+        println!(
+            "{}, which can be deleted to undo them.",
+            paqetz_fw::tune::PATH
+        );
+        return Ok(());
+    }
+    paqetz_fw::tune::apply()?;
+    println!("Applied, and written to {}.", paqetz_fw::tune::PATH);
+    Ok(())
 }
 
 fn firewall(

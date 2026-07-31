@@ -22,7 +22,9 @@
 //! Rule *construction* is pure and lives in [`rules`], so the hard part is
 //! tested without running anything.
 
+pub mod gateway;
 pub mod rules;
+pub mod tune;
 
 use std::io::Write as _;
 use std::process::{Command, Output, Stdio};
@@ -249,7 +251,10 @@ fn run(backend: Backend, args: &[String]) -> Result<Output> {
 }
 
 /// Feeds a script to `nft -f -`.
-fn nft_script(script: &str) -> Result<()> {
+///
+/// # Errors
+/// Returns the tool's failure.
+pub fn nft_script(script: &str) -> Result<()> {
     let mut child = Command::new("nft")
         .arg("-f")
         .arg("-")
@@ -289,6 +294,21 @@ fn check(command: &str, args: &str, output: Output) -> Result<Output> {
         status: output.status.to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
+}
+
+/// Runs one `ip` command.
+///
+/// # Errors
+/// Returns an error if `ip` cannot be run or reports failure.
+pub fn run_ip(args: &[&str]) -> Result<()> {
+    let output = Command::new("ip")
+        .args(args)
+        .output()
+        .map_err(|source| Error::Spawn {
+            command: "ip".to_owned(),
+            source,
+        })?;
+    check("ip", &args.join(" "), output).map(|_| ())
 }
 
 #[cfg(test)]

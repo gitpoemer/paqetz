@@ -1,0 +1,209 @@
+//! Kernel settings that matter for a host carrying a tunnel.
+//!
+//! Every value here has a reason attached, because a list of `sysctl` lines
+//! copied from somewhere is how hosts acquire settings nobody can justify. The
+//! plan is printed before anything is written, and the file it writes is a
+//! single drop-in that can be deleted to undo the lot.
+
+use std::io;
+
+/// Where the settings are written.
+pub const PATH: &str = "/etc/sysctl.d/99-paqetz.conf";
+
+/// One setting, and why it is here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setting {
+    /// The `sysctl` key.
+    pub key: &'static str,
+    /// The value to set.
+    pub value: &'static str,
+    /// Why, in one line.
+    pub reason: &'static str,
+}
+
+/// The settings, in the order they are written.
+///
+/// Deliberately short. Each one addresses something this program actually does;
+/// anything that would merely be generally nice is left out, because a setting
+/// nobody can explain is a setting nobody can safely change later.
+pub const SETTINGS: &[Setting] = &[
+    Setting {
+        key: "net.core.rmem_max",
+        value: "16777216",
+        reason: "the capture socket buffers bursts here; too small and the kernel drops \
+                 frames before we read them",
+    },
+    Setting {
+        key: "net.core.wmem_max",
+        value: "16777216",
+        reason: "the transmit socket queues here when the link is busier than \
+                 the sender; too small and sends fail with a full queue",
+    },
+    Setting {
+        key: "net.core.netdev_max_backlog",
+        value: "16384",
+        reason: "how many frames the kernel queues before the capture socket reads them",
+    },
+    Setting {
+        key: "net.core.default_qdisc",
+        value: "fq",
+        reason: "fair queueing, which BBR requires to pace correctly",
+    },
+    Setting {
+        key: "net.ipv4.tcp_congestion_control",
+        value: "bbr",
+        reason: "for the server's own connections to the internet; BBR handles the \
+                 loss-prone paths a tunnel server usually sits on far better than cubic",
+    },
+    Setting {
+        key: "net.ipv4.tcp_fin_timeout",
+        value: "15",
+        reason: "a gateway opens many short-lived outbound connections; the default \
+                 keeps their state around four times longer than it is useful",
+    },
+    Setting {
+        key: "net.ipv4.tcp_tw_reuse",
+        value: "1",
+        reason: "lets outbound connections reuse recently-closed local ports, which a \
+                 gateway exhausts quickly without it",
+    },
+    Setting {
+        key: "net.ipv4.ip_local_port_range",
+        value: "10000 65535",
+        reason: "more source ports for translated connections; the default range runs \
+                 out under a few thousand concurrent flows",
+    },
+    Setting {
+        key: "net.netfilter.nf_conntrack_max",
+        value: "262144",
+        reason: "translation keeps one connection-tracking entry per flow, and the \
+                 default is sized for a workstation",
+    },
+];
+
+/// Renders the drop-in file.
+#[must_use]
+pub fn file_contents() -> String {
+    let mut out = String::from(
+        "# Written by `paqetz tune`. Delete this file and reboot to undo.\n\
+         #\n\
+         # Every setting here is explained; if one does not apply to this host,\n\
+         # removing it is safe.\n\n",
+    );
+    for s in SETTINGS {
+        out.push_str(&format!("# {}\n{} = {}\n\n", s.reason, s.key, s.value));
+    }
+    out
+}
+
+/// Reads a setting's current value, if the key exists on this kernel.
+#[must_use]
+pub fn current(key: &str) -> Option<String> {
+    let path = format!("/proc/sys/{}", key.replace('.', "/"));
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Which settings would actually change on this host.
+#[must_use]
+pub fn pending() -> Vec<(&'static Setting, Option<String>)> {
+    SETTINGS
+        .iter()
+        .filter_map(|s| {
+            let now = current(s.key);
+            match now.as_deref() {
+                // A key the kernel does not have is skipped rather than
+                // reported as a change that never happens.
+                None => None,
+                Some(v) if v == s.value => None,
+                Some(_) => Some((s, now)),
+            }
+        })
+        .collect()
+}
+
+/// Writes the drop-in and asks the kernel to load it.
+///
+/// # Errors
+/// Returns an error if the file cannot be written.
+pub fn apply() -> io::Result<()> {
+    std::fs::write(PATH, file_contents())?;
+    let output = std::process::Command::new("sysctl")
+        .arg("--system")
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "sysctl --system failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_setting_explains_itself() {
+        for s in SETTINGS {
+            assert!(!s.reason.is_empty(), "{} has no reason", s.key);
+            assert!(
+                s.reason.len() > 30,
+                "{} needs a real explanation, not a label",
+                s.key
+            );
+        }
+    }
+
+    #[test]
+    fn keys_are_unique() {
+        for (i, a) in SETTINGS.iter().enumerate() {
+            for b in SETTINGS.iter().skip(i + 1) {
+                assert_ne!(a.key, b.key, "{} appears twice", a.key);
+            }
+        }
+    }
+
+    #[test]
+    fn the_file_carries_every_setting_and_its_reason() {
+        let text = file_contents();
+        for s in SETTINGS {
+            assert!(text.contains(s.key), "{} missing", s.key);
+            assert!(text.contains(s.value), "{} value missing", s.key);
+            // The reason is wrapped across lines in the source, so check a
+            // distinctive fragment rather than the whole string.
+            let fragment = s
+                .reason
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(text.contains(&fragment), "{} reason missing", s.key);
+        }
+    }
+
+    #[test]
+    fn the_file_says_how_to_undo_it() {
+        assert!(file_contents().contains("Delete this file"));
+    }
+
+    #[test]
+    fn reading_the_hosts_current_values_does_not_fail() {
+        // Read-only. A key this kernel lacks yields None rather than an error.
+        assert_eq!(current("net.ipv4.definitely_not_a_real_key"), None);
+        assert!(current("net.ipv4.ip_forward").is_some());
+    }
+
+    #[test]
+    fn settings_already_correct_are_not_listed_as_pending() {
+        // Whatever this host has, `pending` must never include a key whose
+        // current value already matches, or `tune` would claim work it is not
+        // doing.
+        for (setting, now) in pending() {
+            assert_ne!(now.as_deref(), Some(setting.value), "{}", setting.key);
+        }
+    }
+}

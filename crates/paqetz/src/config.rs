@@ -55,6 +55,16 @@ pub(crate) struct Interface {
     pub(crate) log: crate::log::Level,
     /// Seconds between health lines; zero disables them.
     pub(crate) health_interval: u64,
+    /// Whether to forward and translate the peer's traffic to the internet.
+    ///
+    /// The server side of a tunnel that is meant to be a way out. Without it
+    /// the two ends can reach each other and nothing beyond, which looks
+    /// exactly like a broken tunnel while nothing is broken.
+    pub(crate) gateway: bool,
+    /// Whether to route this host's traffic through the tunnel.
+    ///
+    /// The client side of the same arrangement.
+    pub(crate) route_all: bool,
     /// Whether to move packets in batches.
     pub(crate) datapath: Datapath,
     /// Which transmit path to use.
@@ -145,6 +155,22 @@ pub(crate) struct Peer {
     pub(crate) allowed_ips: Vec<(Ipv4Addr, u8)>,
     /// The peer's address inside the tunnel.
     pub(crate) tunnel_address: Ipv4Addr,
+}
+
+impl Config {
+    /// The tunnel's inner subnet, from this end's address and prefix.
+    ///
+    /// The gateway translates traffic from this range, so it has to be the
+    /// network rather than the host address.
+    #[must_use]
+    pub(crate) fn tunnel_subnet(&self) -> (Ipv4Addr, u8) {
+        let mask = u32::from_be_bytes(self.interface.netmask.octets());
+        let addr = u32::from_be_bytes(self.interface.address.octets());
+        (
+            Ipv4Addr::from((addr & mask).to_be_bytes()),
+            u8::try_from(mask.count_ones()).unwrap_or(32),
+        )
+    }
 }
 
 impl Peer {
@@ -239,6 +265,10 @@ struct RawInterface {
     log: Option<String>,
     #[serde(default)]
     health_interval: Option<u64>,
+    #[serde(default)]
+    gateway: Option<bool>,
+    #[serde(default)]
+    route_all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,6 +520,8 @@ impl Config {
                 transmit,
                 log,
                 health_interval: raw.interface.health_interval.unwrap_or(60),
+                gateway: raw.interface.gateway.unwrap_or(false),
+                route_all: raw.interface.route_all.unwrap_or(false),
             },
             peer: Peer {
                 public_key,
@@ -589,6 +621,34 @@ tunnel_address = "10.7.0.2"
         assert_eq!(c.interface.profile.name, "linux-6");
         assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Midstream);
         assert!(c.interface.manage_firewall);
+    }
+
+    #[test]
+    fn forwarding_and_routing_are_off_unless_asked_for() {
+        // Both change the host's networking beyond the tunnel itself, so
+        // neither happens because a config file was merely present.
+        let c = Config::parse(CLIENT).expect("parse");
+        assert!(!c.interface.gateway);
+        assert!(!c.interface.route_all);
+    }
+
+    #[test]
+    fn forwarding_and_routing_can_be_switched_on() {
+        let text = CLIENT.replace("[peer]", "gateway = true\nroute_all = true\n\n[peer]");
+        let c = Config::parse(&text).expect("parse");
+        assert!(c.interface.gateway);
+        assert!(c.interface.route_all);
+    }
+
+    #[test]
+    fn the_tunnel_subnet_is_derived_from_the_address() {
+        // What the gateway's translation rule is scoped to.
+        let c = Config::parse(CLIENT).expect("parse");
+        assert_eq!(
+            c.tunnel_subnet(),
+            (Ipv4Addr::new(10, 7, 0, 0), 24),
+            "10.7.0.2/24 sits in 10.7.0.0/24"
+        );
     }
 
     #[test]

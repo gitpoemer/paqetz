@@ -44,36 +44,32 @@ idea it keeps and whose architecture it does not.
 Both ends need Linux, and `CAP_NET_ADMIN` + `CAP_NET_RAW` (root will do).
 
 ```bash
-cargo build --release            # target/release/paqetz
-./target/release/paqetz keygen   # once on each end
+cargo build --release
+./target/release/paqetz init 203.0.113.5:9999 --socks5 127.0.0.1:1080
 ```
 
-Exchange the two **public** keys — they are not sensitive. Then write a config
-on each end, starting from [`example/server.toml`](example/server.toml) and
-[`example/client.toml`](example/client.toml), and run:
+That writes `server.toml` and `client.toml` with both keypairs already matched
+and the inner addresses mirrored — so the keys are never handled loose, which is
+where they get transposed. Copy each file to the host named in its first line,
+then on each:
 
 ```bash
-sudo paqetz doctor -c /etc/paqetz/paqetz.toml   # read-only; changes nothing
-sudo paqetz run    -c /etc/paqetz/paqetz.toml
+paqetz doctor -c paqetz.toml    # read-only; changes nothing
+paqetz run    -c paqetz.toml
 ```
 
-`doctor` checks the things that otherwise fail silently — capabilities, the TUN
-driver, a free port, an MTU that fits the path, a routable peer — and says what
-to do about each. Run it first; it is why the tunnel not working should be a
-short conversation.
+`paqetz setup` asks the same questions one at a time, explains each, and offers
+to tune the host's kernel settings at the end.
 
-For a permanent install, [`example/paqetz.service`](example/paqetz.service) runs
-it with two capabilities rather than as root.
+Two settings turn a tunnel that is *up* into one that is *useful*:
+`gateway = true` on the server forwards and translates the client's traffic, and
+`route_all = true` on the client sends its traffic through the tunnel. `init`
+sets the first by default. Without them the two ends reach each other and
+nothing beyond — which looks exactly like a broken tunnel while nothing is
+broken.
 
-The kernel firewall rules the tunnel needs are installed at start-up and removed
-on exit. To inspect or manage them yourself:
-
-```bash
-paqetz firewall plan -c paqetz.toml    # prints what would run, changes nothing
-```
-
-Pick a non-standard port. The rules are scoped to it, and on 80 or 443 they
-would disturb the host's own traffic.
+See [docs/09-deployment.md](docs/09-deployment.md) for the whole path,
+including pointing an Xray outbound at it.
 
 ## Testing
 
