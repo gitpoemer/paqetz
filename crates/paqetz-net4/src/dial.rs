@@ -79,9 +79,13 @@ fn marked_socket(domain: libc::c_int, ty: libc::c_int, mark: u32) -> io::Result<
 pub fn resolve(address: &Address) -> io::Result<Vec<SocketAddr>> {
     match address {
         Address::Socket(a) => Ok(vec![*a]),
+        // The resolver's own message says what went wrong but never which name
+        // it was looking up, and one line of "Name has no usable address" among
+        // many connections points nowhere. The name is the whole question here.
         Address::Domain(host, port) => (host.as_str(), *port)
             .to_socket_addrs()
-            .map(Iterator::collect),
+            .map(Iterator::collect)
+            .map_err(|e| io::Error::new(e.kind(), format!("could not resolve {host}: {e}"))),
     }
 }
 
@@ -273,6 +277,16 @@ fn raw_connect(fd: RawFd, target: SocketAddr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_resolution_failure_names_the_host_it_was_looking_up() {
+        let e = resolve(&Address::Domain("no-such-host.invalid".to_owned(), 443))
+            .expect_err(".invalid never resolves");
+        assert!(
+            e.to_string().contains("no-such-host.invalid"),
+            "a log line without the name points nowhere: {e}"
+        );
+    }
+
     #[test]
     fn a_dual_stack_name_keeps_only_its_v4_addresses() {
         let addr = Address::Domain("example.invalid".to_owned(), 443);
