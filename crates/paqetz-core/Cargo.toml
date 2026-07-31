@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 snow = { workspace = true }
 chacha20 = { workspace = true }
+x25519-dalek = { workspace = true }
 blake2 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }

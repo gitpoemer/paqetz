@@ -32,6 +32,7 @@ paqetz-net4 = { path = "crates/paqetz-net4" }
 # mask (D7), `blake2` only for key derivation and mac1.
 snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
 chacha20 = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 blake2 = "0.10"
 subtle = "2"
 zeroize = { version = "1", features = ["derive"] }
@@ -43,6 +44,8 @@ libc = "0.2"
 # Plumbing.
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

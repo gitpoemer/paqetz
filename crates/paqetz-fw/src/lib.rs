@@ -346,6 +346,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "invokes nft; run with --ignored in a throwaway namespace"]
+    fn the_generated_ruleset_is_valid_nftables() {
+        // `nft -c` parses and validates against the live ruleset without
+        // applying anything. It still needs privilege to read that ruleset,
+        // which is why this cannot run in the default suite. Without it, a
+        // syntax error in the generated script would only surface the first
+        // time someone tried to bring a tunnel up.
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let script = rules::nft_apply(9999);
+        let mut child = Command::new("nft")
+            .arg("-c")
+            .arg("-f")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("nft should be installed in the test namespace");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(script.as_bytes())
+            .expect("write script");
+        let out = child.wait_with_output().expect("wait");
+        assert!(
+            out.status.success(),
+            "nft rejected the generated ruleset: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "invokes nft; run with --ignored in a throwaway namespace"]
+    fn apply_is_idempotent_and_revert_is_complete() {
+        let fw = Firewall::with_backend(Backend::Nft, 9999);
+        assert_eq!(fw.status().expect("status"), Status::Absent);
+
+        fw.apply().expect("apply");
+        assert_eq!(fw.status().expect("status"), Status::Installed);
+
+        // Applying twice must leave the same ruleset, not two copies.
+        fw.apply().expect("apply again");
+        assert_eq!(fw.status().expect("status"), Status::Installed);
+
+        fw.revert().expect("revert");
+        assert_eq!(fw.status().expect("status"), Status::Absent);
+
+        // And reverting when nothing is installed must not fail, because this
+        // runs on the shutdown path where an error is noise at best.
+        fw.revert().expect("revert again");
+    }
+
+    #[test]
     fn a_failure_reports_what_the_tool_said() {
         let err = Error::CommandFailed {
             command: "iptables -t raw -A PREROUTING".to_owned(),

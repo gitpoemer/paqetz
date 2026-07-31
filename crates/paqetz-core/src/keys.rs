@@ -126,6 +126,17 @@ impl PartialEq for PrivateKey {
 
 impl Eq for PrivateKey {}
 
+/// Recovers the public key belonging to a private one.
+///
+/// Needed because a configuration file holds only the private key, exactly as
+/// WireGuard's does: the public half is derivable, so storing it would be a
+/// second copy that could disagree with the first.
+#[must_use]
+pub fn public_from_private(private: &[u8; KEY_LEN]) -> PublicKey {
+    let secret = x25519_dalek::StaticSecret::from(*private);
+    PublicKey(x25519_dalek::PublicKey::from(&secret).to_bytes())
+}
+
 /// A static keypair.
 #[derive(Clone, Debug)]
 pub struct KeyPair {
@@ -172,6 +183,22 @@ mod tests {
         let b = KeyPair::generate().expect("generate");
         assert_ne!(a.public, b.public);
         assert_ne!(a.private, b.private);
+    }
+
+    #[test]
+    fn a_public_key_can_be_recovered_from_its_private_half() {
+        let kp = KeyPair::generate().expect("generate");
+        assert_eq!(public_from_private(kp.private.as_bytes()), kp.public);
+    }
+
+    #[test]
+    fn distinct_private_keys_give_distinct_public_keys() {
+        let a = KeyPair::generate().expect("generate");
+        let b = KeyPair::generate().expect("generate");
+        assert_ne!(
+            public_from_private(a.private.as_bytes()),
+            public_from_private(b.private.as_bytes())
+        );
     }
 
     #[test]

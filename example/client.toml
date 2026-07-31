@@ -1,0 +1,38 @@
+# The side that initiates. It needs to know where the server is; the server does
+# not need to know where it is.
+
+[interface]
+private_key = "REPLACE-WITH-YOUR-PRIVATE-KEY"
+address = "10.7.0.2/24"
+
+# No listen_port: the outer port is ephemeral, chosen at start-up. Nothing needs
+# to reach this end at a fixed address.
+
+[peer]
+public_key = "REPLACE-WITH-THE-SERVER-PUBLIC-KEY"
+endpoint = "203.0.113.5:9999"
+tunnel_address = "10.7.0.1"
+
+# --- Everything below is optional. The defaults are what you want. ---
+
+# Which operating system the carrier should resemble on the wire. Affects TTL,
+# MSS, window scale, window, and whether TCP timestamps are negotiated.
+# One of: linux-6 (default), windows-11, android-14.
+#profile = "linux-6"
+
+# Whether the carrier performs a synthetic TCP handshake. "midstream" (default)
+# never emits a SYN, which is how paqet behaves and keeps the responder from
+# answering anything it cannot authenticate. See docs/decisions/D14.
+#carrier = "midstream"
+
+# Inner MTU. The default leaves room for the outer IPv4, TCP, TCP options, and
+# the tunnel's own framing against a 1500-byte path.
+#mtu = 1400
+
+# Name of the TUN device.
+#device = "paqetz0"
+
+# Whether to install and remove the kernel firewall rules automatically. These
+# stop the kernel resetting the flow, so turning this off means applying the
+# output of `paqetz firewall plan` yourself.
+#manage_firewall = true

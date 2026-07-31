@@ -1,0 +1,779 @@
+//! The run loop: TUN ↔ core ↔ tcpwire ↔ datapath.
+//!
+//! Three threads and one lock. One reads the TUN device, encrypts, and puts
+//! packets on the wire; one reads the wire, decrypts, and writes to the TUN
+//! device; one drives handshake and rekey timers. There is no async runtime,
+//! because a fixed set of long-lived descriptors gains nothing from one and
+//! pays scheduling overhead per packet.
+//!
+//! # State
+//!
+//! Everything the two data threads share is one [`PeerState`] behind a mutex:
+//! the Noise session, the carrier's connection state, and the peer's current
+//! endpoint. That is the whole of the tunnel's mutable state — O(peers), never
+//! O(flows) (D4).
+//!
+//! Taking a lock per packet is a deliberate phase-1 simplification. With two
+//! threads it is an uncontended atomic in the common case; removing it belongs
+//! with the rest of the throughput work.
+
+use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use paqetz_core::noise::{self, Initiator, PendingResponder, Session};
+use paqetz_core::{Millis, PublicKey};
+use paqetz_dp::{MAX_FRAME, PacketRx, RawTx, Tun};
+use paqetz_tcpwire::segment::{self, MAX_OVERHEAD};
+use paqetz_tcpwire::{Endpoint as Carrier, Role};
+
+use crate::config::Config;
+
+/// How often the timer thread wakes.
+const TICK: Duration = Duration::from_millis(250);
+
+/// How long to wait before repeating an unanswered handshake.
+///
+/// WireGuard's interval. Long enough not to flood a peer that is down, short
+/// enough that a transient loss costs a few seconds rather than a minute.
+const REKEY_TIMEOUT: Millis = 5_000;
+
+/// Largest inner packet we will handle.
+const MAX_INNER: usize = 9000;
+
+/// The shared, mutable state of the tunnel.
+struct PeerState {
+    /// The established session, once there is one.
+    session: Option<Session>,
+    /// A handshake we have sent and are awaiting a reply to.
+    pending: Option<Initiator>,
+    /// The synthetic TCP conversation with this peer.
+    carrier: Option<Carrier>,
+    /// Where the peer currently is.
+    endpoint: Option<SocketAddrV4>,
+    /// When the last handshake was sent.
+    last_handshake: Millis,
+}
+
+impl PeerState {
+    const fn new(endpoint: Option<SocketAddrV4>) -> Self {
+        Self {
+            session: None,
+            pending: None,
+            carrier: None,
+            endpoint,
+            last_handshake: 0,
+        }
+    }
+}
+
+/// A running tunnel.
+pub(crate) struct Tunnel {
+    cfg: Config,
+    tun: Arc<Tun>,
+    rx: Arc<PacketRx>,
+    tx: Arc<RawTx>,
+    state: Arc<Mutex<PeerState>>,
+    /// Our own outer address and port.
+    local: (Ipv4Addr, u16),
+    /// Our static public key, needed to verify `mac1` on inbound handshakes.
+    local_public: PublicKey,
+    started: Instant,
+    running: Arc<AtomicBool>,
+}
+
+/// Anything that can stop the tunnel starting.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    /// An operating-system call failed.
+    #[error("{context}: {source}")]
+    Os {
+        /// What was being attempted.
+        context: String,
+        /// The underlying error.
+        source: io::Error,
+    },
+
+    /// The cryptographic core rejected something.
+    #[error("crypto: {0}")]
+    Core(#[from] paqetz_core::Error),
+
+    /// The carrier rejected something.
+    #[error("carrier: {0}")]
+    Wire(#[from] paqetz_tcpwire::Error),
+}
+
+/// Result alias for this module.
+pub(crate) type Result<T> = core::result::Result<T, Error>;
+
+fn os<T>(context: impl Into<String>, r: io::Result<T>) -> Result<T> {
+    r.map_err(|source| Error::Os {
+        context: context.into(),
+        source,
+    })
+}
+
+impl Tunnel {
+    /// Brings up the device, sockets, and firewall rules.
+    ///
+    /// # Errors
+    /// Returns the first failure, with context describing what was attempted.
+    pub(crate) fn start(cfg: Config) -> Result<Self> {
+        let local_public =
+            paqetz_core::keys::public_from_private(cfg.interface.private_key.as_bytes());
+
+        // Choosing our own outer port above the kernel's ephemeral range keeps
+        // it from colliding with a port the kernel hands to some other socket.
+        // paqet picked from 32768-65535, which overlaps that range exactly.
+        let local_port = if cfg.interface.listen_port == 0 {
+            let r = os("choosing an outer port", random_u32())?;
+            61_000 + u16::try_from(r % 4_000).unwrap_or(0)
+        } else {
+            cfg.interface.listen_port
+        };
+
+        // Our own outer address is whichever one the kernel would route from.
+        // Asking it directly avoids putting an address in the configuration
+        // that then has to be kept in step with the host's networking.
+        let local_ip = match cfg.peer.endpoint {
+            Some(peer) => os(
+                "determining our outer address",
+                source_address_for(*peer.ip()),
+            )?,
+            // The side that waits learns its own address from the destination
+            // of the first packet that arrives, so nothing is needed here.
+            None => Ipv4Addr::UNSPECIFIED,
+        };
+
+        let interface = os(
+            "finding the interface that routes to the peer",
+            outbound_interface(),
+        )?;
+
+        let tun = Tun::create(&cfg.interface.device).map_err(|source| Error::Os {
+            context: format!("creating TUN device {}", cfg.interface.device),
+            source,
+        })?;
+        os(
+            "configuring the TUN device",
+            tun.configure(
+                cfg.interface.address,
+                cfg.interface.netmask,
+                cfg.interface.mtu,
+            ),
+        )?;
+
+        let rx = os(
+            format!("opening a capture socket on {interface}"),
+            PacketRx::open(&interface, local_port),
+        )?;
+        let _ = rx.set_recv_buffer(8 * 1024 * 1024);
+
+        let tx = os("opening the transmit socket", RawTx::open())?;
+        let _ = tx.set_send_buffer(4 * 1024 * 1024);
+
+        Ok(Self {
+            state: Arc::new(Mutex::new(PeerState::new(cfg.peer.endpoint))),
+            cfg,
+            tun: Arc::new(tun),
+            rx: Arc::new(rx),
+            tx: Arc::new(tx),
+            local: (local_ip, local_port),
+            local_public,
+            started: Instant::now(),
+            running: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
+    /// Milliseconds since the tunnel started.
+    fn now(&self) -> Millis {
+        Millis::try_from(self.started.elapsed().as_millis()).unwrap_or(Millis::MAX)
+    }
+
+    /// Whether this end initiates handshakes.
+    const fn is_initiator(&self) -> bool {
+        self.cfg.peer.is_initiator()
+    }
+
+    /// Runs until stopped. Consumes the tunnel.
+    ///
+    /// # Errors
+    /// Returns a failure from thread startup; per-packet errors are logged and
+    /// the loop continues, since one bad packet must never stop the tunnel.
+    pub(crate) fn run(self) -> Result<()> {
+        let this = Arc::new(self);
+
+        let outbound = Arc::clone(&this);
+        let t1 = std::thread::Builder::new()
+            .name("tun-to-wire".to_owned())
+            .spawn(move || outbound.tun_to_wire())
+            .map_err(|source| Error::Os {
+                context: "starting the outbound thread".to_owned(),
+                source,
+            })?;
+
+        let inbound = Arc::clone(&this);
+        let t2 = std::thread::Builder::new()
+            .name("wire-to-tun".to_owned())
+            .spawn(move || inbound.wire_to_tun())
+            .map_err(|source| Error::Os {
+                context: "starting the inbound thread".to_owned(),
+                source,
+            })?;
+
+        let timers = Arc::clone(&this);
+        let t3 = std::thread::Builder::new()
+            .name("timers".to_owned())
+            .spawn(move || timers.timers())
+            .map_err(|source| Error::Os {
+                context: "starting the timer thread".to_owned(),
+                source,
+            })?;
+
+        // The worker threads block in `read` and `recv`, so they cannot notice
+        // a flag on their own. The process exits once this returns and the
+        // caller has removed the firewall rules; the blocked threads go with
+        // it. Waking them properly needs the poll loop that arrives with the
+        // rest of the throughput work.
+        while this.running.load(Ordering::Relaxed) && !SHUTDOWN.load(Ordering::Relaxed) {
+            std::thread::sleep(TICK);
+        }
+        this.stop();
+
+        drop((t1, t2, t3));
+        Ok(())
+    }
+
+    /// Asks the loops to stop.
+    pub(crate) fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+
+    // -- outbound ------------------------------------------------------------
+
+    /// Reads inner packets, encrypts them, and puts them on the wire.
+    fn tun_to_wire(&self) {
+        let mut inner = vec![0u8; MAX_INNER];
+        let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
+        let mut frame = vec![0u8; MAX_INNER + MAX_OVERHEAD + paqetz_core::framing::OVERHEAD];
+
+        while self.running.load(Ordering::Relaxed) {
+            let n = match self.tun.recv(&mut inner) {
+                Ok(n) if n > 0 => n,
+                Ok(_) => continue,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    eprintln!("tun read failed: {e}");
+                    break;
+                }
+            };
+            let Some(packet) = inner.get(..n) else {
+                continue;
+            };
+
+            if let Err(e) = self.send_inner(packet, &mut sealed, &mut frame) {
+                // A packet we cannot send is dropped, exactly as a congested
+                // link would drop it. Inner TCP retries; nothing here should
+                // treat it as fatal.
+                if !matches!(e, Error::Core(paqetz_core::Error::Expired)) {
+                    eprintln!("dropping outbound packet: {e}");
+                }
+            }
+        }
+    }
+
+    /// Encrypts one inner packet and transmits it.
+    fn send_inner(&self, packet: &[u8], sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(session) = state.session.as_mut() else {
+            // No session yet. The timer thread is responsible for starting one;
+            // this packet is simply lost, which is what a link that is not up
+            // yet looks like from above.
+            return Ok(());
+        };
+        let n = session.seal(packet, sealed, now)?;
+
+        let Some(carrier) = state.carrier.as_mut() else {
+            return Ok(());
+        };
+        let Some(payload) = sealed.get(..n) else {
+            return Ok(());
+        };
+        let written = carrier.data(payload, frame, now)?;
+        let dst = carrier.remote().0;
+        drop(state);
+
+        let Some(out) = frame.get(..written) else {
+            return Ok(());
+        };
+        os("transmitting", self.tx.send(out, dst)).map(|_| ())
+    }
+
+    // -- inbound -------------------------------------------------------------
+
+    /// Reads from the wire, decrypts, and writes inner packets to the device.
+    fn wire_to_tun(&self) {
+        let mut frame = vec![0u8; MAX_FRAME];
+        let mut inner = vec![0u8; MAX_INNER];
+        let mut reply = vec![0u8; MAX_FRAME];
+
+        while self.running.load(Ordering::Relaxed) {
+            let n = match self.rx.recv(&mut frame) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    eprintln!("capture read failed: {e}");
+                    break;
+                }
+            };
+            let Some(bytes) = frame.get(..n) else {
+                continue;
+            };
+            let Some(seg) = segment::parse_ethernet(bytes) else {
+                continue;
+            };
+            if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
+                // Anything unauthenticated lands here. It is dropped silently
+                // in the sense that matters -- nothing goes back on the wire --
+                // but it is worth a line at this stage of development.
+                if !matches!(
+                    e,
+                    Error::Core(paqetz_core::Error::Rejected | paqetz_core::Error::Replay)
+                ) {
+                    eprintln!("dropping inbound packet: {e}");
+                }
+            }
+        }
+    }
+
+    /// Dispatches one inbound segment.
+    fn handle_segment(
+        &self,
+        seg: &segment::Segment<'_>,
+        inner: &mut [u8],
+        reply: &mut [u8],
+    ) -> Result<()> {
+        let from = SocketAddrV4::new(seg.src.0, seg.src.1);
+        let payload = seg.payload;
+
+        // A handshake and a transport packet can be the same length, so the
+        // keyed mac1 decides which this is rather than the length (D7).
+        if payload.len() == noise::MSG1_LEN
+            && noise::verify_mac1(&self.local_public, payload).is_ok()
+        {
+            return self.handle_msg1(seg, payload, reply);
+        }
+        if payload.len() == noise::MSG2_LEN
+            && noise::verify_mac1(&self.local_public, payload).is_ok()
+        {
+            return self.handle_msg2(seg, payload);
+        }
+
+        self.handle_transport(seg, from, inner)
+    }
+
+    /// Accepts an initiator's handshake and answers it.
+    fn handle_msg1(
+        &self,
+        seg: &segment::Segment<'_>,
+        payload: &[u8],
+        reply: &mut [u8],
+    ) -> Result<()> {
+        if self.is_initiator() {
+            // We initiate; an inbound msg1 is not ours to answer.
+            return Ok(());
+        }
+        let now = self.now();
+        let pending =
+            PendingResponder::read(&self.cfg.interface.private_key, &self.local_public, payload)?;
+
+        // The authorization decision (D11). An unknown key gets no reply at
+        // all, so the port stays indistinguishable from one that is filtered.
+        if pending.initiator_static() != &self.cfg.peer.public_key {
+            return Err(paqetz_core::Error::Unauthorized.into());
+        }
+
+        let epoch = pending.epoch();
+        let (isn_i, isn_r, ts_base) =
+            noise::carrier_numbers(epoch, &self.cfg.peer.public_key, &self.local_public);
+
+        let index = random_u32().map_err(|source| Error::Os {
+            context: "generating a session index".to_owned(),
+            source,
+        })?;
+        let (session, msg2) = pending.accept(index, now)?;
+
+        // We learn our own outer address from where the peer sent to.
+        let local = (seg.dst.0, seg.dst.1);
+        let mut carrier = Carrier::new(paqetz_tcpwire::Config {
+            local,
+            remote: seg.src,
+            profile: self.cfg.interface.profile,
+            role: Role::Responder,
+            carrier: self.cfg.interface.carrier,
+            isn: isn_r,
+            peer_isn: isn_i,
+            ts_base,
+        });
+        // Fold in the segment that carried msg1, so our acknowledgement counts
+        // the bytes the peer actually sent.
+        carrier.on_receive(seg);
+
+        let written = carrier.data(&msg2, reply, now)?;
+        let dst = seg.src.0;
+
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.session = Some(session);
+            state.pending = None;
+            state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
+            state.carrier = Some(carrier);
+        }
+
+        let Some(out) = reply.get(..written) else {
+            return Ok(());
+        };
+        os("transmitting handshake reply", self.tx.send(out, dst)).map(|_| ())
+    }
+
+    /// Completes our own handshake.
+    fn handle_msg2(&self, seg: &segment::Segment<'_>, payload: &[u8]) -> Result<()> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pending) = state.pending.take() else {
+            return Ok(());
+        };
+        match pending.finish(payload, now) {
+            Ok(session) => {
+                if let Some(carrier) = state.carrier.as_mut() {
+                    carrier.on_receive(seg);
+                }
+                state.session = Some(session);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Decrypts a transport packet and delivers it.
+    fn handle_transport(
+        &self,
+        seg: &segment::Segment<'_>,
+        from: SocketAddrV4,
+        inner: &mut [u8],
+    ) -> Result<()> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(session) = state.session.as_mut() else {
+            return Ok(());
+        };
+        let n = session.open(seg.payload, inner, now)?;
+
+        // Authenticated, so the endpoint is trustworthy. Roaming (D5): the peer
+        // may have moved, and following it here is what makes a NAT rebinding
+        // invisible instead of fatal.
+        if state.endpoint != Some(from) {
+            state.endpoint = Some(from);
+            if let Some(carrier) = state.carrier.as_mut() {
+                carrier.set_remote((from.ip().to_owned(), from.port()));
+            }
+        }
+        if let Some(carrier) = state.carrier.as_mut() {
+            carrier.on_receive(seg);
+        }
+        drop(state);
+
+        let Some(packet) = inner.get(..n) else {
+            return Ok(());
+        };
+        self.deliver(packet)
+    }
+
+    /// Checks an inner packet and writes it to the device.
+    fn deliver(&self, packet: &[u8]) -> Result<()> {
+        let Some(source) = inner_source(packet) else {
+            return Ok(());
+        };
+
+        // Cryptokey routing (D12). Without this a peer can claim any inner
+        // source address, including one that reaches a service bound to the
+        // host's loopback.
+        if !self.cfg.peer.permits(source) {
+            eprintln!("dropping inner packet with disallowed source {source}");
+            return Ok(());
+        }
+        if !plausible_source(source) {
+            eprintln!("dropping inner packet with martian source {source}");
+            return Ok(());
+        }
+
+        os("writing to the TUN device", self.tun.send(packet)).map(|_| ())
+    }
+
+    // -- timers --------------------------------------------------------------
+
+    /// Starts and refreshes handshakes.
+    fn timers(&self) {
+        if !self.is_initiator() {
+            // A responder answers handshakes but never starts one, so it has
+            // nothing to do on a timer.
+            while self.running.load(Ordering::Relaxed) {
+                std::thread::sleep(TICK);
+            }
+            return;
+        }
+
+        let mut frame = vec![0u8; MAX_FRAME];
+        while self.running.load(Ordering::Relaxed) {
+            if let Err(e) = self.maybe_handshake(&mut frame) {
+                eprintln!("handshake attempt failed: {e}");
+            }
+            std::thread::sleep(TICK);
+        }
+    }
+
+    /// Sends a handshake if one is due.
+    fn maybe_handshake(&self, frame: &mut [u8]) -> Result<()> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        let due = match state.session.as_ref() {
+            None => {
+                state.pending.is_none() || now.saturating_sub(state.last_handshake) >= REKEY_TIMEOUT
+            }
+            Some(s) => s.needs_rekey(now),
+        };
+        if !due {
+            return Ok(());
+        }
+        let Some(peer) = state.endpoint else {
+            return Ok(());
+        };
+
+        let epoch = random_u32().map_err(|source| Error::Os {
+            context: "generating an epoch".to_owned(),
+            source,
+        })?;
+        let index = random_u32().map_err(|source| Error::Os {
+            context: "generating a session index".to_owned(),
+            source,
+        })?;
+
+        let (initiator, msg1) = Initiator::start(
+            &self.cfg.interface.private_key,
+            &self.local_public,
+            &self.cfg.peer.public_key,
+            index,
+            epoch,
+        )?;
+
+        let (isn_i, isn_r, ts_base) =
+            noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
+        let mut carrier = Carrier::new(paqetz_tcpwire::Config {
+            local: self.local,
+            remote: (*peer.ip(), peer.port()),
+            profile: self.cfg.interface.profile,
+            role: Role::Initiator,
+            carrier: self.cfg.interface.carrier,
+            isn: isn_i,
+            peer_isn: isn_r,
+            ts_base,
+        });
+
+        let written = carrier.data(&msg1, frame, now)?;
+        let dst = *peer.ip();
+
+        state.pending = Some(initiator);
+        state.carrier = Some(carrier);
+        state.last_handshake = now;
+        drop(state);
+
+        let Some(out) = frame.get(..written) else {
+            return Ok(());
+        };
+        os("transmitting handshake", self.tx.send(out, dst)).map(|_| ())
+    }
+}
+
+/// Reads the source address of an inner IPv4 packet.
+fn inner_source(packet: &[u8]) -> Option<Ipv4Addr> {
+    if packet.first().map(|b| b >> 4) != Some(4) {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        *packet.get(12)?,
+        *packet.get(13)?,
+        *packet.get(14)?,
+        *packet.get(15)?,
+    ))
+}
+
+/// Whether an inner source address is one a peer could legitimately hold.
+///
+/// Applied regardless of `allowed_ips`, so that widening the allowance — or
+/// disabling it — still cannot be used to reach a service bound to the host's
+/// loopback, or to spoof a link-local or multicast source (D12).
+#[must_use]
+pub(crate) fn plausible_source(addr: Ipv4Addr) -> bool {
+    !(addr.is_loopback()
+        || addr.is_multicast()
+        || addr.is_broadcast()
+        || addr.is_link_local()
+        || addr.is_unspecified())
+}
+
+/// Asks the kernel which local address it would use to reach `peer`.
+///
+/// Connecting a UDP socket sends nothing; it only performs the route lookup,
+/// which is exactly the question being asked. This is why the configuration has
+/// no local-address field.
+fn source_address_for(peer: Ipv4Addr) -> io::Result<Ipv4Addr> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    sock.connect(SocketAddrV4::new(peer, 9))?;
+    match sock.local_addr()? {
+        std::net::SocketAddr::V4(a) => Ok(*a.ip()),
+        std::net::SocketAddr::V6(_) => Err(io::Error::other(
+            "the route to the peer is IPv6, which is not supported yet",
+        )),
+    }
+}
+
+/// Names the interface carrying the default route.
+///
+/// Read from `/proc/net/route` rather than by invoking `ip`, so there is no
+/// dependency on which userland is installed.
+fn outbound_interface() -> io::Result<String> {
+    let table = std::fs::read_to_string("/proc/net/route")?;
+    for line in table.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (Some(iface), Some(dest), Some(_gw), Some(flags)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // Destination 0.0.0.0 with the "up" flag set is the default route.
+        let up = u32::from_str_radix(flags, 16).unwrap_or(0) & 0x0001 != 0;
+        if dest == "00000000" && up {
+            return Ok(iface.to_owned());
+        }
+    }
+    Err(io::Error::other("no default route found"))
+}
+
+/// Set by the signal handler; polled by [`Tunnel::run`].
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Records that a shutdown signal arrived.
+///
+/// Storing to an atomic is async-signal-safe; nothing else here would be, which
+/// is why the handler does no work beyond this.
+extern "C" fn on_signal(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// Arranges for `SIGINT` and `SIGTERM` to request a clean stop.
+pub(crate) fn install_signal_handlers() {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        let handler: extern "C" fn(libc::c_int) = on_signal;
+        // SAFETY: `on_signal` is a plain `extern "C"` function that only stores
+        // to an atomic, which is permitted in a signal handler. The pointer is
+        // taken from the function item rather than cast from it, so there is no
+        // question of the value being anything other than its address.
+        unsafe {
+            libc::signal(sig, handler as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+/// Reads four random bytes from the kernel.
+fn random_u32() -> io::Result<u32> {
+    use std::io::Read as _;
+    let mut buf = [0u8; 4];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inner_source_reads_the_ipv4_source_field() {
+        let mut packet = [0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&[10, 7, 0, 2]);
+        assert_eq!(inner_source(&packet), Some(Ipv4Addr::new(10, 7, 0, 2)));
+    }
+
+    #[test]
+    fn inner_source_rejects_non_ipv4_and_runts() {
+        let mut packet = [0u8; 20];
+        packet[0] = 0x60; // IPv6
+        assert_eq!(inner_source(&packet), None);
+        for len in 0..16 {
+            let mut short = vec![0u8; len];
+            if let Some(b) = short.first_mut() {
+                *b = 0x45;
+            }
+            assert_eq!(inner_source(&short), None, "len {len}");
+        }
+    }
+
+    #[test]
+    fn martian_sources_are_refused() {
+        // These must be refused even when allowed_ips is set to "any", because
+        // the danger is not which peer sent them but where they could reach.
+        for addr in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(127, 1, 2, 3),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+        ] {
+            assert!(!plausible_source(addr), "{addr} should be refused");
+        }
+    }
+
+    #[test]
+    fn ordinary_sources_are_allowed() {
+        for addr in [
+            Ipv4Addr::new(10, 7, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(8, 8, 8, 8),
+        ] {
+            assert!(plausible_source(addr), "{addr} should be allowed");
+        }
+    }
+
+    #[test]
+    fn random_u32_produces_varying_values() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            seen.insert(random_u32().expect("urandom"));
+        }
+        assert!(seen.len() > 30, "saw only {} distinct values", seen.len());
+    }
+
+    #[test]
+    fn the_default_route_is_discoverable() {
+        // Read-only: parses /proc/net/route and touches nothing.
+        match outbound_interface() {
+            Ok(name) => assert!(!name.is_empty()),
+            Err(e) => {
+                // A machine with no default route is a legitimate state; the
+                // point is that parsing does not panic or hang.
+                assert!(e.to_string().contains("default route"), "got: {e}");
+            }
+        }
+    }
+}

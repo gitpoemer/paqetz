@@ -72,20 +72,92 @@ pub const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 /// an AEAD nonce.
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
 
+/// Domain-separation label for the initiator's carrier sequence number.
+pub const ISN_INITIATOR_LABEL: &[u8] = b"paqetz-isn-initiator-v1";
+
+/// Domain-separation label for the responder's carrier sequence number.
+pub const ISN_RESPONDER_LABEL: &[u8] = b"paqetz-isn-responder-v1";
+
+/// Domain-separation label for the carrier's TCP timestamp offset.
+pub const TS_BASE_LABEL: &[u8] = b"paqetz-tsbase-v1";
+
 /// Length of the `mac1` field.
 pub const MAC1_LEN: usize = 16;
 
 /// Domain-separation label for the `mac1` key.
 pub const MAC1_LABEL: &[u8] = b"paqetz-mac1-v1";
 
-/// Bytes of handshake payload: the sender's session index.
-const INDEX_PAYLOAD_LEN: usize = 4;
+/// Bytes of handshake payload: the sender's session index, then the epoch.
+///
+/// The epoch is what lets the carrier's sequence numbers be correct from the
+/// *first* packet. Deriving them from the completed handshake would be too
+/// late: the handshake messages themselves travel over the carrier, and the
+/// initiator has no transcript hash to derive from when it sends the first one.
+/// So the initiator picks the epoch, uses it immediately, and the responder
+/// learns it from msg1 before it has to send anything.
+const PAYLOAD_LEN: usize = 8;
 
-/// `e (32) || encrypted static (32+16) || encrypted payload (4+16) || mac1 (16)`.
-pub const MSG1_LEN: usize = 32 + 48 + (INDEX_PAYLOAD_LEN + 16) + MAC1_LEN;
+/// `e (32) || encrypted static (32+16) || encrypted payload (8+16) || mac1 (16)`.
+pub const MSG1_LEN: usize = 32 + 48 + (PAYLOAD_LEN + 16) + MAC1_LEN;
 
-/// `e (32) || encrypted payload (4+16) || mac1 (16)`.
-pub const MSG2_LEN: usize = 32 + (INDEX_PAYLOAD_LEN + 16) + MAC1_LEN;
+/// `e (32) || encrypted payload (8+16) || mac1 (16)`.
+pub const MSG2_LEN: usize = 32 + (PAYLOAD_LEN + 16) + MAC1_LEN;
+
+/// Packs a handshake payload.
+fn pack_payload(index: u32, epoch: u32) -> [u8; PAYLOAD_LEN] {
+    let mut out = [0u8; PAYLOAD_LEN];
+    let (i, e) = out.split_at_mut(4);
+    i.copy_from_slice(&index.to_le_bytes());
+    e.copy_from_slice(&epoch.to_le_bytes());
+    out
+}
+
+/// Unpacks a handshake payload into `(index, epoch)`.
+fn unpack_payload(raw: &[u8; PAYLOAD_LEN]) -> (u32, u32) {
+    let (i, e) = raw.split_at(4);
+    (
+        u32::from_le_bytes(i.try_into().unwrap_or([0; 4])),
+        u32::from_le_bytes(e.try_into().unwrap_or([0; 4])),
+    )
+}
+
+/// Derives the carrier's initial sequence numbers and timestamp offset.
+///
+/// Returns `(initiator_isn, responder_isn, ts_base)`.
+///
+/// This is what makes mid-stream operation possible: both ends compute all
+/// three from values they already hold — the two static public keys and the
+/// epoch the initiator chose — so they agree on where the synthetic
+/// conversation's numbering starts without exchanging a SYN to establish it.
+///
+/// The epoch is fresh per handshake, so a reconnection does not replay the
+/// previous conversation's numbering. Static keys are mixed in so two different
+/// peer pairs never collide.
+///
+/// None of this is secret. A sequence number needs to be unpredictable in
+/// advance, not confidential — it appears in the clear in every segment.
+#[must_use]
+pub fn carrier_numbers(
+    epoch: u32,
+    initiator_static: &PublicKey,
+    responder_static: &PublicKey,
+) -> (u32, u32, u32) {
+    let derive = |label: &[u8]| -> u32 {
+        let mut h = Blake2s256::new();
+        h.update(label);
+        h.update(initiator_static.as_bytes());
+        h.update(responder_static.as_bytes());
+        h.update(epoch.to_le_bytes());
+        let out: [u8; 32] = h.finalize().into();
+        let (first, _) = out.split_first_chunk::<4>().unwrap_or((&[0; 4], &[]));
+        u32::from_le_bytes(*first)
+    };
+    (
+        derive(ISN_INITIATOR_LABEL),
+        derive(ISN_RESPONDER_LABEL),
+        derive(TS_BASE_LABEL),
+    )
+}
 
 /// Parses the fixed Noise pattern.
 ///
@@ -150,6 +222,7 @@ pub struct Initiator {
     responder_static: PublicKey,
     local_static: PublicKey,
     local_index: u32,
+    epoch: u32,
 }
 
 impl Initiator {
@@ -165,6 +238,7 @@ impl Initiator {
         local_public: &PublicKey,
         responder_static: &PublicKey,
         local_index: u32,
+        epoch: u32,
     ) -> Result<(Self, [u8; MSG1_LEN])> {
         let mut state = snow::Builder::new(pattern())
             .local_private_key(local.as_bytes())?
@@ -174,7 +248,7 @@ impl Initiator {
         let mut msg = [0u8; MSG1_LEN];
         let body_len = {
             let (body, _) = msg.split_at_mut(MSG1_LEN - MAC1_LEN);
-            state.write_message(&local_index.to_le_bytes(), body)?
+            state.write_message(&pack_payload(local_index, epoch), body)?
         };
         debug_assert_eq!(body_len, MSG1_LEN - MAC1_LEN);
         seal_mac1(responder_static, &mut msg)?;
@@ -185,6 +259,7 @@ impl Initiator {
                 responder_static: *responder_static,
                 local_static: *local_public,
                 local_index,
+                epoch,
             },
             msg,
         ))
@@ -202,15 +277,21 @@ impl Initiator {
         // msg2's mac1 is keyed on *our* static key: we are its recipient.
         let body = verify_mac1(&self.local_static, msg2)?;
 
-        let mut payload = [0u8; INDEX_PAYLOAD_LEN];
+        let mut payload = [0u8; PAYLOAD_LEN];
         let n = self
             .state
             .read_message(body, &mut payload)
             .map_err(|_| Error::Rejected)?;
-        if n != INDEX_PAYLOAD_LEN {
+        if n != PAYLOAD_LEN {
             return Err(Error::Rejected);
         }
-        let remote_index = u32::from_le_bytes(payload);
+        let (remote_index, echoed_epoch) = unpack_payload(&payload);
+        // The responder echoes the epoch it will use. A mismatch would mean the
+        // two ends disagree about the carrier's sequence numbering, which would
+        // surface as a flow that contradicts itself rather than as a failure.
+        if echoed_epoch != self.epoch {
+            return Err(Error::Rejected);
+        }
 
         Ok(Session {
             transport: self.state.into_stateless_transport_mode()?,
@@ -221,6 +302,7 @@ impl Initiator {
             replay: ReplayWindow::new(),
             established: now,
             is_initiator: true,
+            epoch: self.epoch,
         })
     }
 
@@ -242,6 +324,7 @@ pub struct PendingResponder {
     responder_static: PublicKey,
     initiator_static: PublicKey,
     remote_index: u32,
+    epoch: u32,
 }
 
 impl PendingResponder {
@@ -263,13 +346,14 @@ impl PendingResponder {
             .local_private_key(local.as_bytes())?
             .build_responder()?;
 
-        let mut payload = [0u8; INDEX_PAYLOAD_LEN];
+        let mut payload = [0u8; PAYLOAD_LEN];
         let n = state
             .read_message(body, &mut payload)
             .map_err(|_| Error::Rejected)?;
-        if n != INDEX_PAYLOAD_LEN {
+        if n != PAYLOAD_LEN {
             return Err(Error::Rejected);
         }
+        let (remote_index, epoch) = unpack_payload(&payload);
 
         let raw = state.get_remote_static().ok_or(Error::Rejected)?;
         let initiator_static: [u8; 32] = raw.try_into().map_err(|_| Error::Rejected)?;
@@ -278,7 +362,8 @@ impl PendingResponder {
             state,
             responder_static: *local_public,
             initiator_static: PublicKey::from_bytes(initiator_static),
-            remote_index: u32::from_le_bytes(payload),
+            remote_index,
+            epoch,
         })
     }
 
@@ -286,6 +371,12 @@ impl PendingResponder {
     #[must_use]
     pub const fn initiator_static(&self) -> &PublicKey {
         &self.initiator_static
+    }
+
+    /// The epoch the initiator chose, for deriving the carrier's numbering.
+    #[must_use]
+    pub const fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     /// Accepts the handshake, producing msg2 and the established session.
@@ -296,7 +387,8 @@ impl PendingResponder {
         let mut msg = [0u8; MSG2_LEN];
         let body_len = {
             let (body, _) = msg.split_at_mut(MSG2_LEN - MAC1_LEN);
-            self.state.write_message(&local_index.to_le_bytes(), body)?
+            self.state
+                .write_message(&pack_payload(local_index, self.epoch), body)?
         };
         debug_assert_eq!(body_len, MSG2_LEN - MAC1_LEN);
         // msg2's mac1 is keyed on the initiator's static key: it is the recipient.
@@ -311,6 +403,7 @@ impl PendingResponder {
             replay: ReplayWindow::new(),
             established: now,
             is_initiator: false,
+            epoch: self.epoch,
         };
         Ok((session, msg))
     }
@@ -329,6 +422,8 @@ pub struct Session {
     replay: ReplayWindow,
     established: Millis,
     is_initiator: bool,
+    /// The epoch this session was established under.
+    epoch: u32,
 }
 
 impl Session {
@@ -469,6 +564,15 @@ impl Session {
         now.saturating_sub(self.established) >= REJECT_AFTER_TIME
     }
 
+    /// The epoch this session was established under.
+    ///
+    /// Feed it to [`carrier_numbers`] together with the two static public keys
+    /// to obtain the carrier's sequence numbering.
+    #[must_use]
+    pub const fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     /// Messages sent under this session so far.
     #[must_use]
     pub const fn sent(&self) -> u64 {
@@ -519,6 +623,8 @@ mod tests {
         server: Session,
     }
 
+    const TEST_EPOCH: u32 = 0xC0FF_EE01;
+
     /// Runs a full handshake and returns both established sessions.
     fn handshake_at(now: Millis) -> (Pair, KeyPair, KeyPair) {
         let client_kp = KeyPair::generate().expect("generate");
@@ -529,6 +635,7 @@ mod tests {
             &client_kp.public,
             &server_kp.public,
             0x1111_1111,
+            TEST_EPOCH,
         )
         .expect("start");
 
@@ -571,9 +678,14 @@ mod tests {
     fn handshake_message_lengths_are_fixed() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (init, msg1) =
-            Initiator::start(&client_kp.private, &client_kp.public, &server_kp.public, 1)
-                .expect("start");
+        let (init, msg1) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
         assert_eq!(msg1.len(), MSG1_LEN);
         let pending =
             PendingResponder::read(&server_kp.private, &server_kp.public, &msg1).expect("read");
@@ -742,6 +854,7 @@ mod tests {
             &stranger.public,
             &server_kp.public,
             0xAAAA,
+            TEST_EPOCH,
         )
         .expect("start");
 
@@ -760,9 +873,14 @@ mod tests {
         let intended = KeyPair::generate().expect("generate");
         let other_server = KeyPair::generate().expect("generate");
 
-        let (_, msg1) =
-            Initiator::start(&client_kp.private, &client_kp.public, &intended.public, 1)
-                .expect("start");
+        let (_, msg1) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &intended.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
 
         // A server that is not the intended recipient rejects on mac1, before
         // doing any Diffie-Hellman at all.
@@ -776,9 +894,14 @@ mod tests {
     fn mac1_rejects_a_corrupted_handshake() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (_, mut msg1) =
-            Initiator::start(&client_kp.private, &client_kp.public, &server_kp.public, 1)
-                .expect("start");
+        let (_, mut msg1) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
 
         msg1[0] ^= 0x01;
         assert!(matches!(
@@ -803,9 +926,14 @@ mod tests {
     fn a_forged_msg2_is_rejected() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (initiator, _msg1) =
-            Initiator::start(&client_kp.private, &client_kp.public, &server_kp.public, 1)
-                .expect("start");
+        let (initiator, _msg1) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
 
         let forged = [0u8; MSG2_LEN];
         assert!(matches!(initiator.finish(&forged, 0), Err(Error::Rejected)));
@@ -816,10 +944,22 @@ mod tests {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (_, a) = Initiator::start(&client_kp.private, &client_kp.public, &server_kp.public, 1)
-            .expect("start");
-        let (_, b) = Initiator::start(&client_kp.private, &client_kp.public, &server_kp.public, 1)
-            .expect("start");
+        let (_, a) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
+        let (_, b) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
 
         // Fresh ephemerals each time, so a recorded handshake cannot be replayed
         // as-is and identical sessions are not identifiable by their bytes.
@@ -835,6 +975,74 @@ mod tests {
         let header = peek_header(p.server.mask(), &wire[..n]).expect("peek");
         assert_eq!(header.index, p.server.local_index());
         assert_eq!(header.counter, 0);
+    }
+
+    #[test]
+    fn both_ends_agree_on_the_epoch() {
+        let (p, client_kp, server_kp) = handshake_at(0);
+        assert_eq!(p.client.epoch(), TEST_EPOCH);
+        assert_eq!(p.server.epoch(), TEST_EPOCH);
+
+        // And therefore on the carrier's numbering, without a SYN having been
+        // exchanged to establish it.
+        let a = carrier_numbers(p.client.epoch(), &client_kp.public, &server_kp.public);
+        let b = carrier_numbers(p.server.epoch(), &client_kp.public, &server_kp.public);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_three_carrier_numbers_differ_from_one_another() {
+        let (_, client_kp, server_kp) = handshake_at(0);
+        let (i, r, ts) = carrier_numbers(TEST_EPOCH, &client_kp.public, &server_kp.public);
+        assert_ne!(i, r, "the two directions must not share a sequence space");
+        assert_ne!(i, ts);
+        assert_ne!(r, ts);
+    }
+
+    #[test]
+    fn a_fresh_epoch_gives_fresh_carrier_numbers() {
+        // Otherwise a reconnection would replay the previous conversation's
+        // sequence numbers, which is exactly the anomaly this avoids.
+        let (_, client_kp, server_kp) = handshake_at(0);
+        let a = carrier_numbers(1, &client_kp.public, &server_kp.public);
+        let b = carrier_numbers(2, &client_kp.public, &server_kp.public);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn different_peers_never_share_carrier_numbers() {
+        let one = KeyPair::generate().expect("generate");
+        let two = KeyPair::generate().expect("generate");
+        let three = KeyPair::generate().expect("generate");
+        assert_ne!(
+            carrier_numbers(7, &one.public, &two.public),
+            carrier_numbers(7, &one.public, &three.public)
+        );
+    }
+
+    #[test]
+    fn a_responder_echoing_the_wrong_epoch_is_rejected() {
+        // A mismatch means the two ends disagree about the carrier's numbering,
+        // which would show up on the wire as a flow contradicting itself rather
+        // than as an outright failure. Catch it at the handshake instead.
+        let client_kp = KeyPair::generate().expect("generate");
+        let server_kp = KeyPair::generate().expect("generate");
+
+        let (initiator, msg1) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            1,
+            TEST_EPOCH,
+        )
+        .expect("start");
+
+        let mut pending =
+            PendingResponder::read(&server_kp.private, &server_kp.public, &msg1).expect("read");
+        pending.epoch = TEST_EPOCH ^ 0xFFFF;
+        let (_, msg2) = pending.accept(2, 0).expect("accept");
+
+        assert!(matches!(initiator.finish(&msg2, 0), Err(Error::Rejected)));
     }
 
     #[test]

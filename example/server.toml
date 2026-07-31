@@ -1,0 +1,22 @@
+# The side with a stable address. It waits for the client and learns where the
+# client is from whichever address sends a packet that authenticates, so a
+# client on a dynamic connection needs nothing configured here.
+
+[interface]
+# From `paqetz keygen`. The only secret in the system.
+private_key = "REPLACE-WITH-YOUR-PRIVATE-KEY"
+
+# This end's address inside the tunnel, with the tunnel subnet's prefix.
+address = "10.7.0.1/24"
+
+# The outer TCP port. Avoid 80 and 443: the firewall rules are scoped to this
+# port and would disturb the host's own traffic on a standard one.
+listen_port = 9999
+
+[peer]
+# The client's public key, from its `paqetz keygen`.
+public_key = "REPLACE-WITH-THE-CLIENT-PUBLIC-KEY"
+
+# The client's address inside the tunnel. Its allowed source addresses are
+# derived from this, so there is normally no `allowed_ips` to write.
+tunnel_address = "10.7.0.2"

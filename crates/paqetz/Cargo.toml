@@ -12,6 +12,12 @@ name = "paqetz"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
 paqetz-core = { workspace = true }
 paqetz-dp = { workspace = true }
 paqetz-fw = { workspace = true }
