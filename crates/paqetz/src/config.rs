@@ -51,6 +51,10 @@ pub(crate) struct Interface {
     pub(crate) carrier: paqetz_tcpwire::Carrier,
     /// Whether to manage firewall rules automatically.
     pub(crate) manage_firewall: bool,
+    /// How much to say on stdout.
+    pub(crate) log: crate::log::Level,
+    /// Seconds between health lines; zero disables them.
+    pub(crate) health_interval: u64,
     /// Whether to move packets in batches.
     pub(crate) datapath: Datapath,
     /// Which transmit path to use.
@@ -231,6 +235,10 @@ struct RawInterface {
     datapath: Option<String>,
     #[serde(default)]
     transmit: Option<String>,
+    #[serde(default)]
+    log: Option<String>,
+    #[serde(default)]
+    health_interval: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,6 +382,17 @@ impl Config {
             }
         };
 
+        let log_name = raw.interface.log.as_deref().unwrap_or("info");
+        let log = crate::log::Level::parse(log_name).ok_or_else(|| {
+            invalid(
+                "interface.log",
+                format!(
+                    "unknown level {log_name:?}; known levels are {:?}",
+                    crate::log::Level::ALL
+                ),
+            )
+        })?;
+
         let public_key = PublicKey::from_base64(&raw.peer.public_key)
             .map_err(|e| invalid("peer.public_key", e.to_string()))?;
 
@@ -469,6 +488,8 @@ impl Config {
                 manage_firewall: raw.interface.manage_firewall.unwrap_or(true),
                 datapath,
                 transmit,
+                log,
+                health_interval: raw.interface.health_interval.unwrap_or(60),
             },
             peer: Peer {
                 public_key,
@@ -568,6 +589,41 @@ tunnel_address = "10.7.0.2"
         assert_eq!(c.interface.profile.name, "linux-6");
         assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Midstream);
         assert!(c.interface.manage_firewall);
+    }
+
+    #[test]
+    fn logging_defaults_to_info_with_a_health_line_every_minute() {
+        let c = Config::parse(CLIENT).expect("parse");
+        assert_eq!(c.interface.log, crate::log::Level::Info);
+        assert_eq!(c.interface.health_interval, 60);
+    }
+
+    #[test]
+    fn the_log_level_can_be_set_and_silenced() {
+        for name in crate::log::Level::ALL {
+            let text = CLIENT.replace("[peer]", &format!("log = \"{name}\"\n\n[peer]"));
+            let c = Config::parse(&text).expect("parse");
+            assert_eq!(c.interface.log.name(), *name);
+        }
+    }
+
+    #[test]
+    fn an_unknown_log_level_lists_the_known_ones() {
+        let text = CLIENT.replace("[peer]", "log = \"verbose\"\n\n[peer]");
+        let err = Config::parse(&text).expect_err("must be rejected");
+        assert!(err.to_string().contains("debug"), "got: {err}");
+    }
+
+    #[test]
+    fn the_health_line_can_be_disabled() {
+        let text = CLIENT.replace("[peer]", "health_interval = 0\n\n[peer]");
+        assert_eq!(
+            Config::parse(&text)
+                .expect("parse")
+                .interface
+                .health_interval,
+            0
+        );
     }
 
     #[test]

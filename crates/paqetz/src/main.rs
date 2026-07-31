@@ -5,6 +5,8 @@
 
 mod config;
 mod doctor;
+mod log;
+mod stats;
 mod tunnel;
 
 use std::path::PathBuf;
@@ -82,6 +84,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    log::init();
     let cli = Cli::parse();
     match cli.command {
         Command::Keygen => keygen(),
@@ -121,11 +124,18 @@ fn pubkey() -> Result<(), Box<dyn std::error::Error>> {
 fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(path)?;
     let manage_firewall = cfg.interface.manage_firewall;
+    // `PAQETZ_LOG` overrides the file, so a level can be raised for one run
+    // without editing anything.
+    let level = std::env::var("PAQETZ_LOG")
+        .ok()
+        .and_then(|v| log::Level::parse(&v))
+        .unwrap_or(cfg.interface.log);
+    log::set_level(level);
 
     tunnel::install_signal_handlers();
 
-    println!(
-        "paqetz: {} at {} (mtu {}), peer {} {}",
+    log::info!(
+        "{} at {} (mtu {}), peer {} {}",
         cfg.interface.device,
         cfg.interface.address,
         cfg.interface.mtu,
@@ -143,9 +153,10 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let socks5 = cfg.socks5.clone();
     let device = cfg.interface.device.clone();
 
-    let tunnel = Tunnel::start(cfg)?;
+    let mut tunnel = Tunnel::start(cfg)?;
+    tunnel.watch_config(path.to_path_buf());
     let port = tunnel.local_port();
-    println!("paqetz: outer port {port}");
+    log::info!("outer port {port}, log level {}", level.name());
 
     // The rules are load-bearing, not advisory (D9): without them the kernel
     // resets the flow. Installing them here means one less way for a setup to
@@ -157,8 +168,8 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 Some(fw)
             }
             Err(e) => {
-                eprintln!("warning: {e}");
-                eprintln!("the tunnel will run, but the kernel may reset it");
+                log::warn_!("{e}");
+                log::warn_!("the tunnel will run, but the kernel may reset it");
                 None
             }
         }
@@ -187,7 +198,7 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 .name("socks5-accept".to_owned())
                 .spawn(move || {
                     if let Err(e) = paqetz_net4::serve(listener, running) {
-                        eprintln!("socks5: {e}");
+                        log::error!("socks5: {e}");
                     }
                 })?;
             Some(policy)
@@ -204,7 +215,7 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(fw) = fw
         && let Err(e) = fw.revert()
     {
-        eprintln!("warning: could not remove firewall rules: {e}");
+        log::warn_!("could not remove firewall rules: {e}");
     }
 
     result.map_err(Into::into)

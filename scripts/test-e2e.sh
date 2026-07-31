@@ -74,6 +74,7 @@ address = "${SRV_INNER}/24"
 listen_port = ${PORT}
 device = "pq-srv"
 datapath = "${DATAPATH:-batched}"
+health_interval = 2
 
 [peer]
 public_key = "${CLI_PUB}"
@@ -91,6 +92,7 @@ address = "${CLI_INNER}/24"
 listen_port = $((PORT + 1))
 device = "pq-cli"
 datapath = "${DATAPATH}"
+health_interval = 2
 
 [peer]
 public_key = "${SRV_PUB}"
@@ -476,6 +478,71 @@ PYEOF
     fi
 else
     bad "could not find the tunnel process inside ${SRV_NS}"
+fi
+
+# --- diagnostics ------------------------------------------------------------
+log "diagnostics"
+if grep -q "handshake completed" "${WORK}/client.log"; then
+    ok "the handshake is reported when it completes"
+else
+    bad "no handshake line in the client log"
+fi
+
+sleep 3
+if grep -q "up .* | handshake .* | tx .* | rx " "${WORK}/server.log"; then
+    ok "the health line reports traffic in both directions"
+else
+    bad "no health line in the server log"
+fi
+
+# A flood of garbage at the port must cost one counter increment per packet,
+# not one log line: otherwise a prober decides how much this process writes.
+before=$(wc -l < "${WORK}/server.log")
+sudo ip netns exec "${CLI_NS}" python3 - "${SRV_OUTER}" "${PORT}" <<'PYEOF' 2>/dev/null
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket()
+s.settimeout(0.2)
+# Connect attempts to the port produce inbound segments the tunnel must reject.
+for _ in range(200):
+    try:
+        s2 = socket.socket()
+        s2.settimeout(0.05)
+        s2.connect_ex((host, port))
+        s2.close()
+    except OSError:
+        pass
+PYEOF
+sleep 1
+after=$(wc -l < "${WORK}/server.log")
+if [[ $((after - before)) -lt 20 ]]; then
+    ok "garbage at the port does not produce a line per packet ($((after - before)) lines)"
+else
+    bad "garbage produced $((after - before)) log lines; it should be counted, not logged"
+fi
+
+# SIGHUP re-reads the file: the log level changes without dropping the session.
+sed -i 's/^health_interval = 2/health_interval = 2\nlog = "debug"/' "${WORK}/server.toml"
+srv_pid_hup=""
+for p in $(sudo ip netns pids "${SRV_NS}" 2>/dev/null); do
+    if [[ $(cat "/proc/${p}/comm" 2>/dev/null) == paqetz ]]; then srv_pid_hup=${p}; break; fi
+done
+if [[ -n ${srv_pid_hup} ]]; then
+    sudo kill -HUP "${srv_pid_hup}"
+    sleep 1
+    if grep -q "log level is now debug" "${WORK}/server.log"; then
+        ok "SIGHUP applies a new log level"
+    else
+        bad "SIGHUP did not apply the new log level"
+    fi
+    # And the tunnel is still up afterwards.
+    if sudo ip netns exec "${CLI_NS}" ping -c2 -W3 "${SRV_INNER}" >/dev/null 2>&1; then
+        ok "the tunnel survives a reload"
+    else
+        bad "the tunnel did not survive a reload"
+    fi
+else
+    bad "could not find the server process to signal"
 fi
 
 # --- firewall rules were installed and are removed on exit ------------------

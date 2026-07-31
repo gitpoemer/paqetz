@@ -30,6 +30,8 @@ use paqetz_tcpwire::segment::{self, MAX_OVERHEAD};
 use paqetz_tcpwire::{Endpoint as Carrier, Role};
 
 use crate::config::{Config, Datapath};
+use crate::log::{debug, error, info, warn_};
+use crate::stats::Stats;
 
 /// How often the timer thread wakes.
 const TICK: Duration = Duration::from_millis(250);
@@ -82,6 +84,9 @@ pub(crate) struct Tunnel {
     local_public: PublicKey,
     started: Instant,
     running: Arc<AtomicBool>,
+    stats: Arc<Stats>,
+    /// Where the configuration was read from, so `SIGHUP` can re-read it.
+    config_path: Option<std::path::PathBuf>,
 }
 
 /// Anything that can stop the tunnel starting.
@@ -207,7 +212,7 @@ impl Tunnel {
             }
         };
         let _ = tx.set_send_buffer(4 * 1024 * 1024);
-        println!("paqetz: transmit via {}", tx.name());
+        info!("transmit via {}", tx.name());
 
         Ok(Self {
             state: Arc::new(Mutex::new(PeerState::new(cfg.peer.endpoint))),
@@ -219,6 +224,8 @@ impl Tunnel {
             local_public,
             started: Instant::now(),
             running: Arc::new(AtomicBool::new(true)),
+            stats: Arc::new(Stats::default()),
+            config_path: None,
         })
     }
 
@@ -277,6 +284,15 @@ impl Tunnel {
                 source,
             })?;
 
+        let health = Arc::clone(&this);
+        let t4 = std::thread::Builder::new()
+            .name("health".to_owned())
+            .spawn(move || health.health())
+            .map_err(|source| Error::Os {
+                context: "starting the health thread".to_owned(),
+                source,
+            })?;
+
         // The worker threads block in `read` and `recv`, so they cannot notice
         // a flag on their own. The process exits once this returns and the
         // caller has removed the firewall rules; the blocked threads go with
@@ -284,17 +300,119 @@ impl Tunnel {
         // rest of the throughput work.
         while this.running.load(Ordering::Relaxed) && !SHUTDOWN.load(Ordering::Relaxed) {
             std::thread::sleep(TICK);
+            if reload_requested()
+                && let Some(path) = this.config_path.as_ref()
+            {
+                this.reload(path);
+            }
         }
         this.stop();
 
-        drop((t1, t2, t3));
+        drop((t1, t2, t3, t4));
         Ok(())
+    }
+
+    /// Remembers where the configuration came from, enabling `SIGHUP`.
+    pub(crate) fn watch_config(&mut self, path: std::path::PathBuf) {
+        self.config_path = Some(path);
     }
 
     /// A handle to the flag that stops every loop, including any front end
     /// started alongside the tunnel.
     pub(crate) fn running_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.running)
+    }
+
+    /// Prints the health line every `health_interval` seconds.
+    fn health(&self) {
+        let interval = self.cfg.interface.health_interval;
+        if interval == 0 {
+            return;
+        }
+        let mut next = Duration::from_secs(interval);
+        while self.running.load(Ordering::Relaxed) && !SHUTDOWN.load(Ordering::Relaxed) {
+            std::thread::sleep(TICK);
+            if self.started.elapsed() < next {
+                continue;
+            }
+            next = self.started.elapsed() + Duration::from_secs(interval);
+            if crate::log::enabled(crate::log::Level::Info) {
+                // The kernel's own drop counter resets on read, so each line
+                // reports the interval since the last rather than a total.
+                let drops = self.rx.drops().ok();
+                crate::log::emit(
+                    crate::log::Level::Info,
+                    format_args!("{}", self.stats.line(self.now(), drops)),
+                );
+            }
+        }
+    }
+
+    /// Applies the parts of a new configuration that can change without
+    /// dropping the session, and reports the parts that cannot.
+    ///
+    /// Deliberately narrow. The log level is the field worth changing on a
+    /// running tunnel — turning on detail when something is wrong, without
+    /// interrupting the traffic being investigated. Everything else either
+    /// belongs to a live session (keys, the carrier's numbering) or to a socket
+    /// already bound, and pretending otherwise would produce a tunnel whose
+    /// behaviour no longer matches its configuration file.
+    pub(crate) fn reload(&self, path: &std::path::Path) {
+        let fresh = match Config::load(path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("reload: {e}; keeping the running configuration");
+                return;
+            }
+        };
+
+        if fresh.interface.log != crate::log::level() {
+            crate::log::set_level(fresh.interface.log);
+            // Emitted after the change so raising the level shows this line.
+            info!("reload: log level is now {}", fresh.interface.log.name());
+        }
+
+        let old = &self.cfg;
+        let mut needs_restart = Vec::new();
+        if fresh.peer.public_key != old.peer.public_key {
+            needs_restart.push("peer.public_key");
+        }
+        if fresh.peer.endpoint != old.peer.endpoint {
+            needs_restart.push("peer.endpoint");
+        }
+        if fresh.peer.allowed_ips != old.peer.allowed_ips {
+            needs_restart.push("peer.allowed_ips");
+        }
+        if fresh.interface.listen_port != old.interface.listen_port {
+            needs_restart.push("interface.listen_port");
+        }
+        if fresh.interface.mtu != old.interface.mtu {
+            needs_restart.push("interface.mtu");
+        }
+        if fresh.interface.address != old.interface.address {
+            needs_restart.push("interface.address");
+        }
+        if fresh.interface.profile != old.interface.profile {
+            needs_restart.push("interface.profile");
+        }
+        if fresh.interface.datapath != old.interface.datapath {
+            needs_restart.push("interface.datapath");
+        }
+        if fresh.interface.transmit != old.interface.transmit {
+            needs_restart.push("interface.transmit");
+        }
+        if fresh.interface.health_interval != old.interface.health_interval {
+            needs_restart.push("interface.health_interval");
+        }
+
+        if needs_restart.is_empty() {
+            debug!("reload: nothing else changed");
+        } else {
+            warn_!(
+                "reload: {} changed but needs a restart to take effect",
+                needs_restart.join(", ")
+            );
+        }
     }
 
     /// Asks the loops to stop.
@@ -326,7 +444,7 @@ impl Tunnel {
                     if e.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    eprintln!("tun read failed: {e}");
+                    error!("reading the device failed: {e}");
                     break;
                 }
             };
@@ -349,7 +467,7 @@ impl Tunnel {
         // Set once, not per read. Toggling it around each read cost two extra
         // syscalls per packet, which made batching slower than not batching.
         if let Err(e) = self.tun.set_nonblocking(true) {
-            eprintln!("could not set the device non-blocking: {e}");
+            error!("could not set the device non-blocking: {e}");
             return;
         }
 
@@ -445,7 +563,7 @@ impl Tunnel {
                 Ok(true) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    eprintln!("waiting on the device failed: {e}");
+                    error!("waiting on the device failed: {e}");
                     return None;
                 }
             }
@@ -455,20 +573,21 @@ impl Tunnel {
                 Ok(_) => continue,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    eprintln!("tun read failed: {e}");
+                    error!("reading the device failed: {e}");
                     return None;
                 }
             }
         }
     }
 
-    /// Reports a per-packet outbound failure, unless it is an ordinary one.
+    /// Records a per-packet outbound failure.
+    ///
+    /// Counted rather than logged: a packet we cannot send is dropped exactly
+    /// as a congested link would drop it, and a line per drop would let a
+    /// congested link decide how much this process writes.
     fn note_outbound(&self, e: &Error) {
-        // A packet we cannot send is dropped, exactly as a congested link would
-        // drop it. Inner TCP retries; nothing here should treat it as fatal.
-        if !matches!(e, Error::Core(paqetz_core::Error::Expired)) {
-            eprintln!("dropping outbound packet: {e}");
-        }
+        Stats::bump(&self.stats.tx_dropped);
+        debug!("outbound packet dropped: {e}");
     }
 
     /// Encrypts one inner packet and transmits it immediately.
@@ -500,6 +619,8 @@ impl Tunnel {
             return Ok(None);
         };
         let n = session.seal(packet, sealed, now)?;
+        Stats::bump(&self.stats.tx_packets);
+        Stats::add(&self.stats.tx_bytes, packet.len() as u64);
 
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(None);
@@ -536,7 +657,7 @@ impl Tunnel {
                     if e.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    eprintln!("capture read failed: {e}");
+                    error!("reading from the wire failed: {e}");
                     break;
                 }
             };
@@ -557,17 +678,19 @@ impl Tunnel {
         }
     }
 
-    /// Reports a per-packet inbound failure, unless it is an ordinary one.
+    /// Records a per-packet inbound failure.
+    ///
+    /// Counted rather than logged, and this is the case that matters: anything
+    /// unauthenticated reaches here, so a line per packet would let whoever is
+    /// sending garbage at the port choose how much this process writes to disk
+    /// and how long it spends formatting. See `crate::stats`.
     fn note_inbound(&self, e: &Error) {
-        // Anything unauthenticated lands here. It is dropped silently in the
-        // sense that matters — nothing goes back on the wire — but it is worth
-        // a line at this stage of development.
-        if !matches!(
-            e,
-            Error::Core(paqetz_core::Error::Rejected | paqetz_core::Error::Replay)
-        ) {
-            eprintln!("dropping inbound packet: {e}");
+        match e {
+            Error::Core(paqetz_core::Error::Rejected) => Stats::bump(&self.stats.rejected),
+            Error::Core(paqetz_core::Error::Replay) => Stats::bump(&self.stats.replayed),
+            _ => Stats::bump(&self.stats.rejected),
         }
+        debug!("inbound packet dropped: {e}");
     }
 
     /// One frame per syscall.
@@ -583,7 +706,7 @@ impl Tunnel {
                     if e.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    eprintln!("capture read failed: {e}");
+                    error!("reading from the wire failed: {e}");
                     break;
                 }
             };
@@ -690,6 +813,12 @@ impl Tunnel {
         state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
         drop(state);
 
+        self.stats.note_handshake(now);
+        info!(
+            "handshake completed with {} at {}:{}",
+            self.cfg.peer.public_key, seg.src.0, seg.src.1
+        );
+
         let Some(out) = reply.get(..written) else {
             return Ok(());
         };
@@ -709,6 +838,9 @@ impl Tunnel {
                     carrier.on_receive(seg);
                 }
                 state.session = Some(session);
+                drop(state);
+                self.stats.note_handshake(now);
+                info!("handshake completed with {}", self.cfg.peer.public_key);
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -734,10 +866,19 @@ impl Tunnel {
         // may have moved, and following it here is what makes a NAT rebinding
         // invisible instead of fatal.
         if state.endpoint != Some(from) {
+            let was = state.endpoint;
             state.endpoint = Some(from);
             if let Some(carrier) = state.carrier.as_mut() {
                 carrier.set_remote((from.ip().to_owned(), from.port()));
             }
+            Stats::bump(&self.stats.roams);
+            // The single most useful line when a link is flapping: it says the
+            // peer moved and the tunnel followed, rather than leaving a gap in
+            // traffic with no explanation.
+            info!(
+                "peer moved from {} to {from}",
+                was.map_or_else(|| "unknown".to_owned(), |a| a.to_string())
+            );
         }
         if let Some(carrier) = state.carrier.as_mut() {
             carrier.on_receive(seg);
@@ -747,6 +888,8 @@ impl Tunnel {
         let Some(packet) = inner.get(..n) else {
             return Ok(());
         };
+        Stats::bump(&self.stats.rx_packets);
+        Stats::add(&self.stats.rx_bytes, n as u64);
         self.deliver(packet)
     }
 
@@ -760,11 +903,13 @@ impl Tunnel {
         // source address, including one that reaches a service bound to the
         // host's loopback.
         if !self.cfg.peer.permits(source) {
-            eprintln!("dropping inner packet with disallowed source {source}");
+            Stats::bump(&self.stats.disallowed);
+            debug!("inner packet refused: source {source} is outside the peer's range");
             return Ok(());
         }
         if !plausible_source(source) {
-            eprintln!("dropping inner packet with martian source {source}");
+            Stats::bump(&self.stats.martian);
+            debug!("inner packet refused: source {source} is not a usable address");
             return Ok(());
         }
 
@@ -797,7 +942,7 @@ impl Tunnel {
         let mut frame = vec![0u8; MAX_FRAME];
         while self.running.load(Ordering::Relaxed) {
             if let Err(e) = self.maybe_handshake(&mut frame) {
-                eprintln!("handshake attempt failed: {e}");
+                warn_!("handshake attempt failed: {e}");
             }
             std::thread::sleep(TICK);
         }
@@ -867,6 +1012,9 @@ impl Tunnel {
         state.pending = Some(initiator);
         state.last_handshake = now;
         drop(state);
+
+        Stats::bump(&self.stats.handshakes_sent);
+        debug!("handshake sent to {peer}");
 
         let Some(out) = frame.get(..written) else {
             return Ok(());
@@ -943,6 +1091,19 @@ fn outbound_interface() -> io::Result<String> {
 /// Set by the signal handler; polled by [`Tunnel::run`].
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Set by the signal handler when `SIGHUP` arrives.
+static RELOAD: AtomicBool = AtomicBool::new(false);
+
+/// Whether a reload has been requested, clearing the request.
+pub(crate) fn reload_requested() -> bool {
+    RELOAD.swap(false, Ordering::Relaxed)
+}
+
+/// Records that a reload signal arrived.
+extern "C" fn on_hangup(_: libc::c_int) {
+    RELOAD.store(true, Ordering::Relaxed);
+}
+
 /// Records that a shutdown signal arrived.
 ///
 /// Storing to an atomic is async-signal-safe; nothing else here would be, which
@@ -953,6 +1114,13 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 /// Arranges for `SIGINT` and `SIGTERM` to request a clean stop.
 pub(crate) fn install_signal_handlers() {
+    {
+        let handler: extern "C" fn(libc::c_int) = on_hangup;
+        // SAFETY: as below — the handler only stores to an atomic.
+        unsafe {
+            libc::signal(libc::SIGHUP, handler as *const () as libc::sighandler_t);
+        }
+    }
     for sig in [libc::SIGINT, libc::SIGTERM] {
         let handler: extern "C" fn(libc::c_int) = on_signal;
         // SAFETY: `on_signal` is a plain `extern "C"` function that only stores

@@ -78,3 +78,25 @@ tunnel_address = "10.7.0.1"
 #table = 51         # routing table the policy rule points at
 #username = "..."   # optional; both or neither
 #password = "..."
+
+# --- Diagnostics ---
+
+# How much to say on stdout: off, error, warn, info (default), debug.
+# `PAQETZ_LOG=debug` overrides this for one run without editing the file, and
+# `kill -HUP` re-reads it on a running tunnel without dropping the session.
+#
+# Per-packet events are never logged individually -- they are counted, and
+# reported in the health line below. Logging one line per rejected packet would
+# let whoever is sending garbage at the port decide how much this process writes.
+#log = "info"
+
+# Seconds between health lines; 0 disables them. Each line reports uptime, how
+# long ago the last handshake completed, traffic each way, and any counter that
+# is non-zero:
+#
+#   up 3h12m | handshake 47s ago | tx 1.2M pkt/1.60 GB | rx 1.1M pkt/1.50 GB
+#
+# rx flat means nothing is arriving -- firewall or routing. rejected climbing
+# with rx flat means packets arrive and fail to authenticate -- a key mismatch,
+# or a scanner. ring-drops climbing means the capture buffer is too small.
+#health_interval = 60
