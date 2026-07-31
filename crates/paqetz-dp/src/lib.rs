@@ -1,4 +1,4 @@
-//! Datapath: raw transmit, `AF_PACKET` receive ring, TUN device (decision D8).
+//! Datapath: raw transmit, `AF_PACKET` receive, TUN device (decision D8).
 //!
 //! Linux only, by decision — so there is one implementation, not a matrix of
 //! `cfg` branches. No libpcap and no FFI beyond `libc`, which removes the
@@ -6,19 +6,31 @@
 //!
 //! Transmit is a raw `IPPROTO_TCP` socket with `IP_HDRINCL`: we supply the IP
 //! and TCP headers and the kernel handles routing, ARP, and L2 framing, so no
-//! gateway MAC address appears in the configuration. An `AF_PACKET` transmit
-//! path with an explicit destination MAC is retained as a fallback — and may
-//! prove to be the *faster* path, since it skips the routing lookup and the
-//! netfilter `OUTPUT` chain and can request NIC checksum offload. Phase 3
-//! measures both and picks the default on evidence.
+//! gateway MAC address appears in the configuration. Receive is `AF_PACKET`
+//! with a kernel-side BPF filter.
 //!
-//! Receive is `AF_PACKET` with an attached BPF filter and a `PACKET_MMAP` ring,
-//! read in place. `PACKET_FANOUT` spreads across worker threads when packet
-//! rate demands it.
+//! # Scope
 //!
-//! Performance rules that apply to everything in this crate (see
-//! `docs/08-rewrite-plan.md` §8.3): no allocation on the steady-state path, no
-//! dynamic dispatch, no locks, no async runtime. Threads block on syscalls and
-//! do the crypto inline. TUN reads use `IFF_VNET_HDR` with `TUNSETOFFLOAD` so
-//! one syscall returns a GSO super-packet rather than a single segment; that
-//! one feature is worth roughly 3x and is not optional.
+//! This phase implements the datapath correctly, not yet quickly. Reads and
+//! writes are one syscall per packet. The `PACKET_MMAP` receive ring,
+//! `PACKET_FANOUT` across workers, `sendmmsg` batching, and TUN GSO via
+//! `IFF_VNET_HDR` all belong to the throughput phase and are deliberately
+//! absent here — landing several hundred lines of ring-buffer `unsafe` before
+//! anything works end to end would be the wrong order. See
+//! `docs/08-rewrite-plan.md` §8.5 phase 3.
+
+pub mod bpf;
+pub mod rx;
+pub mod sys;
+pub mod tun;
+pub mod tx;
+
+pub use rx::PacketRx;
+pub use tun::Tun;
+pub use tx::RawTx;
+
+/// Largest frame this crate will read or write.
+///
+/// Comfortably above any Ethernet MTU, so a jumbo frame is truncated rather
+/// than overflowing anything.
+pub const MAX_FRAME: usize = 9216;

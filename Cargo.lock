@@ -235,6 +235,10 @@ dependencies = [
 [[package]]
 name = "paqetz-dp"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+]
 
 [[package]]
 name = "paqetz-fw"
