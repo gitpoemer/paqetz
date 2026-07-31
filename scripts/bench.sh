@@ -167,13 +167,26 @@ echo
 echo "==> ${SECONDS_PER_RUN}s per measurement, over a veth pair"
 echo "    (relative numbers are the point; a veth pair is not a real network)"
 echo
+# The full matrix, so each variable can be read independently: comparing down a
+# column isolates batching, comparing across a row isolates the transmit path.
+# Three runs sharing one setting would confound the two.
 run_one simple  raw      "simple  + raw"
+run_one simple  afpacket "simple  + af_packet"
 run_one batched raw      "batched + raw       [default]"
 run_one batched afpacket "batched + af_packet"
 
 echo
-echo "==> what to do with this"
-echo "    If batched is not clearly ahead, the syscall was not the bottleneck"
-echo "    and the AEAD is — which is the expected result at small packet sizes."
-echo "    If af_packet wins by enough to matter, set transmit = \"afpacket\" and"
-echo "    accept that a stale next-hop address becomes a failure mode."
+echo "==> reading this"
+echo "    Down a column (simple vs batched, same transmit): what batching is"
+echo "    worth. If it is not clearly ahead, the syscall was not the bottleneck"
+echo "    and the AEAD is — the expected result at these packet sizes, and a"
+echo "    sign the deferred PACKET_MMAP ring is correctly deferred."
+echo
+echo "    Across a row (raw vs af_packet, same datapath): what skipping the"
+echo "    route lookup, the netfilter OUTPUT chain, and the software checksum"
+echo "    is worth. transmit = \"raw\" is the default because it has no next-hop"
+echo "    address to go stale; switch only if this margin justifies that risk."
+echo
+echo "    UDP packet rate is the more useful of the two figures. TCP throughput"
+echo "    here is largely a measure of how few, large packets iperf3 can push;"
+echo "    the tunnel is bounded by packets, not bytes."
