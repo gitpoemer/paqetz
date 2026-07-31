@@ -102,6 +102,12 @@ pub(crate) struct Socks5 {
     pub(crate) table: u32,
     /// Credentials clients must present, if any.
     pub(crate) credentials: Option<(String, String)>,
+    /// Where to resolve names, reached through the tunnel.
+    ///
+    /// `None` means this host's own resolver, which is the network the tunnel
+    /// exists to get out of: it sees every name asked for, and decides what the
+    /// answers are. Set `dns = "system"` to accept that deliberately.
+    pub(crate) dns: Option<SocketAddrV4>,
 }
 
 /// How packets move between the device and the wire.
@@ -205,6 +211,20 @@ impl Peer {
     }
 }
 
+/// Reads a resolver address, defaulting the port to 53.
+///
+/// Written as a bare address in almost every case, since a resolver on a port
+/// other than 53 is unusual enough that spelling it out is the clearer thing to
+/// have to do.
+fn parse_resolver(text: &str) -> core::result::Result<SocketAddrV4, String> {
+    if let Ok(addr) = text.parse::<SocketAddrV4>() {
+        return Ok(addr);
+    }
+    text.parse::<Ipv4Addr>()
+        .map(|ip| SocketAddrV4::new(ip, 53))
+        .map_err(|e| format!("{text:?}: {e}"))
+}
+
 /// Whether `addr` falls inside `net/prefix`.
 #[must_use]
 pub(crate) fn in_network(addr: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
@@ -254,6 +274,8 @@ struct RawSocks5 {
     username: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    #[serde(default)]
+    dns: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +524,16 @@ impl Config {
                 // not steered anywhere, so the proxy would work perfectly and
                 // send everything out the ordinary route -- the failure that is
                 // hardest to notice, because nothing appears wrong.
+                // Through the tunnel by default. Resolving locally hands every
+                // name to the network being tunnelled out of, and lets it
+                // choose the answer -- which is a redirection to somewhere that
+                // never replies, indistinguishable from a slow site.
+                let dns = match r.dns.as_deref() {
+                    None => Some(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53)),
+                    Some("system") => None,
+                    Some(text) => Some(parse_resolver(text).map_err(|e| invalid("socks5.dns", e))?),
+                };
+
                 let mark = r.mark.unwrap_or(0x51);
                 if mark == 0 {
                     return Err(invalid(
@@ -511,6 +543,7 @@ impl Config {
                     ));
                 }
                 Some(Socks5 {
+                    dns,
                     listen,
                     mark,
                     table: r.table.unwrap_or(51),
@@ -773,6 +806,48 @@ tunnel_address = "10.7.0.2"
         assert!(s.listen.ip().is_loopback());
         assert_ne!(s.mark, 0, "a zero mark would steer nothing");
         assert!(s.credentials.is_none());
+    }
+
+    #[test]
+    fn names_resolve_through_the_tunnel_unless_that_is_declined() {
+        let with = |line: &str| {
+            let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\n{line}\n");
+            Config::parse(&text)
+                .expect("parse")
+                .socks5
+                .expect("socks5")
+                .dns
+        };
+
+        assert_eq!(
+            with(""),
+            Some(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53)),
+            "the default has to be the safe one: resolving locally hands every \
+             name to the network being tunnelled out of"
+        );
+        assert_eq!(
+            with("dns = \"9.9.9.9\""),
+            Some(SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 53))
+        );
+        assert_eq!(
+            with("dns = \"9.9.9.9:5353\""),
+            Some(SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 5353)),
+            "an unusual port can still be spelled out"
+        );
+        assert_eq!(with("dns = \"system\""), None, "opting out stays possible");
+    }
+
+    #[test]
+    fn a_resolver_that_is_not_an_address_is_refused() {
+        for bad in [
+            "dns = \"\"",
+            "dns = \"1.1.1.1.1\"",
+            "dns = \"::1\"",
+            "dns = \"resolver\"",
+        ] {
+            let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\n{bad}\n");
+            assert!(Config::parse(&text).is_err(), "{bad} should be refused");
+        }
     }
 
     #[test]

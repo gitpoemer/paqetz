@@ -183,6 +183,20 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(c, "# tunnel without routing the whole host through it.")?;
         writeln!(c, "[socks5]")?;
         writeln!(c, "listen = \"{listen}\"")?;
+        writeln!(
+            c,
+            "\n# Names are resolved through the tunnel, by this server,"
+        )?;
+        writeln!(
+            c,
+            "# rather than by whatever resolver this host is pointed at."
+        )?;
+        writeln!(c, "# The local network then learns neither what is being")?;
+        writeln!(
+            c,
+            "# reached nor gets to choose the answer. `system` opts out."
+        )?;
+        writeln!(c, "dns = \"1.1.1.1\"")?;
     }
 
     Ok(Pair {

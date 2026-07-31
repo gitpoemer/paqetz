@@ -22,9 +22,11 @@
 //! rather than the way to run this.
 
 pub mod dial;
+pub mod dns;
 pub mod protocol;
 pub mod route;
 pub mod server;
 
+pub use dns::Resolver;
 pub use protocol::Address;
 pub use server::{Config, serve};

@@ -16,6 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::time::Duration;
 
+use crate::dns::Resolver;
 use crate::protocol::Address;
 
 /// How long to wait for a target to accept a connection.
@@ -76,9 +77,15 @@ fn marked_socket(domain: libc::c_int, ty: libc::c_int, mark: u32) -> io::Result<
 ///
 /// # Errors
 /// Returns an error if the name does not resolve.
-pub fn resolve(address: &Address) -> io::Result<Vec<SocketAddr>> {
+pub fn resolve(address: &Address, resolver: Option<&Resolver>) -> io::Result<Vec<SocketAddr>> {
     match address {
         Address::Socket(a) => Ok(vec![*a]),
+        // Through the tunnel, so the local network neither sees the name nor
+        // gets to decide what it means.
+        Address::Domain(host, port) if resolver.is_some() => {
+            let r = resolver.ok_or_else(|| io::Error::other("resolver vanished"))?;
+            r.lookup(host, *port)
+        }
         // The resolver's own message says what went wrong but never which name
         // it was looking up, and one line of "Name has no usable address" among
         // many connections points nowhere. The name is the whole question here.
@@ -121,8 +128,12 @@ fn tunnelable(targets: Vec<SocketAddr>, address: &Address) -> io::Result<Vec<Soc
 ///
 /// # Errors
 /// Returns the last connection error, or a resolution failure.
-pub fn connect_tcp(address: &Address, mark: u32) -> io::Result<TcpStream> {
-    let targets = tunnelable(resolve(address)?, address)?;
+pub fn connect_tcp(
+    address: &Address,
+    mark: u32,
+    resolver: Option<&Resolver>,
+) -> io::Result<TcpStream> {
+    let targets = tunnelable(resolve(address, resolver)?, address)?;
     let mut last = io::Error::new(
         io::ErrorKind::NotFound,
         format!("socks5: {address} resolved to no addresses"),
@@ -279,8 +290,11 @@ fn raw_connect(fd: RawFd, target: SocketAddr) -> io::Result<()> {
 mod tests {
     #[test]
     fn a_resolution_failure_names_the_host_it_was_looking_up() {
-        let e = resolve(&Address::Domain("no-such-host.invalid".to_owned(), 443))
-            .expect_err(".invalid never resolves");
+        let e = resolve(
+            &Address::Domain("no-such-host.invalid".to_owned(), 443),
+            None,
+        )
+        .expect_err(".invalid never resolves");
         assert!(
             e.to_string().contains("no-such-host.invalid"),
             "a log line without the name points nowhere: {e}"
@@ -332,7 +346,7 @@ mod tests {
     fn a_literal_address_resolves_to_itself() {
         let a = Address::Socket("192.0.2.1:443".parse().expect("addr"));
         assert_eq!(
-            resolve(&a).expect("resolve"),
+            resolve(&a, None).expect("resolve"),
             vec!["192.0.2.1:443".parse::<SocketAddr>().expect("addr")]
         );
     }
@@ -341,7 +355,7 @@ mod tests {
     fn localhost_resolves() {
         // Uses the resolver but touches no network.
         let a = Address::Domain("localhost".to_owned(), 80);
-        let addrs = resolve(&a).expect("resolve");
+        let addrs = resolve(&a, None).expect("resolve");
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|a| a.ip().is_loopback()));
     }
@@ -349,7 +363,7 @@ mod tests {
     #[test]
     fn an_unresolvable_name_fails_rather_than_hanging() {
         let a = Address::Domain("this-name-should-not-exist.invalid".to_owned(), 80);
-        assert!(resolve(&a).is_err());
+        assert!(resolve(&a, None).is_err());
     }
 
     #[test]
@@ -381,7 +395,7 @@ mod tests {
         // Loopback only: binds nothing, and the connection is refused because
         // nothing is listening.
         let a = Address::Socket("127.0.0.1:1".parse().expect("addr"));
-        let err = connect_tcp(&a, 0).expect_err("nothing listens on port 1");
+        let err = connect_tcp(&a, 0, None).expect_err("nothing listens on port 1");
         assert_eq!(
             crate::protocol::reply_code_for(&err),
             crate::protocol::reply::CONNECTION_REFUSED
@@ -394,7 +408,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let a = Address::Socket(format!("127.0.0.1:{port}").parse().expect("addr"));
-        let stream = connect_tcp(&a, 0).expect("connect");
+        let stream = connect_tcp(&a, 0, None).expect("connect");
         assert_eq!(stream.peer_addr().expect("peer").port(), port);
     }
 }

@@ -38,6 +38,13 @@ pub struct Config {
     pub mark: u32,
     /// Required credentials, if any.
     pub credentials: Option<(String, String)>,
+    /// Where to resolve names, through the tunnel.
+    ///
+    /// `None` falls back to this host's own resolver, which is the network the
+    /// tunnel exists to get out of — so the names are visible to it, and it
+    /// decides what they resolve to. Kept only for a host where that is
+    /// genuinely wanted.
+    pub resolver: Option<crate::dns::Resolver>,
 }
 
 /// Runs the listener until `running` clears.
@@ -167,7 +174,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Relays a TCP connection.
 fn connect(mut client: TcpStream, address: &Address, config: &Config) -> io::Result<()> {
-    let target = match dial::connect_tcp(address, config.mark) {
+    let target = match dial::connect_tcp(address, config.mark, config.resolver.as_ref()) {
         Ok(t) => t,
         Err(e) => {
             let bound = Address::Socket(SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -303,7 +310,7 @@ fn forward_outbound(sock: &UdpSocket, datagram: &[u8], config: &Config) -> io::R
         Ok(p) => p,
         Err(_) => return Ok(()), // malformed: drop, as UDP always may
     };
-    let Ok(targets) = dial::resolve(&parsed.address) else {
+    let Ok(targets) = dial::resolve(&parsed.address, config.resolver.as_ref()) else {
         return Ok(());
     };
     // IPv4 only, for the reason the TCP side is: the relay socket is marked so
@@ -313,7 +320,6 @@ fn forward_outbound(sock: &UdpSocket, datagram: &[u8], config: &Config) -> io::R
     let Some(target) = targets.iter().find(|t| t.is_ipv4()) else {
         return Ok(());
     };
-    let _ = config;
     let _ = sock.send_to(parsed.payload, target);
     Ok(())
 }

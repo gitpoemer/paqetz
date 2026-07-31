@@ -366,7 +366,20 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 listen: cfg.listen,
                 mark: cfg.mark,
                 credentials: cfg.credentials,
+                // Marked the same way the proxied connections are, so the
+                // query takes the tunnel rather than the local network.
+                resolver: cfg.dns.map(|server| paqetz_net4::Resolver {
+                    server,
+                    mark: cfg.mark,
+                }),
             };
+            match cfg.dns {
+                Some(server) => log::info!("socks5 resolves through the tunnel at {server}"),
+                None => log::warn_!(
+                    "socks5 resolves with this host's own resolver: names are \
+                     visible to the local network, which also chooses the answers"
+                ),
+            }
             std::thread::Builder::new()
                 .name("socks5-accept".to_owned())
                 .spawn(move || {
