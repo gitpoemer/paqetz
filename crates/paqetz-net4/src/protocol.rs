@@ -269,6 +269,10 @@ pub fn reply_code_for(e: &io::Error) -> u8 {
         io::ErrorKind::ConnectionRefused => reply::CONNECTION_REFUSED,
         io::ErrorKind::HostUnreachable | io::ErrorKind::NotFound => reply::HOST_UNREACHABLE,
         io::ErrorKind::NetworkUnreachable => reply::NETWORK_UNREACHABLE,
+        // Raised for a destination that is IPv6-only. Saying so lets a client
+        // stop asking, rather than read a general failure and retry the same
+        // address it will never reach through here.
+        io::ErrorKind::Unsupported => reply::ADDRESS_NOT_SUPPORTED,
         _ => reply::GENERAL_FAILURE,
     }
 }

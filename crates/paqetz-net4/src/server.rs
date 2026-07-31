@@ -306,7 +306,11 @@ fn forward_outbound(sock: &UdpSocket, datagram: &[u8], config: &Config) -> io::R
     let Ok(targets) = dial::resolve(&parsed.address) else {
         return Ok(());
     };
-    let Some(target) = targets.first() else {
+    // IPv4 only, for the reason the TCP side is: the relay socket is marked so
+    // that the v4 policy route carries it, and a v6 destination would leave by
+    // the host's ordinary route instead — around the tunnel rather than through
+    // it. Dropped rather than sent, which is what UDP looks like anyway.
+    let Some(target) = targets.iter().find(|t| t.is_ipv4()) else {
         return Ok(());
     };
     let _ = config;

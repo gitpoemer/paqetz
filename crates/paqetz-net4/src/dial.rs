@@ -85,24 +85,47 @@ pub fn resolve(address: &Address) -> io::Result<Vec<SocketAddr>> {
     }
 }
 
+/// Keeps only the addresses this tunnel can actually carry.
+///
+/// IPv4, and deliberately so. The datapath carries IPv4, and the policy route
+/// that steers a marked socket into the tunnel is an `ip rule` in the v4 table.
+/// A marked AF_INET6 socket matches no such rule, so it would leave by the
+/// host's ordinary route — outside the tunnel entirely, with this host's own
+/// address visible to the destination rather than the far end's. Sending
+/// traffic quietly around the tunnel is worse than refusing to carry it, so an
+/// address that cannot be tunnelled is an error rather than a fallback.
+///
+/// A name that has both records still works: the v4 ones survive this. Only a
+/// v6-only destination fails, and it fails visibly.
+///
+/// # Errors
+/// Returns `Unsupported` when nothing IPv4 is left.
+fn tunnelable(targets: Vec<SocketAddr>, address: &Address) -> io::Result<Vec<SocketAddr>> {
+    let (v4, dropped): (Vec<_>, Vec<_>) = targets.into_iter().partition(SocketAddr::is_ipv4);
+    if v4.is_empty() && !dropped.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "socks5: {address} is reachable only over IPv6, which this tunnel does not carry"
+            ),
+        ));
+    }
+    Ok(v4)
+}
+
 /// Opens a TCP connection to `address`, marked so it routes into the tunnel.
 ///
 /// # Errors
 /// Returns the last connection error, or a resolution failure.
 pub fn connect_tcp(address: &Address, mark: u32) -> io::Result<TcpStream> {
-    let targets = resolve(address)?;
+    let targets = tunnelable(resolve(address)?, address)?;
     let mut last = io::Error::new(
         io::ErrorKind::NotFound,
         format!("socks5: {address} resolved to no addresses"),
     );
 
     for target in targets {
-        let domain = if target.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-        let fd = match marked_socket(domain, libc::SOCK_STREAM, mark) {
+        let fd = match marked_socket(libc::AF_INET, libc::SOCK_STREAM, mark) {
             Ok(fd) => fd,
             Err(e) => {
                 last = e;
@@ -250,6 +273,45 @@ fn raw_connect(fd: RawFd, target: SocketAddr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dual_stack_name_keeps_only_its_v4_addresses() {
+        let addr = Address::Domain("example.invalid".to_owned(), 443);
+        let targets = vec![
+            "[2001:db8::1]:443".parse().expect("v6"),
+            "203.0.113.5:443".parse().expect("v4"),
+        ];
+        let kept = tunnelable(targets, &addr).expect("v4 survives");
+        assert_eq!(kept, vec!["203.0.113.5:443".parse().expect("v4")]);
+    }
+
+    #[test]
+    fn a_v6_only_destination_is_refused_rather_than_sent_around_the_tunnel() {
+        // The failure this prevents: a marked AF_INET6 socket matches no v4
+        // policy rule, so it leaves by the ordinary route and the destination
+        // sees this host rather than the far end. A visible error beats a
+        // silent bypass.
+        let addr = Address::Domain("example.invalid".to_owned(), 443);
+        let targets = vec!["[2001:db8::1]:443".parse().expect("v6")];
+        let e = tunnelable(targets, &addr).expect_err("must not be carried");
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            crate::protocol::reply_code_for(&e),
+            crate::protocol::reply::ADDRESS_NOT_SUPPORTED,
+            "so the client stops asking for an address it cannot reach here"
+        );
+    }
+
+    #[test]
+    fn a_name_that_does_not_resolve_at_all_is_not_reported_as_unsupported() {
+        let addr = Address::Domain("example.invalid".to_owned(), 443);
+        assert!(
+            tunnelable(vec![], &addr)
+                .expect("empty is not an error here")
+                .is_empty(),
+            "no addresses is a resolution failure, which the caller already reports"
+        );
+    }
+
     use super::*;
 
     #[test]
