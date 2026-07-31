@@ -61,6 +61,13 @@ detect_target() {
 TARGET=${PAQETZ_TARGET:-$(detect_target)}
 NAME="paqetz-${TARGET}"
 
+# Read before anything is replaced, so the report at the end can say what this
+# actually did rather than only where it ended up.
+previous=""
+if [ -x "${PREFIX}/paqetz" ]; then
+    previous=$("${PREFIX}/paqetz" --version 2>/dev/null) || previous=""
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
@@ -98,8 +105,28 @@ chmod 755 "$tmp/paqetz"
 mv -f "$tmp/paqetz" "${PREFIX}/paqetz" 2>/dev/null \
     || die "could not write ${PREFIX}/paqetz — run this with sudo, or set PAQETZ_PREFIX"
 
+current=$("${PREFIX}/paqetz" --version)
 say ""
-"${PREFIX}/paqetz" --version
+if [ -z "$previous" ]; then
+    say "==> installed ${current}"
+elif [ "$previous" = "$current" ]; then
+    say "==> reinstalled ${current}"
+else
+    say "==> replaced ${previous} with ${current}"
+fi
+
+# Replacing the file does not touch the process using it. Without this the
+# service keeps running the old binary while `paqetz --version` reports the new
+# one, which is a confusing place to debug from. Not restarted here: this may be
+# the tunnel carrying the session that is running the installer, and dropping
+# that is the user's call to make, not an installer's.
+if [ -n "$previous" ] && [ "$previous" != "$current" ] \
+   && command -v systemctl >/dev/null 2>&1 \
+   && systemctl is-active --quiet paqetz 2>/dev/null; then
+    say ""
+    say "The paqetz service is still running the old binary. Restart it with:"
+    say "  sudo systemctl restart paqetz"
+fi
 say ""
 
 if [ "${PAQETZ_SETUP:-0}" = "1" ]; then
