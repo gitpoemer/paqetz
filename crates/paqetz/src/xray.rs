@@ -4,6 +4,19 @@
 //! Xray forwards what it receives through the tunnel. Xray is the inbound,
 //! paqetz is the transport.
 //!
+//! # Two legs, not two layers
+//!
+//! REALITY encrypts the hop from the end user to the client host. The tunnel
+//! encrypts the hop from the client host to the server. They are sequential and
+//! independent: nothing is encrypted twice for the same hop, and neither
+//! protects the other's leg.
+//!
+//! It follows that Xray terminates REALITY on the client host and re-encrypts
+//! into the tunnel, so between the two the traffic is in the clear to that
+//! machine. That is inherent to a proxy chain rather than a shortcoming here,
+//! but it makes the client host a trust boundary and it is worth knowing which
+//! machine is in that position. See `docs/09-deployment.md`.
+//!
 //! # What this does
 //!
 //! Generates the configuration and credentials, and — asked for explicitly —
