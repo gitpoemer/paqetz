@@ -104,6 +104,7 @@ pub(crate) fn run(path: &Path) -> bool {
     findings.push(check_tun_device());
     findings.push(check_default_route());
     findings.push(check_firewall_backend());
+    findings.push(check_service());
 
     if let Some(cfg) = cfg.as_ref() {
         findings.push(check_device_free(&cfg.interface.device));
@@ -224,6 +225,27 @@ fn check_firewall_backend() -> Finding {
         "install one; without the NOTRACK and RST-drop rules the kernel will \
          reset the tunnel. `paqetz firewall plan` prints what to apply by hand.",
     )
+}
+
+/// Whether the tunnel is installed as a service.
+///
+/// Not a problem either way — plenty of hosts run it by hand — but "it stopped
+/// after I closed the terminal" and "it did not come back after a reboot" are
+/// common enough that the answer is worth stating.
+fn check_service() -> Finding {
+    if !crate::service::has_systemd() {
+        return Finding::pass("service", "no systemd on this host");
+    }
+    if crate::service::unit_enabled("paqetz") {
+        Finding::pass("service", "installed and enabled; it will start at boot")
+    } else {
+        Finding::warn(
+            "service",
+            "not installed as a service",
+            "fine if you run it by hand; `paqetz service install` if it should \
+             start at boot and restart on failure",
+        )
+    }
 }
 
 /// Whether the configured device name is already taken.

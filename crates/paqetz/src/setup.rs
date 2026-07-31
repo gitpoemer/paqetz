@@ -56,6 +56,25 @@ impl Default for Plan {
     }
 }
 
+/// Which end of the tunnel this host is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// Waits to be contacted.
+    Server,
+    /// Connects out.
+    Client,
+}
+
+impl Role {
+    /// The generated file this end runs.
+    const fn file(self) -> &'static str {
+        match self {
+            Self::Server => "server.toml",
+            Self::Client => "client.toml",
+        }
+    }
+}
+
 /// The two finished configuration files.
 #[derive(Debug, Clone)]
 pub(crate) struct Pair {
@@ -197,8 +216,28 @@ fn split_endpoint(s: &str) -> Result<(String, u16), Box<dyn std::error::Error>> 
 pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("paqetz setup\n");
     println!("This asks a few questions and writes two configuration files —");
-    println!("one for each end. Nothing is changed on this host until the last");
-    println!("step, which asks first.\n");
+    println!("one for each end. Anything that changes this host is asked for");
+    println!("separately, and shows the command it runs.\n");
+
+    if !crate::service::is_root() {
+        println!("Running unprivileged. Steps that need root will use sudo for");
+        println!("that step only, printing each command first.\n");
+    }
+
+    // Asked first, because it decides which of the later questions apply and
+    // which configuration this host will actually run.
+    println!("0. Which end is this host?");
+    println!("   [s] the server — stable address, the client connects to it");
+    println!("   [c] the client — connects out");
+    println!("   [n] neither — just generating the files to copy elsewhere");
+    let role = loop {
+        match ask("   ", "c")?.to_ascii_lowercase().as_str() {
+            "s" | "server" => break Some(Role::Server),
+            "c" | "client" => break Some(Role::Client),
+            "n" | "neither" => break None,
+            _ => println!("   Please answer s, c or n.\n"),
+        }
+    };
 
     let endpoint = loop {
         let answer = ask(
@@ -348,6 +387,61 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // Keeping the tunnel running, for the host that will actually run one.
+    if let Some(role) = role {
+        let source = dir.join(role.file());
+        if crate::service::has_systemd() {
+            if yes_no(
+                &format!(
+                    "\n7. Install paqetz as a system service on this host,\n   \
+                     running {}, so it starts at boot and restarts on failure?",
+                    role.file()
+                ),
+                true,
+            )? {
+                let binary = crate::service::install_binary("/usr/local/bin")?;
+                let config = "/etc/paqetz/paqetz.toml";
+                let contents = std::fs::read_to_string(&source)?;
+                crate::service::write_file(std::path::Path::new(config), &contents, 0o600)?;
+                println!("    wrote {config}");
+                crate::service::install_unit(
+                    "paqetz",
+                    &crate::service::tunnel_unit(&binary, config),
+                    true,
+                )?;
+                println!("\n   Check it with: systemctl status paqetz");
+                println!("   Follow it with: journalctl -u paqetz -f");
+            }
+        } else {
+            println!("\n7. No systemd on this host, so nothing to install.");
+            println!("   Run it however this system starts things:");
+            println!("     paqetz run -c {}", source.display());
+        }
+
+        // WARP, if the server was configured to egress through it, is brought
+        // up by wg-quick rather than by us -- but enabling its unit is one
+        // command and forgetting it is the obvious mistake.
+        if let Some(iface) = egress.as_ref()
+            && crate::service::has_systemd()
+            && yes_no(
+                &format!(
+                    "\n   Enable wg-quick@{iface} so the egress interface comes\n   \
+                     up at boot? It must already be configured; paqetz does not\n   \
+                     create it."
+                ),
+                false,
+            )?
+        {
+            match crate::service::run_elevated(
+                "systemctl",
+                &["enable", "--now", &format!("wg-quick@{iface}")],
+            ) {
+                Ok(()) => println!("    enabled wg-quick@{iface}"),
+                Err(e) => println!("    could not enable it: {e}"),
+            }
+        }
+    }
+
     // The one step that changes this host, asked for separately and last.
     let pending = paqetz_fw::tune::pending();
     if pending.is_empty() {
@@ -366,9 +460,11 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    println!("\nNext, on each host:");
+    println!("\nOn the other host:");
     println!("  paqetz doctor -c <file>     # checks, changes nothing");
     println!("  paqetz run    -c <file>");
+    println!("\nOr copy paqetz there and run `paqetz setup` again, answering");
+    println!("with the other end at step 0.");
     Ok(())
 }
 

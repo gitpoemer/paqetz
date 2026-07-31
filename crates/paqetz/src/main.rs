@@ -6,6 +6,7 @@
 mod config;
 mod doctor;
 mod log;
+mod service;
 mod setup;
 mod stats;
 mod tunnel;
@@ -92,6 +93,12 @@ enum Command {
         action: XrayAction,
     },
 
+    /// Install or remove the system service that keeps the tunnel running.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Show kernel settings worth changing for a tunnel, and why.
     Tune {
         /// Apply them, rather than only printing them.
@@ -104,6 +111,21 @@ enum Command {
         #[command(subcommand)]
         action: FirewallAction,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Install the unit, copy the binary and configuration into place, and
+    /// start it.
+    Install {
+        /// Start it now and at boot, rather than only writing the unit.
+        #[arg(long, default_value_t = true)]
+        enable: bool,
+    },
+    /// Stop it, and remove the unit.
+    Remove,
+    /// Print the unit that `install` would write, without writing it.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -182,6 +204,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             socks5,
         } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5),
         Command::Setup { out } => setup::interactive(&out),
+        Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action),
         Command::Tune { apply } => tune(apply),
         Command::Doctor => {
@@ -454,6 +477,48 @@ fn default_route() -> Result<(Option<std::net::Ipv4Addr>, String), Box<dyn std::
         return Ok((gateway, iface.to_owned()));
     }
     Err("no default route, so there is nothing to route around".into())
+}
+
+fn service_command(
+    action: ServiceAction,
+    config: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        ServiceAction::Show => {
+            let binary = std::env::current_exe()?.display().to_string();
+            print!(
+                "{}",
+                service::tunnel_unit(&binary, &config.display().to_string())
+            );
+            Ok(())
+        }
+        ServiceAction::Install { enable } => {
+            if !service::has_systemd() {
+                return Err("this host does not use systemd".into());
+            }
+            // Validate before installing anything: a unit pointing at a
+            // configuration that does not parse would fail at start, which is
+            // a worse place to find out.
+            Config::load(config)?;
+
+            let binary = service::install_binary("/usr/local/bin")?;
+            let target = "/etc/paqetz/paqetz.toml";
+            if config != std::path::Path::new(target) {
+                let contents = std::fs::read_to_string(config)?;
+                service::write_file(std::path::Path::new(target), &contents, 0o600)?;
+                println!("    wrote {target}");
+            }
+            service::install_unit("paqetz", &service::tunnel_unit(&binary, target), enable)?;
+            println!("\nCheck it with:  systemctl status paqetz");
+            println!("Follow it with: journalctl -u paqetz -f");
+            Ok(())
+        }
+        ServiceAction::Remove => {
+            service::remove_unit("paqetz");
+            println!("Removed. The configuration in /etc/paqetz was left alone.");
+            Ok(())
+        }
+    }
 }
 
 fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {

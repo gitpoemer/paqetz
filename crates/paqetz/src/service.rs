@@ -1,0 +1,292 @@
+//! Installing things that need root, and the systemd units that keep them
+//! running.
+//!
+//! # How privilege is handled
+//!
+//! Not by re-executing under `sudo`, which would hand a whole interactive
+//! session elevated privilege for the sake of writing three files, and not by
+//! refusing and printing instructions, which is how a setup tool becomes a
+//! README with extra steps.
+//!
+//! Instead each privileged action is attempted directly, and only if the kernel
+//! refuses does it retry through `sudo`, printing the exact command first. The
+//! elevation is therefore per-action, visible, and skipped entirely when the
+//! process already has the privilege it needs.
+
+use std::io::{self, Write as _};
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+/// Whether this process can write to system locations without help.
+#[must_use]
+pub(crate) fn is_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Writes a file, elevating only if the direct write is refused.
+///
+/// # Errors
+/// Returns an error if the write fails for any reason other than privilege, or
+/// if the elevated retry also fails.
+pub(crate) fn write_file(path: &Path, contents: &str, mode: u32) -> io::Result<()> {
+    match direct_write(path, contents, mode) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            println!("    (needs root) sudo tee {} > /dev/null", path.display());
+            elevated_write(path, contents, mode)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn direct_write(path: &Path, contents: &str, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    f.write_all(contents.as_bytes())
+}
+
+/// Writes through `sudo tee`, then fixes the mode.
+fn elevated_write(path: &Path, contents: &str, mode: u32) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        run_elevated("mkdir", &["-p", &parent.display().to_string()])?;
+    }
+
+    let mut child = Command::new("sudo")
+        .arg("tee")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(contents.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "could not write {} even with sudo",
+            path.display()
+        )));
+    }
+    run_elevated(
+        "chmod",
+        &[&format!("{mode:o}"), &path.display().to_string()],
+    )
+}
+
+/// Runs a command, elevating only if this process is not already root.
+///
+/// # Errors
+/// Returns an error if the command cannot be run or reports failure.
+pub(crate) fn run_elevated(program: &str, args: &[&str]) -> io::Result<()> {
+    let (cmd, full): (&str, Vec<&str>) = if is_root() {
+        (program, args.to_vec())
+    } else {
+        let mut v = vec![program];
+        v.extend_from_slice(args);
+        ("sudo", v)
+    };
+    if !is_root() {
+        println!("    (needs root) sudo {program} {}", args.join(" "));
+    }
+    let out = Command::new(cmd).args(&full).output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "`{program} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+/// Whether this host uses systemd.
+#[must_use]
+pub(crate) fn has_systemd() -> bool {
+    Path::new("/run/systemd/system").exists()
+}
+
+/// The unit that keeps the tunnel running.
+///
+/// `doctor` runs first, so a host that cannot work fails at start with a
+/// diagnosis rather than at run time with silence. `Restart=on-failure` covers
+/// the transient cases; a configuration error is not transient and exits
+/// non-zero, which systemd will keep retrying — hence `StartLimitBurst`, so a
+/// broken configuration stops rather than looping forever.
+#[must_use]
+pub(crate) fn tunnel_unit(binary: &str, config: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=paqetz tunnel\n\
+         Documentation=https://github.com/gitpoemer/paqetz\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         StartLimitIntervalSec=300\n\
+         StartLimitBurst=5\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStartPre={binary} doctor -c {config}\n\
+         ExecStart={binary} run -c {config}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         # Raw sockets and a TUN device; the firewall rules need CAP_NET_ADMIN.\n\
+         # Nothing else does, so nothing else is granted.\n\
+         AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW\n\
+         NoNewPrivileges=true\n\
+         \n\
+         # The configuration holds a private key.\n\
+         UMask=0077\n\
+         \n\
+         ProtectSystem=strict\n\
+         ProtectHome=true\n\
+         PrivateTmp=true\n\
+         ProtectKernelLogs=true\n\
+         ProtectControlGroups=true\n\
+         RestrictRealtime=true\n\
+         RestrictSUIDSGID=true\n\
+         LockPersonality=true\n\
+         DeviceAllow=/dev/net/tun rw\n\
+         \n\
+         # `paqetz tune` writes here, and the unit must be able to read it back.\n\
+         ReadWritePaths=/proc/sys/net\n\
+         \n\
+         LimitNOFILE=8192\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+/// Where a unit file lives.
+fn unit_path(name: &str) -> String {
+    format!("/etc/systemd/system/{name}.service")
+}
+
+/// Installs and starts a unit.
+///
+/// # Errors
+/// Returns an error if any step fails.
+pub(crate) fn install_unit(name: &str, contents: &str, enable: bool) -> io::Result<()> {
+    let path = unit_path(name);
+    write_file(Path::new(&path), contents, 0o644)?;
+    println!("    wrote {path}");
+    run_elevated("systemctl", &["daemon-reload"])?;
+    if enable {
+        run_elevated("systemctl", &["enable", "--now", name])?;
+        println!("    enabled and started {name}");
+    } else {
+        println!("    not started; `systemctl enable --now {name}` when ready");
+    }
+    Ok(())
+}
+
+/// Stops and removes a unit.
+pub(crate) fn remove_unit(name: &str) {
+    let _ = run_elevated("systemctl", &["disable", "--now", name]);
+    let _ = run_elevated("rm", &["-f", &unit_path(name)]);
+    let _ = run_elevated("systemctl", &["daemon-reload"]);
+}
+
+/// Whether a unit exists and is enabled.
+#[must_use]
+pub(crate) fn unit_enabled(name: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-enabled", "--quiet", name])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Copies this binary to a system location, if it is not already there.
+///
+/// # Errors
+/// Returns an error if the executable cannot be located or copied.
+pub(crate) fn install_binary(prefix: &str) -> io::Result<String> {
+    let target = format!("{prefix}/paqetz");
+    let current = std::env::current_exe()?;
+    if current == Path::new(&target) {
+        return Ok(target);
+    }
+    let contents = std::fs::read(&current)?;
+    // Written as bytes through the same privilege path as everything else.
+    match std::fs::write(&target, &contents) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            run_elevated("cp", &[&current.display().to_string(), &target])?;
+        }
+        Err(e) => return Err(e),
+    }
+    run_elevated("chmod", &["755", &target])?;
+    println!("    installed the binary to {target}");
+    Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unit_runs_doctor_before_the_tunnel() {
+        // So a host that cannot work says why at start, rather than coming up
+        // and carrying nothing.
+        let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
+        let pre = u.find("ExecStartPre").expect("has ExecStartPre");
+        let start = u.find("ExecStart=").expect("has ExecStart");
+        assert!(pre < start);
+        assert!(u.contains("doctor -c /etc/paqetz/paqetz.toml"));
+    }
+
+    #[test]
+    fn the_unit_asks_for_two_capabilities_and_not_root() {
+        let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
+        assert!(u.contains("AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW"));
+        assert!(u.contains("CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW"));
+        assert!(u.contains("NoNewPrivileges=true"));
+        assert!(!u.contains("User=root"));
+    }
+
+    #[test]
+    fn the_unit_protects_the_key_it_reads() {
+        let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
+        assert!(u.contains("UMask=0077"), "the config holds a private key");
+        assert!(u.contains("ProtectHome=true"));
+    }
+
+    #[test]
+    fn a_broken_configuration_stops_rather_than_looping() {
+        // Restart=on-failure alone would retry a config error forever, at five
+        // seconds a time, filling the journal and never succeeding.
+        let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
+        assert!(u.contains("StartLimitBurst"), "{u}");
+        assert!(u.contains("StartLimitIntervalSec"), "{u}");
+    }
+
+    #[test]
+    fn the_unit_allows_the_device_it_needs_and_no_others() {
+        let u = tunnel_unit("/usr/local/bin/paqetz", "/etc/paqetz/paqetz.toml");
+        assert!(u.contains("DeviceAllow=/dev/net/tun rw"));
+        assert_eq!(u.matches("DeviceAllow").count(), 1);
+    }
+
+    #[test]
+    fn unit_paths_are_where_systemd_looks() {
+        assert_eq!(unit_path("paqetz"), "/etc/systemd/system/paqetz.service");
+    }
+
+    #[test]
+    fn systemd_detection_reads_the_filesystem_only() {
+        // Read-only, and a host without systemd is a legitimate answer.
+        let _ = has_systemd();
+    }
+}
