@@ -50,6 +50,26 @@ command -v iperf3 >/dev/null || {
     exit 1
 }
 
+cat > "${WORK}/parse.py" <<'PYEOF'
+"""Extracts a throughput figure from iperf3's JSON."""
+import json
+import sys
+
+mode, duration = sys.argv[1], float(sys.argv[2])
+try:
+    report = json.load(sys.stdin)
+    if mode == "tcp":
+        bits = report["end"]["sum_received"]["bits_per_second"]
+        print(f"{bits / 1e9:.2f} Gbit/s")
+    else:
+        summary = report["end"]["sum"]
+        bits = summary["bits_per_second"]
+        pps = summary["packets"] / duration / 1000
+        print(f"{bits / 1e9:.2f} Gbit/s ({pps:.0f}k pps)")
+except (ValueError, KeyError, TypeError, ZeroDivisionError):
+    print("n/a")
+PYEOF
+
 echo "==> building"
 cargo build --release --bin paqetz || exit 1
 BIN=$(pwd)/target/release/paqetz
@@ -129,26 +149,15 @@ EOF
     local tcp udp
     tcp=$(sudo ip netns exec "${CLI_NS}" iperf3 -c "${SRV_INNER}" \
         -t "${SECONDS_PER_RUN}" -J 2>/dev/null |
-        python3 -c 'import json,sys
-try:
-    d = json.load(sys.stdin)
-    print(f"{d[\"end\"][\"sum_received\"][\"bits_per_second\"]/1e9:.2f}")
-except Exception:
-    print("n/a")')
+        python3 "${WORK}/parse.py" tcp "${SECONDS_PER_RUN}")
 
     sudo ip netns exec "${SRV_NS}" iperf3 -s -1 -B "${SRV_INNER}" >/dev/null 2>&1 &
     sleep 1
     udp=$(sudo ip netns exec "${CLI_NS}" iperf3 -c "${SRV_INNER}" -u -b 0 -l 1200 \
         -t "${SECONDS_PER_RUN}" -J 2>/dev/null |
-        python3 -c 'import json,sys
-try:
-    d = json.load(sys.stdin)
-    s = d["end"]["sum"]
-    print(f"{s[\"bits_per_second\"]/1e9:.2f} ({s[\"packets\"]/'"${SECONDS_PER_RUN}"'/1000:.0f}k pps)")
-except Exception:
-    print("n/a")')
+        python3 "${WORK}/parse.py" udp "${SECONDS_PER_RUN}")
 
-    printf '  %-28s TCP %-8s UDP %s\n' "${label}" "${tcp} Gbit/s" "${udp}"
+    printf '  %-28s TCP %-16s UDP %s\n' "${label}" "${tcp}" "${udp}"
 
     sudo pkill -INT -f "paqetz run -c ${WORK}/" 2>/dev/null
     sleep 2
