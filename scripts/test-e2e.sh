@@ -222,6 +222,74 @@ else
     bad "256 KiB does not round-trip through the tunnel"
 fi
 
+# --- UDP through the tunnel -------------------------------------------------
+log "UDP through the tunnel"
+# This is an L3 tunnel: it forwards IP packets and never looks at the inner
+# protocol, so UDP works by the same mechanism TCP does. Worth proving rather
+# than assuming, since DNS and QUIC are the reason it matters.
+cat > "${WORK}/udp_server.py" <<'PYEOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 7788))
+s.settimeout(60)
+while True:
+    try:
+        data, peer = s.recvfrom(65535)
+    except socket.timeout:
+        break
+    s.sendto(data, peer)
+PYEOF
+
+cat > "${WORK}/udp_client.py" <<'PYEOF'
+import socket, sys
+host, size = sys.argv[1], int(sys.argv[2])
+payload = bytes((i * 11 + 5) & 0xFF for i in range(size))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(8)
+# UDP has no retransmission and the tunnel adds none (D2), so give a lost
+# datagram a couple of chances before calling it a failure.
+for _ in range(3):
+    s.sendto(payload, (host, 7788))
+    try:
+        got, _ = s.recvfrom(65535)
+    except socket.timeout:
+        continue
+    if got == payload:
+        sys.exit(0)
+    print(f"mismatch: sent {size}, got {len(got)}")
+    sys.exit(1)
+print("no reply")
+sys.exit(1)
+PYEOF
+
+sudo ip netns exec "${SRV_NS}" python3 "${WORK}/udp_server.py" >/dev/null 2>&1 &
+sleep 1
+
+# A DNS-sized datagram: the common case, and one packet end to end.
+if timeout 20 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/udp_client.py" "${SRV_INNER}" 64 >/dev/null 2>&1; then
+    ok "a UDP datagram round-trips through the tunnel"
+else
+    bad "a UDP datagram does not round-trip through the tunnel"
+fi
+
+# One that fits a single inner packet exactly at the far end of the MTU.
+if timeout 20 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/udp_client.py" "${SRV_INNER}" 1300 >/dev/null 2>&1; then
+    ok "a full-MTU UDP datagram round-trips"
+else
+    bad "a full-MTU UDP datagram does not round-trip"
+fi
+
+# And one the kernel must fragment before it reaches the device, which the
+# tunnel carries as ordinary payload without knowing it is a fragment.
+if timeout 20 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/udp_client.py" "${SRV_INNER}" 4000 >/dev/null 2>&1; then
+    ok "a fragmented UDP datagram round-trips"
+else
+    bad "a fragmented UDP datagram does not round-trip"
+fi
+
 # --- the wire looks like TCP ------------------------------------------------
 log "what the wire looks like"
 sudo ip netns exec "${SRV_NS}" timeout 4 \

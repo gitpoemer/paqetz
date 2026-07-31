@@ -25,8 +25,11 @@ for what is built, what is deferred, and why.
 
 - **Noise IK** — X25519 identities, ChaCha20-Poly1305, forward secrecy, replay
   protection, and silence toward anything that does not authenticate.
-- **No reliability layer.** The tunnel forwards IP packets and lets inner TCP do
-  what it is already good at. There is no KCP, no ARQ, no multiplexer.
+- **No reliability layer.** The tunnel forwards IP packets and lets the inner
+  protocol do what it is already good at. There is no KCP, no ARQ, no
+  multiplexer. Because it works at L3, anything over IP goes through it —
+  TCP, UDP, ICMP, QUIC — and UDP is delivered as UDP, not silently made
+  reliable underneath the application.
 - **State is per peer, not per flow.** Memory and thread count do not move as
   connections come and go.
 - **Roaming.** A peer is a public key, not an address; the endpoint is learned
