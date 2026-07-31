@@ -56,20 +56,28 @@ pub(crate) struct Interface {
 }
 
 /// How packets move between the device and the wire.
+///
+/// `simple` is the default, on measurement rather than on principle. Over a
+/// veth pair, batching moved UDP packet rate by +6 to +8% and TCP throughput by
+/// −2 to −7% — a contradictory signal, which is what a difference near the
+/// noise floor looks like. The cipher dominates the per-packet budget, so
+/// amortising the syscall has little left to win, exactly as
+/// `docs/08-rewrite-plan.md` §8.11 predicted.
+///
+/// Given no clear gain, the simpler path wins the tie: one code path, a
+/// blocking device, and no writes that can be refused because a queue is full.
+/// Worth re-measuring on a real path, where the syscall cost relative to
+/// everything else may differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Datapath {
+    /// One packet per syscall.
+    #[default]
+    Simple,
     /// Up to 32 packets per syscall, drained from whatever is already queued.
     ///
-    /// The default. Batching only ever takes packets that were waiting anyway,
-    /// so it costs no latency: with one packet in flight it behaves exactly as
-    /// the simple path does.
-    #[default]
+    /// Only ever takes packets that were waiting anyway, so it costs no
+    /// latency: with one packet in flight it behaves as the simple path does.
     Batched,
-    /// One packet per syscall.
-    ///
-    /// Kept so the two can be measured against each other, and as somewhere to
-    /// stand if the batched path ever misbehaves.
-    Simple,
 }
 
 /// Which mechanism puts frames on the wire.
@@ -85,8 +93,14 @@ pub(crate) enum TransmitPath {
     Raw,
     /// `AF_PACKET`, naming the next hop ourselves.
     ///
-    /// Skips the route lookup and the netfilter `OUTPUT` chain. Possibly
-    /// faster — measure it with `scripts/bench.sh` before adopting it.
+    /// Skips the route lookup and the netfilter `OUTPUT` chain. Measurably
+    /// faster — a consistent +3 to +10% over a veth pair, on both TCP
+    /// throughput and UDP packet rate — but it needs the next hop's hardware
+    /// address, which can go stale when a gateway fails over or a lease moves.
+    ///
+    /// Not the default, because that margin does not buy back a failure mode
+    /// the other path simply does not have. Worth switching to on a host where
+    /// the gateway is stable and the throughput matters.
     AfPacket,
 }
 
@@ -303,7 +317,7 @@ impl Config {
             }
         };
 
-        let datapath = match raw.interface.datapath.as_deref().unwrap_or("batched") {
+        let datapath = match raw.interface.datapath.as_deref().unwrap_or("simple") {
             "batched" => Datapath::Batched,
             "simple" => Datapath::Simple,
             other => {
@@ -487,8 +501,8 @@ tunnel_address = "10.7.0.2"
         let c = Config::parse(CLIENT).expect("parse");
         assert_eq!(
             c.interface.datapath,
-            Datapath::Batched,
-            "batching costs nothing when there is one packet, so it is the default"
+            Datapath::Simple,
+            "batching showed no consistent gain, so the simpler path wins the tie"
         );
         assert_eq!(
             c.interface.transmit,

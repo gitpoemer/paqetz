@@ -29,6 +29,9 @@ SRV_INNER=10.7.0.1
 CLI_INNER=10.7.0.2
 PORT=9999
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-5}
+# Differences here are small enough that one sample says little; the median of
+# a few says rather more. Raise for a measurement you intend to act on.
+REPEATS=${REPEATS:-3}
 
 WORK=$(mktemp -d)
 
@@ -175,9 +178,11 @@ echo
 # The full matrix, so each variable can be read independently: comparing down a
 # column isolates batching, comparing across a row isolates the transmit path.
 # Three runs sharing one setting would confound the two.
-run_one simple  raw      "simple  + raw"
+echo "    ${REPEATS} run(s) per configuration; the median is reported"
+echo
+run_one simple  raw      "simple  + raw       [default]"
 run_one simple  afpacket "simple  + af_packet"
-run_one batched raw      "batched + raw       [default]"
+run_one batched raw      "batched + raw"
 run_one batched afpacket "batched + af_packet"
 
 echo
