@@ -247,6 +247,9 @@ version = "0.1.0"
 [[package]]
 name = "paqetz-tcpwire"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "poly1305"
