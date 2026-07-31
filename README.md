@@ -7,8 +7,8 @@ It exists for networks that block UDP first and inspect what is left. WireGuard'
 cryptography and roaming, carried by something that looks like an ordinary TCP
 conversation.
 
-**Status: phase 1.** The tunnel works — see [docs/08-rewrite-plan.md](docs/08-rewrite-plan.md)
-for what is built, what is deferred, and why.
+**Status: working.** Phases 1 through 5 are built: the tunnel, setup tooling,
+batched datapath, a SOCKS5 front end, and diagnostics.
 
 ## What it is
 
@@ -37,7 +37,6 @@ for what is built, what is deferred, and why.
 
 It is a ground-up rewrite of [paqet](https://github.com/gitpoemer/paqet), whose
 idea it keeps and whose architecture it does not.
-[docs/07-analysis.md](docs/07-analysis.md) explains the difference.
 
 ## Quick start
 
@@ -68,20 +67,27 @@ sets the first by default. Without them the two ends reach each other and
 nothing beyond — which looks exactly like a broken tunnel while nothing is
 broken.
 
-See [docs/09-deployment.md](docs/09-deployment.md) for the whole path,
-including pointing an Xray outbound at it.
+`paqetz setup` walks the whole path, including generating an Xray REALITY
+inbound and pointing it at the tunnel.
 
 ## Testing
 
 `cargo test` is safe on a workstation: it creates no device, opens no socket,
-and writes no firewall rule. Everything that touches the host is gated behind a
-script that confines it to a throwaway namespace. See
-[docs/TESTING.md](docs/TESTING.md).
+and writes no firewall rule.
 
-## Documentation
+Everything that touches the host is gated behind `#[ignore]` and confined to a
+throwaway network namespace by the scripts that run it:
 
-[docs/](docs/) covers the design, a full analysis of the implementation this
-replaces, and one record per decision in [docs/decisions/](docs/decisions/).
+```bash
+cargo test --workspace                 # safe anywhere
+./scripts/test-privileged.sh           # needs CAP_NET_ADMIN/CAP_NET_RAW
+./scripts/test-e2e.sh                  # two namespaces, a real tunnel
+./scripts/bench.sh                     # datapath comparison, needs iperf3
+```
+
+Each compiles as you and runs only the built binaries under `sudo`, so `target/`
+never acquires root-owned files. The namespaces are deleted afterwards,
+including on failure, and nothing is created in the host's own namespace.
 
 ## License
 

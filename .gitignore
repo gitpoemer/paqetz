@@ -3,3 +3,11 @@
 *.pcap
 *.profraw
 perf.data*
+
+# Design notes and analysis, kept locally rather than published.
+#
+# The reasoning is worth having while working on this; publishing it hands a
+# reader a ready-made summary of exactly what the wire looks like, which is
+# effort they would otherwise have to spend themselves. The source remains the
+# authoritative description either way.
+docs/
