@@ -285,15 +285,23 @@ pub fn recvmmsg(fd: RawFd, bufs: &mut [Vec<u8>], lens: &mut [usize]) -> io::Resu
         msg.msg_hdr.msg_iovlen = 1;
     }
 
+    // MSG_WAITFORONE is load-bearing, not an optimisation. Without it, a
+    // blocking `recvmmsg` waits for *all* `vlen` messages before returning any
+    // -- so asking for 32 means nothing is delivered until 32 frames have
+    // arrived. On a tunnel whose first packet is a handshake, that is a
+    // deadlock: the one packet that would produce more traffic sits in the
+    // kernel waiting for traffic. The flag turns on MSG_DONTWAIT after the
+    // first message, giving "take what is here, starting with at least one".
+    //
     // SAFETY: `msgs[..n]` is initialised above, each pointing at an `iovec`
     // that borrows one of `bufs` for the duration of the call, with its exact
-    // length. A null timeout blocks until at least one datagram arrives.
+    // length. A null timeout blocks until the flag's condition is met.
     let got = unsafe {
         libc::recvmmsg(
             fd,
             msgs.as_mut_ptr(),
             u32::try_from(n).unwrap_or(1),
-            0,
+            libc::MSG_WAITFORONE,
             std::ptr::null_mut(),
         )
     };
@@ -458,5 +466,186 @@ mod tests {
     #[test]
     fn looking_up_a_missing_interface_fails() {
         assert!(if_nametoindex("definitely-not-real").is_err());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    //! Exercises the batched syscall wrappers over loopback UDP.
+    //!
+    //! No privilege, no device, no firewall rule: a pair of sockets bound to
+    //! ephemeral ports on 127.0.0.1, gone when the test ends. That is enough to
+    //! test the descriptor arrays, which is where a mistake in this file would
+    //! be, without needing a namespace.
+
+    // Panicking on an out-of-range index is exactly what a test should do.
+    #![allow(clippy::indexing_slicing)]
+
+    use super::*;
+    use std::net::UdpSocket;
+
+    fn pair() -> (UdpSocket, UdpSocket) {
+        let rx = UdpSocket::bind("127.0.0.1:0").expect("bind rx");
+        let tx = UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        tx.connect(rx.local_addr().expect("addr")).expect("connect");
+        (rx, tx)
+    }
+
+    #[test]
+    fn one_datagram_round_trips() {
+        let (rx, tx) = pair();
+        tx.send(b"hello").expect("send");
+
+        let mut bufs: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0u8; 2048]).collect();
+        let mut lens = [0usize; BATCH];
+        let n = recvmmsg(rx.as_raw_fd(), &mut bufs, &mut lens).expect("recvmmsg");
+        assert_eq!(n, 1);
+        assert_eq!(lens[0], 5);
+        assert_eq!(&bufs[0][..5], b"hello");
+    }
+
+    #[test]
+    fn many_datagrams_arrive_in_one_call_with_the_right_lengths() {
+        let (rx, tx) = pair();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("timeout");
+
+        // Distinct lengths and contents, so a descriptor pointing at the wrong
+        // buffer would show up as mismatched data rather than passing by luck.
+        for i in 0..8usize {
+            let payload = vec![u8::try_from(i).unwrap_or(0); i + 1];
+            tx.send(&payload).expect("send");
+        }
+
+        let mut bufs: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0u8; 2048]).collect();
+        let mut lens = [0usize; BATCH];
+        let mut received = 0usize;
+        while received < 8 {
+            let n = recvmmsg(rx.as_raw_fd(), &mut bufs[received..], &mut lens[received..])
+                .expect("recvmmsg");
+            assert!(n > 0);
+            received += n;
+        }
+
+        for i in 0..8usize {
+            assert_eq!(lens[i], i + 1, "datagram {i} has the wrong length");
+            assert_eq!(
+                bufs[i][..=i],
+                vec![u8::try_from(i).unwrap_or(0); i + 1][..],
+                "datagram {i} has the wrong contents"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_of_sends_all_arrive() {
+        let rx = UdpSocket::bind("127.0.0.1:0").expect("bind rx");
+        let tx = UdpSocket::bind("127.0.0.1:0").expect("bind tx");
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("timeout");
+        let dst = match rx.local_addr().expect("addr") {
+            std::net::SocketAddr::V4(a) => a,
+            std::net::SocketAddr::V6(_) => unreachable!("bound to 127.0.0.1"),
+        };
+
+        let payloads: Vec<Vec<u8>> = (0..8usize)
+            .map(|i| vec![u8::try_from(i).unwrap_or(0); i + 1])
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+
+        // Each message carries its own destination, as the tunnel's do.
+        let addrs: Vec<libc::sockaddr_in> = (0..8)
+            .map(|_| {
+                // SAFETY: `sockaddr_in` is plain old data; every field is set.
+                let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                a.sin_family = u16::try_from(libc::AF_INET).unwrap_or(2);
+                a.sin_port = dst.port().to_be();
+                a.sin_addr.s_addr = u32::from_ne_bytes(dst.ip().octets());
+                a
+            })
+            .collect();
+
+        // SAFETY: an AF_INET socket sends to `sockaddr_in`.
+        let sent = unsafe { sendmmsg(tx.as_raw_fd(), &refs, &addrs) }.expect("sendmmsg");
+        assert_eq!(sent, 8, "every message should be accepted");
+
+        let mut got = 0usize;
+        let mut buf = [0u8; 2048];
+        while got < 8 {
+            let n = rx.recv(&mut buf).expect("recv");
+            assert_eq!(n, got + 1, "datagram {got} has the wrong length");
+            got += 1;
+        }
+    }
+
+    #[test]
+    fn a_partial_batch_returns_rather_than_waiting_for_a_full_one() {
+        // The regression test for the bug that made the batched datapath fail
+        // every end-to-end check while the unbatched one passed: a blocking
+        // recvmmsg without MSG_WAITFORONE waits for all `vlen` messages, so
+        // asking for 32 and being sent 3 returns nothing at all. On a tunnel
+        // whose first packet is a handshake that is a deadlock.
+        let (rx, tx) = pair();
+        for i in 0..3u8 {
+            tx.send(&[i; 4]).expect("send");
+        }
+
+        let mut bufs: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0u8; 512]).collect();
+        let mut lens = [0usize; BATCH];
+
+        // If this ever waits for BATCH messages again, the test hangs rather
+        // than failing, so bound it explicitly.
+        let (tx_done, rx_done) = std::sync::mpsc::channel();
+        let fd = rx.as_raw_fd();
+        std::thread::spawn(move || {
+            let n = recvmmsg(fd, &mut bufs, &mut lens);
+            let _ = tx_done.send(n.map(|n| (n, lens[0])));
+        });
+
+        let result = rx_done
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("recvmmsg must return without a full batch");
+        let (n, first_len) = result.expect("recvmmsg");
+        assert!((1..=3).contains(&n), "expected 1..=3 messages, got {n}");
+        assert_eq!(first_len, 4);
+    }
+
+    #[test]
+    fn an_empty_batch_is_a_no_op() {
+        let (rx, tx) = pair();
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let mut lens: [usize; 0] = [];
+        assert_eq!(
+            recvmmsg(rx.as_raw_fd(), &mut bufs, &mut lens).expect("recvmmsg"),
+            0
+        );
+        let addrs: Vec<libc::sockaddr_in> = Vec::new();
+        // SAFETY: no messages are sent, so no address is dereferenced.
+        let sent = unsafe { sendmmsg(tx.as_raw_fd(), &[], &addrs) }.expect("sendmmsg");
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
+    fn more_than_a_batch_is_capped_rather_than_overflowing() {
+        // The descriptor arrays are BATCH long; asking for more must clamp, not
+        // write past their end.
+        let (rx, _tx) = pair();
+        rx.set_nonblocking(true).expect("nonblocking");
+        let mut bufs: Vec<Vec<u8>> = (0..BATCH * 2).map(|_| vec![0u8; 64]).collect();
+        let mut lens = vec![0usize; BATCH * 2];
+        // Nothing was sent, so this returns EAGAIN rather than data; what
+        // matters is that it does not corrupt the stack getting there.
+        let _ = recvmmsg(rx.as_raw_fd(), &mut bufs, &mut lens);
+    }
+
+    #[test]
+    fn non_blocking_can_be_set_and_cleared() {
+        let (rx, _tx) = pair();
+        let fd = rx.as_raw_fd();
+        set_nonblocking(fd, true).expect("set");
+        let mut buf = [0u8; 16];
+        let err = read(fd, &mut buf).expect_err("nothing to read");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        set_nonblocking(fd, false).expect("clear");
     }
 }
