@@ -75,6 +75,18 @@ impl Role {
     }
 }
 
+/// Whether this host should be offered the client's Xray inbound.
+///
+/// Everywhere but the server. That inbound carries a REALITY private key, and
+/// it is the key for the leg between a user and the client host — the server
+/// has no use for it, cannot answer the questions that produce it, and would be
+/// left holding a copy after it was moved to where it belongs. `None` keeps the
+/// offer, since generating both ends on a third machine is exactly what that
+/// answer means.
+const fn generates_client_inbound(role: Option<Role>) -> bool {
+    !matches!(role, Some(Role::Server))
+}
+
 /// The two finished configuration files.
 #[derive(Debug, Clone)]
 pub(crate) struct Pair {
@@ -329,7 +341,14 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
 
     // An Xray inbound, for the arrangement where users connect to the client
     // host and their traffic leaves through the tunnel.
-    if yes_no(
+    if !generates_client_inbound(role) {
+        println!(
+            "The client's Xray inbound is not generated here. It contains a\n\
+             REALITY private key for the leg between a user and the client\n\
+             host, which is not this one — run `paqetz setup` or `paqetz xray`\n\
+             there, so the key is only ever on the host that uses it.\n"
+        );
+    } else if yes_no(
         "6. Generate an Xray REALITY inbound for the client host?\n            This is how users reach the tunnel: they connect to Xray, and Xray\n            forwards what it receives through paqetz.",
         false,
     )? {
@@ -679,6 +698,20 @@ mod tests {
         .expect("render");
         let client = crate::config::Config::parse(&pair.client).expect("parse");
         assert_eq!(client.socks5.expect("socks5").listen.port(), 1080);
+    }
+
+    #[test]
+    fn the_server_is_never_offered_the_client_inbound() {
+        assert!(
+            !generates_client_inbound(Some(Role::Server)),
+            "its REALITY private key would be written to a host with no use \
+             for it, and left there after being copied to the one that has"
+        );
+        assert!(generates_client_inbound(Some(Role::Client)));
+        assert!(
+            generates_client_inbound(None),
+            "generating both ends on a third machine is what `neither` means"
+        );
     }
 
     #[test]
