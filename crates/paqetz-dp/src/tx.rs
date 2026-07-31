@@ -60,19 +60,30 @@ impl RawTx {
     /// # Errors
     /// Returns the underlying OS error.
     pub fn send(&self, packet: &[u8], dst: Ipv4Addr) -> io::Result<usize> {
-        let mut addr: libc::sockaddr_in =
-            // SAFETY: `sockaddr_in` is plain old data; all-zero is a valid,
-            // if meaningless, value, and every field is set below.
-            unsafe { std::mem::zeroed() };
-        addr.sin_family = u16::try_from(libc::AF_INET)
-            .map_err(|_| io::Error::other("AF_INET does not fit in sa_family_t"))?;
-        // The port is ignored for a raw socket — the header carries the real
-        // one — but is zeroed rather than left arbitrary.
-        addr.sin_port = 0;
-        addr.sin_addr.s_addr = u32::from_ne_bytes(dst.octets());
-
+        let addr = sockaddr_for(dst)?;
         // SAFETY: an AF_INET socket sends to a `sockaddr_in`.
         unsafe { sys::sendto(self.fd.as_raw_fd(), packet, &addr) }
+    }
+
+    /// Sends up to [`sys::BATCH`] packets in one syscall.
+    ///
+    /// Returns how many the kernel accepted; a short count under pressure is
+    /// normal and the remainder is dropped, which is what a congested link does
+    /// anyway.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error.
+    pub fn send_batch(&self, packets: &[&[u8]], dsts: &[Ipv4Addr]) -> io::Result<usize> {
+        let n = packets.len().min(dsts.len()).min(sys::BATCH);
+        let mut addrs: Vec<libc::sockaddr_in> = Vec::with_capacity(n);
+        for dst in dsts.iter().take(n) {
+            addrs.push(sockaddr_for(*dst)?);
+        }
+        let Some(head) = packets.get(..n) else {
+            return Ok(0);
+        };
+        // SAFETY: an AF_INET socket sends to `sockaddr_in`.
+        unsafe { sys::sendmmsg(self.fd.as_raw_fd(), head, &addrs) }
     }
 
     /// Sets the send buffer size, in bytes.
@@ -113,6 +124,20 @@ impl std::os::fd::AsRawFd for RawTx {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
+}
+
+/// Builds the destination address a raw send needs for its route lookup.
+fn sockaddr_for(dst: Ipv4Addr) -> io::Result<libc::sockaddr_in> {
+    // SAFETY: `sockaddr_in` is plain old data; an all-zero bit pattern is a
+    // valid, if meaningless, value, and every field is set below.
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = u16::try_from(libc::AF_INET)
+        .map_err(|_| io::Error::other("AF_INET does not fit in sa_family_t"))?;
+    // The port is ignored for a raw socket — the header carries the real one —
+    // but is zeroed rather than left arbitrary.
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = u32::from_ne_bytes(dst.octets());
+    Ok(addr)
 }
 
 #[cfg(test)]

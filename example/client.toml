@@ -32,6 +32,25 @@ tunnel_address = "10.7.0.1"
 # Name of the TUN device.
 #device = "paqetz0"
 
+# How packets move between the device and the wire.
+#   "batched" (default) — up to 32 per syscall, drained from what is already
+#                         queued. It never waits for a batch to form, so with
+#                         one packet in flight it behaves exactly as "simple".
+#   "simple"            — one per syscall. Kept for comparison, and as somewhere
+#                         to stand if the batched path ever misbehaves.
+#datapath = "batched"
+
+# Which mechanism puts frames on the wire.
+#   "raw"      (default) — raw socket with IP_HDRINCL. The kernel routes and
+#                          resolves the next hop, so there is no hardware
+#                          address to go stale when a gateway fails over.
+#   "afpacket"           — names the next hop itself, skipping the route lookup
+#                          and the netfilter OUTPUT chain. Possibly faster;
+#                          measure with scripts/bench.sh before adopting it, and
+#                          note it needs a peer endpoint, so only the initiating
+#                          side can use it.
+#transmit = "raw"
+
 # Whether to install and remove the kernel firewall rules automatically. These
 # stop the kernel resetting the flow, so turning this off means applying the
 # output of `paqetz firewall plan` yourself.

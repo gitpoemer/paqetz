@@ -97,6 +97,30 @@ impl Tun {
         sys::read(self.fd.as_raw_fd(), buf)
     }
 
+    /// Reads one inner IP packet if one is already waiting.
+    ///
+    /// Returns `Ok(None)` when nothing is queued, rather than blocking. This is
+    /// what lets the outbound path collect a batch without ever waiting for one
+    /// to form: block for the first packet, then take whatever else has already
+    /// arrived.
+    ///
+    /// The descriptor is switched to non-blocking for the call and back
+    /// afterwards, so a blocking read elsewhere is unaffected.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error, other than "would block".
+    pub fn recv_nonblocking(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        let fd = self.fd.as_raw_fd();
+        sys::set_nonblocking(fd, true)?;
+        let result = sys::read(fd, buf);
+        sys::set_nonblocking(fd, false)?;
+        match result {
+            Ok(n) => Ok(Some(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Writes one inner IP packet into the kernel's stack.
     ///
     /// # Errors

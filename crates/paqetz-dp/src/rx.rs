@@ -115,6 +115,17 @@ impl PacketRx {
         sys::recv(self.fd.as_raw_fd(), buf)
     }
 
+    /// Receives up to [`sys::BATCH`] frames in one syscall.
+    ///
+    /// Blocks until at least one arrives. Returns how many were filled; each
+    /// frame's length is written to `lens`.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error.
+    pub fn recv_batch(&self, bufs: &mut [Vec<u8>], lens: &mut [usize]) -> io::Result<usize> {
+        sys::recvmmsg(self.fd.as_raw_fd(), bufs, lens)
+    }
+
     /// Sets the receive buffer size, in bytes.
     ///
     /// The kernel doubles the value internally for bookkeeping. A larger buffer

@@ -248,6 +248,133 @@ pub fn raw(fd: &OwnedFd) -> RawFd {
     fd.as_raw_fd()
 }
 
+/// Largest number of packets moved in one batched syscall.
+///
+/// Amortising a syscall over 32 packets removes most of its per-packet cost;
+/// beyond that the returns flatten while the latency of filling the batch and
+/// the size of the on-stack descriptor arrays both grow.
+pub const BATCH: usize = 32;
+
+/// Receives up to `BATCH` datagrams in one syscall.
+///
+/// Returns how many were filled. `lens` is written with each one's length.
+///
+/// This is the cheap two-thirds of what a `PACKET_MMAP` ring would buy. The
+/// ring's remaining advantage is that it avoids the copy out of kernel memory,
+/// worth perhaps a hundred nanoseconds per packet; the syscall itself, which
+/// dominates, is amortised here for a fraction of the complexity.
+pub fn recvmmsg(fd: RawFd, bufs: &mut [Vec<u8>], lens: &mut [usize]) -> io::Result<usize> {
+    let n = bufs.len().min(lens.len()).min(BATCH);
+    if n == 0 {
+        return Ok(0);
+    }
+
+    // SAFETY: `iovec` is plain-old-data; an all-zero bit pattern is a valid,
+    // if empty, value, and every field used below is set.
+    let mut iovecs: [libc::iovec; BATCH] = unsafe { std::mem::zeroed() };
+    // SAFETY: likewise for `mmsghdr`.
+    let mut msgs: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
+
+    for i in 0..n {
+        let Some(buf) = bufs.get_mut(i) else { break };
+        let Some(iov) = iovecs.get_mut(i) else { break };
+        iov.iov_base = buf.as_mut_ptr().cast();
+        iov.iov_len = buf.len();
+        let Some(msg) = msgs.get_mut(i) else { break };
+        msg.msg_hdr.msg_iov = std::ptr::from_mut(iov);
+        msg.msg_hdr.msg_iovlen = 1;
+    }
+
+    // SAFETY: `msgs[..n]` is initialised above, each pointing at an `iovec`
+    // that borrows one of `bufs` for the duration of the call, with its exact
+    // length. A null timeout blocks until at least one datagram arrives.
+    let got = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            u32::try_from(n).unwrap_or(1),
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if got < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let got = usize::try_from(got).unwrap_or(0);
+    for i in 0..got {
+        let written = msgs.get(i).map_or(0, |m| m.msg_len);
+        if let Some(slot) = lens.get_mut(i) {
+            *slot = usize::try_from(written).unwrap_or(0);
+        }
+    }
+    Ok(got)
+}
+
+/// Sends up to `BATCH` packets in one syscall, each to its own address.
+///
+/// Returns how many the kernel accepted. A short count is normal under
+/// pressure; the caller drops the remainder, which is what a congested link
+/// does anyway and what the absence of a reliability layer (D2) expects.
+///
+/// # Safety
+/// `addrs` must be `sockaddr` variants appropriate to the socket's domain.
+pub unsafe fn sendmmsg<T>(fd: RawFd, packets: &[&[u8]], addrs: &[T]) -> io::Result<usize> {
+    let n = packets.len().min(addrs.len()).min(BATCH);
+    if n == 0 {
+        return Ok(0);
+    }
+    let addr_len = libc::socklen_t::try_from(size_of::<T>())
+        .map_err(|_| io::Error::other("address is implausibly large"))?;
+
+    // SAFETY: as above, `iovec` is plain-old-data.
+    let mut iovecs: [libc::iovec; BATCH] = unsafe { std::mem::zeroed() };
+    // SAFETY: likewise for `mmsghdr`.
+    let mut msgs: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
+
+    for i in 0..n {
+        let Some(packet) = packets.get(i) else { break };
+        let Some(addr) = addrs.get(i) else { break };
+        let Some(iov) = iovecs.get_mut(i) else { break };
+        // The kernel does not write through this pointer for a send, so
+        // casting away constness is sound here.
+        iov.iov_base = packet.as_ptr().cast_mut().cast();
+        iov.iov_len = packet.len();
+        let Some(msg) = msgs.get_mut(i) else { break };
+        msg.msg_hdr.msg_iov = std::ptr::from_mut(iov);
+        msg.msg_hdr.msg_iovlen = 1;
+        msg.msg_hdr.msg_name = std::ptr::from_ref(addr).cast_mut().cast();
+        msg.msg_hdr.msg_namelen = addr_len;
+    }
+
+    // SAFETY: `msgs[..n]` is initialised above; each borrows one packet and one
+    // address for the duration of the call, with exact lengths. The caller
+    // guarantees the address type matches the socket's domain.
+    let sent = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), u32::try_from(n).unwrap_or(1), 0) };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(usize::try_from(sent).unwrap_or(0))
+}
+
+/// Makes a descriptor non-blocking.
+///
+/// Used to drain whatever is already queued without waiting for more, which is
+/// what turns a stream of single packets into a batch exactly when there is a
+/// backlog to batch.
+pub fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
+    // SAFETY: F_GETFL takes no pointer argument.
+    let flags = check(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
+    let flags = if on {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // SAFETY: F_SETFL takes an int.
+    check(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

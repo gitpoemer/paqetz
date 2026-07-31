@@ -25,11 +25,11 @@ use std::time::{Duration, Instant};
 
 use paqetz_core::noise::{self, Initiator, PendingResponder, Session};
 use paqetz_core::{Millis, PublicKey};
-use paqetz_dp::{MAX_FRAME, PacketRx, RawTx, Tun};
+use paqetz_dp::{AfPacketTx, MAX_FRAME, PacketRx, RawTx, Transmit, Tun, sys};
 use paqetz_tcpwire::segment::{self, MAX_OVERHEAD};
 use paqetz_tcpwire::{Endpoint as Carrier, Role};
 
-use crate::config::Config;
+use crate::config::{Config, Datapath};
 
 /// How often the timer thread wakes.
 const TICK: Duration = Duration::from_millis(250);
@@ -74,7 +74,7 @@ pub(crate) struct Tunnel {
     cfg: Config,
     tun: Arc<Tun>,
     rx: Arc<PacketRx>,
-    tx: Arc<RawTx>,
+    tx: Arc<Transmit>,
     state: Arc<Mutex<PeerState>>,
     /// Our own outer address and port.
     local: (Ipv4Addr, u16),
@@ -186,8 +186,28 @@ impl Tunnel {
         )?;
         let _ = rx.set_recv_buffer(8 * 1024 * 1024);
 
-        let tx = os("opening the transmit socket", RawTx::open())?;
+        let tx = match cfg.interface.transmit {
+            crate::config::TransmitPath::Raw => {
+                Transmit::Raw(os("opening the transmit socket", RawTx::open())?)
+            }
+            crate::config::TransmitPath::AfPacket => {
+                // Needs a peer address to resolve the next hop toward, which
+                // only the initiating side has at start-up.
+                let peer = cfg.peer.endpoint.map_or(Ipv4Addr::UNSPECIFIED, |e| *e.ip());
+                if peer.is_unspecified() {
+                    return Err(Error::Unsupported(
+                        "transmit = \"afpacket\" needs a peer endpoint to resolve \
+                         the next hop toward; the waiting side must use \"raw\"",
+                    ));
+                }
+                Transmit::AfPacket(os(
+                    "opening the AF_PACKET transmit socket",
+                    AfPacketTx::open(&interface, peer),
+                )?)
+            }
+        };
         let _ = tx.set_send_buffer(4 * 1024 * 1024);
+        println!("paqetz: transmit via {}", tx.name());
 
         Ok(Self {
             state: Arc::new(Mutex::new(PeerState::new(cfg.peer.endpoint))),
@@ -280,6 +300,14 @@ impl Tunnel {
 
     /// Reads inner packets, encrypts them, and puts them on the wire.
     fn tun_to_wire(&self) {
+        match self.cfg.interface.datapath {
+            Datapath::Simple => self.tun_to_wire_simple(),
+            Datapath::Batched => self.tun_to_wire_batched(),
+        }
+    }
+
+    /// One packet per syscall.
+    fn tun_to_wire_simple(&self) {
         let mut inner = vec![0u8; MAX_INNER];
         let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
         let mut frame = vec![0u8; MAX_INNER + MAX_OVERHEAD + paqetz_core::framing::OVERHEAD];
@@ -299,51 +327,225 @@ impl Tunnel {
             let Some(packet) = inner.get(..n) else {
                 continue;
             };
-
             if let Err(e) = self.send_inner(packet, &mut sealed, &mut frame) {
-                // A packet we cannot send is dropped, exactly as a congested
-                // link would drop it. Inner TCP retries; nothing here should
-                // treat it as fatal.
-                if !matches!(e, Error::Core(paqetz_core::Error::Expired)) {
-                    eprintln!("dropping outbound packet: {e}");
+                self.note_outbound(&e);
+            }
+        }
+    }
+
+    /// Drains whatever is queued, then sends it in one syscall.
+    ///
+    /// The first read blocks; the rest are non-blocking, so this only ever
+    /// collects packets that were already waiting. Under one packet in flight
+    /// it behaves exactly as the simple path does — batching costs latency only
+    /// if you wait for a batch to form, and this does not.
+    fn tun_to_wire_batched(&self) {
+        let mut inner: Vec<Vec<u8>> = (0..sys::BATCH).map(|_| vec![0u8; MAX_INNER]).collect();
+        let mut frames: Vec<Vec<u8>> = (0..sys::BATCH)
+            .map(|_| vec![0u8; MAX_INNER + MAX_OVERHEAD + paqetz_core::framing::OVERHEAD])
+            .collect();
+        let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
+        let mut lens = [0usize; sys::BATCH];
+        let mut dsts = Vec::with_capacity(sys::BATCH);
+
+        while self.running.load(Ordering::Relaxed) {
+            // Block for the first, then take anything else already queued.
+            let Some(first) = self.read_inner_blocking(&mut inner) else {
+                break;
+            };
+            let mut count = 1;
+            if let Some(slot) = lens.get_mut(0) {
+                *slot = first;
+            }
+            while count < sys::BATCH {
+                let Some(buf) = inner.get_mut(count) else {
+                    break;
+                };
+                match self.tun.recv_nonblocking(buf) {
+                    Ok(Some(n)) if n > 0 => {
+                        if let Some(slot) = lens.get_mut(count) {
+                            *slot = n;
+                        }
+                        count += 1;
+                    }
+                    Ok(_) => break,
+                    Err(_) => break,
+                }
+            }
+
+            // Encrypt each into its own frame buffer, then send them together.
+            dsts.clear();
+            let mut ready = 0usize;
+            for i in 0..count {
+                let Some(packet) = inner
+                    .get(i)
+                    .and_then(|b| b.get(..*lens.get(i).unwrap_or(&0)))
+                else {
+                    continue;
+                };
+                let Some(frame) = frames.get_mut(ready) else {
+                    break;
+                };
+                match self.seal_into(packet, &mut sealed, frame) {
+                    Ok(Some((written, dst))) => {
+                        if let Some(slot) = lens.get_mut(ready) {
+                            *slot = written;
+                        }
+                        dsts.push(dst);
+                        ready += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.note_outbound(&e),
+                }
+            }
+            if ready == 0 {
+                continue;
+            }
+
+            let packets: Vec<&[u8]> = frames
+                .iter()
+                .take(ready)
+                .enumerate()
+                .filter_map(|(i, f)| f.get(..*lens.get(i).unwrap_or(&0)))
+                .collect();
+            if let Err(e) = self.tx.send_batch(&packets, &dsts) {
+                self.note_outbound(&Error::Os {
+                    context: "transmitting a batch".to_owned(),
+                    source: e,
+                });
+            }
+        }
+    }
+
+    /// Blocks for one inner packet, returning its length.
+    fn read_inner_blocking(&self, inner: &mut [Vec<u8>]) -> Option<usize> {
+        loop {
+            if !self.running.load(Ordering::Relaxed) {
+                return None;
+            }
+            let buf = inner.first_mut()?;
+            match self.tun.recv(buf) {
+                Ok(n) if n > 0 => return Some(n),
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("tun read failed: {e}");
+                    return None;
                 }
             }
         }
     }
 
-    /// Encrypts one inner packet and transmits it.
+    /// Reports a per-packet outbound failure, unless it is an ordinary one.
+    fn note_outbound(&self, e: &Error) {
+        // A packet we cannot send is dropped, exactly as a congested link would
+        // drop it. Inner TCP retries; nothing here should treat it as fatal.
+        if !matches!(e, Error::Core(paqetz_core::Error::Expired)) {
+            eprintln!("dropping outbound packet: {e}");
+        }
+    }
+
+    /// Encrypts one inner packet and transmits it immediately.
     fn send_inner(&self, packet: &[u8], sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
-        let now = self.now();
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-
-        let Some(session) = state.session.as_mut() else {
-            // No session yet. The timer thread is responsible for starting one;
-            // this packet is simply lost, which is what a link that is not up
-            // yet looks like from above.
+        let Some((written, dst)) = self.seal_into(packet, sealed, frame)? else {
             return Ok(());
         };
-        let n = session.seal(packet, sealed, now)?;
-
-        let Some(carrier) = state.carrier.as_mut() else {
-            return Ok(());
-        };
-        let Some(payload) = sealed.get(..n) else {
-            return Ok(());
-        };
-        let written = carrier.data(payload, frame, now)?;
-        let dst = carrier.remote().0;
-        drop(state);
-
         let Some(out) = frame.get(..written) else {
             return Ok(());
         };
         os("transmitting", self.tx.send(out, dst)).map(|_| ())
     }
 
+    /// Encrypts one inner packet into `frame`, ready to transmit.
+    ///
+    /// Returns the frame's length and where to send it, or `None` when there is
+    /// no session yet — in which case the packet is lost, which is what a link
+    /// that is not up yet looks like from above.
+    fn seal_into(
+        &self,
+        packet: &[u8],
+        sealed: &mut [u8],
+        frame: &mut [u8],
+    ) -> Result<Option<(usize, Ipv4Addr)>> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(session) = state.session.as_mut() else {
+            return Ok(None);
+        };
+        let n = session.seal(packet, sealed, now)?;
+
+        let Some(carrier) = state.carrier.as_mut() else {
+            return Ok(None);
+        };
+        let Some(payload) = sealed.get(..n) else {
+            return Ok(None);
+        };
+        let written = carrier.data(payload, frame, now)?;
+        let dst = carrier.remote().0;
+        Ok(Some((written, dst)))
+    }
+
     // -- inbound -------------------------------------------------------------
 
     /// Reads from the wire, decrypts, and writes inner packets to the device.
     fn wire_to_tun(&self) {
+        match self.cfg.interface.datapath {
+            Datapath::Simple => self.wire_to_tun_simple(),
+            Datapath::Batched => self.wire_to_tun_batched(),
+        }
+    }
+
+    /// Up to [`sys::BATCH`] frames per syscall.
+    fn wire_to_tun_batched(&self) {
+        let mut frames: Vec<Vec<u8>> = (0..sys::BATCH).map(|_| vec![0u8; MAX_FRAME]).collect();
+        let mut lens = [0usize; sys::BATCH];
+        let mut inner = vec![0u8; MAX_INNER];
+        let mut reply = vec![0u8; MAX_FRAME];
+
+        while self.running.load(Ordering::Relaxed) {
+            let count = match self.rx.recv_batch(&mut frames, &mut lens) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    eprintln!("capture read failed: {e}");
+                    break;
+                }
+            };
+            for i in 0..count {
+                let Some(bytes) = frames
+                    .get(i)
+                    .and_then(|f| f.get(..*lens.get(i).unwrap_or(&0)))
+                else {
+                    continue;
+                };
+                let Some(seg) = segment::parse_ethernet(bytes) else {
+                    continue;
+                };
+                if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
+                    self.note_inbound(&e);
+                }
+            }
+        }
+    }
+
+    /// Reports a per-packet inbound failure, unless it is an ordinary one.
+    fn note_inbound(&self, e: &Error) {
+        // Anything unauthenticated lands here. It is dropped silently in the
+        // sense that matters — nothing goes back on the wire — but it is worth
+        // a line at this stage of development.
+        if !matches!(
+            e,
+            Error::Core(paqetz_core::Error::Rejected | paqetz_core::Error::Replay)
+        ) {
+            eprintln!("dropping inbound packet: {e}");
+        }
+    }
+
+    /// One frame per syscall.
+    fn wire_to_tun_simple(&self) {
         let mut frame = vec![0u8; MAX_FRAME];
         let mut inner = vec![0u8; MAX_INNER];
         let mut reply = vec![0u8; MAX_FRAME];
@@ -366,15 +568,7 @@ impl Tunnel {
                 continue;
             };
             if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
-                // Anything unauthenticated lands here. It is dropped silently
-                // in the sense that matters -- nothing goes back on the wire --
-                // but it is worth a line at this stage of development.
-                if !matches!(
-                    e,
-                    Error::Core(paqetz_core::Error::Rejected | paqetz_core::Error::Replay)
-                ) {
-                    eprintln!("dropping inbound packet: {e}");
-                }
+                self.note_inbound(&e);
             }
         }
     }

@@ -73,11 +73,16 @@ private_key = "${SRV_PRIV}"
 address = "${SRV_INNER}/24"
 listen_port = ${PORT}
 device = "pq-srv"
+datapath = "${DATAPATH:-batched}"
 
 [peer]
 public_key = "${CLI_PUB}"
 tunnel_address = "${CLI_INNER}"
 EOF
+
+# DATAPATH lets the whole suite be re-run against the simple path, so the
+# batched one is never the only thing that has been exercised.
+DATAPATH=${DATAPATH:-batched}
 
 cat > "${WORK}/client.toml" <<EOF
 [interface]
@@ -85,6 +90,7 @@ private_key = "${CLI_PRIV}"
 address = "${CLI_INNER}/24"
 listen_port = $((PORT + 1))
 device = "pq-cli"
+datapath = "${DATAPATH}"
 
 [peer]
 public_key = "${SRV_PUB}"
@@ -437,5 +443,5 @@ log "logs"
 echo "--- server ---"; tail -20 "${WORK}/server.log" | sed 's/^/  /'
 echo "--- client ---"; tail -20 "${WORK}/client.log" | sed 's/^/  /'
 
-log "result: ${PASS} passed, ${FAIL} failed"
+log "result: ${PASS} passed, ${FAIL} failed (datapath: ${DATAPATH})"
 [[ ${FAIL} -eq 0 ]]

@@ -9,25 +9,33 @@
 //! gateway MAC address appears in the configuration. Receive is `AF_PACKET`
 //! with a kernel-side BPF filter.
 //!
-//! # Scope
+//! # Batching
 //!
-//! This phase implements the datapath correctly, not yet quickly. Reads and
-//! writes are one syscall per packet. The `PACKET_MMAP` receive ring,
-//! `PACKET_FANOUT` across workers, `sendmmsg` batching, and TUN GSO via
-//! `IFF_VNET_HDR` all belong to the throughput phase and are deliberately
-//! absent here — landing several hundred lines of ring-buffer `unsafe` before
-//! anything works end to end would be the wrong order. See
-//! `docs/08-rewrite-plan.md` §8.5 phase 3.
+//! Both directions can move up to [`sys::BATCH`] packets per syscall, via
+//! `recvmmsg` and `sendmmsg`. That is the large, cheap part of what a
+//! `PACKET_MMAP` ring would buy: the syscall dominates the per-packet cost, and
+//! it is amortised here for a few dozen lines rather than a few hundred of ring
+//! management. What a ring would still add is avoiding the copy out of kernel
+//! memory — worth roughly a hundred nanoseconds per packet against a budget
+//! where the AEAD is nearer a thousand. Deferred on those grounds, not
+//! forgotten.
+//!
+//! Still absent, and honestly so: `PACKET_FANOUT` across workers, and TUN
+//! segmentation offload via `IFF_VNET_HDR`. The latter needs re-segmenting TCP
+//! super-packets in userspace, which is several hundred lines of its own.
 
 pub mod bpf;
+pub mod neigh;
 pub mod rx;
 pub mod sys;
 pub mod tun;
 pub mod tx;
+pub mod tx_afpacket;
 
 pub use rx::PacketRx;
 pub use tun::Tun;
 pub use tx::RawTx;
+pub use tx_afpacket::{AfPacketTx, Transmit};
 
 /// Largest frame this crate will read or write.
 ///

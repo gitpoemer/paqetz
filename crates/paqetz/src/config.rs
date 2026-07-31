@@ -49,6 +49,45 @@ pub(crate) struct Interface {
     pub(crate) carrier: paqetz_tcpwire::Carrier,
     /// Whether to manage firewall rules automatically.
     pub(crate) manage_firewall: bool,
+    /// Whether to move packets in batches.
+    pub(crate) datapath: Datapath,
+    /// Which transmit path to use.
+    pub(crate) transmit: TransmitPath,
+}
+
+/// How packets move between the device and the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Datapath {
+    /// Up to 32 packets per syscall, drained from whatever is already queued.
+    ///
+    /// The default. Batching only ever takes packets that were waiting anyway,
+    /// so it costs no latency: with one packet in flight it behaves exactly as
+    /// the simple path does.
+    #[default]
+    Batched,
+    /// One packet per syscall.
+    ///
+    /// Kept so the two can be measured against each other, and as somewhere to
+    /// stand if the batched path ever misbehaves.
+    Simple,
+}
+
+/// Which mechanism puts frames on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TransmitPath {
+    /// Raw socket with `IP_HDRINCL`; the kernel routes and resolves the next
+    /// hop.
+    ///
+    /// The default, because it has no moving parts: no hardware address to go
+    /// stale when a gateway fails over or a lease moves, which is the failure
+    /// paqet suffered from making the operator write one down.
+    #[default]
+    Raw,
+    /// `AF_PACKET`, naming the next hop ourselves.
+    ///
+    /// Skips the route lookup and the netfilter `OUTPUT` chain. Possibly
+    /// faster — measure it with `scripts/bench.sh` before adopting it.
+    AfPacket,
 }
 
 /// The other end.
@@ -139,6 +178,10 @@ struct RawInterface {
     carrier: Option<String>,
     #[serde(default)]
     manage_firewall: Option<bool>,
+    #[serde(default)]
+    datapath: Option<String>,
+    #[serde(default)]
+    transmit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +303,28 @@ impl Config {
             }
         };
 
+        let datapath = match raw.interface.datapath.as_deref().unwrap_or("batched") {
+            "batched" => Datapath::Batched,
+            "simple" => Datapath::Simple,
+            other => {
+                return Err(invalid(
+                    "interface.datapath",
+                    format!("expected \"batched\" or \"simple\", got {other:?}"),
+                ));
+            }
+        };
+
+        let transmit = match raw.interface.transmit.as_deref().unwrap_or("raw") {
+            "raw" => TransmitPath::Raw,
+            "afpacket" => TransmitPath::AfPacket,
+            other => {
+                return Err(invalid(
+                    "interface.transmit",
+                    format!("expected \"raw\" or \"afpacket\", got {other:?}"),
+                ));
+            }
+        };
+
         let public_key = PublicKey::from_base64(&raw.peer.public_key)
             .map_err(|e| invalid("peer.public_key", e.to_string()))?;
 
@@ -314,6 +379,8 @@ impl Config {
                 profile,
                 carrier,
                 manage_firewall: raw.interface.manage_firewall.unwrap_or(true),
+                datapath,
+                transmit,
             },
             peer: Peer {
                 public_key,
@@ -413,6 +480,41 @@ tunnel_address = "10.7.0.2"
         assert_eq!(c.interface.profile.name, "linux-6");
         assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Midstream);
         assert!(c.interface.manage_firewall);
+    }
+
+    #[test]
+    fn the_datapath_and_transmit_defaults_are_the_recommended_ones() {
+        let c = Config::parse(CLIENT).expect("parse");
+        assert_eq!(
+            c.interface.datapath,
+            Datapath::Batched,
+            "batching costs nothing when there is one packet, so it is the default"
+        );
+        assert_eq!(
+            c.interface.transmit,
+            TransmitPath::Raw,
+            "the raw path has no hardware address to go stale, so it is the default"
+        );
+    }
+
+    #[test]
+    fn both_can_be_switched() {
+        let text = CLIENT.replace(
+            "[peer]",
+            "datapath = \"simple\"\ntransmit = \"afpacket\"\n\n[peer]",
+        );
+        let c = Config::parse(&text).expect("parse");
+        assert_eq!(c.interface.datapath, Datapath::Simple);
+        assert_eq!(c.interface.transmit, TransmitPath::AfPacket);
+    }
+
+    #[test]
+    fn an_unknown_datapath_or_transmit_is_rejected() {
+        for (field, value) in [("datapath", "turbo"), ("transmit", "carrier-pigeon")] {
+            let text = CLIENT.replace("[peer]", &format!("{field} = \"{value}\"\n\n[peer]"));
+            let err = Config::parse(&text).expect_err("must be rejected");
+            assert!(err.to_string().contains(field), "got: {err}");
+        }
     }
 
     #[test]
