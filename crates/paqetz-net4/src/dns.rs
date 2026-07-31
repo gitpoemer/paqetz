@@ -155,10 +155,37 @@ enum Reply {
 /// the part that is not merely address-based.
 fn query_id() -> io::Result<u16> {
     let mut bytes = [0u8; 2];
-    // SAFETY: writes exactly `len` bytes into a buffer of that size.
-    let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
-    if n != 2 {
-        return Err(io::Error::last_os_error());
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let rest = bytes
+            .get_mut(filled..)
+            .ok_or_else(|| io::Error::other("short buffer"))?;
+        // The syscall rather than glibc's wrapper, which only exists from 2.25.
+        // The oldest cross-compilation image predates that, and a build that
+        // links against a newer symbol would also refuse to start on the older
+        // systems this is meant to drop onto.
+        //
+        // SAFETY: writes at most `len` bytes into a buffer of that length.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                rest.as_mut_ptr().cast::<libc::c_void>(),
+                rest.len(),
+                0,
+            )
+        };
+        match usize::try_from(n) {
+            Ok(0) | Err(_) => {
+                let e = io::Error::last_os_error();
+                // A signal arriving mid-call is not a failure to produce
+                // randomness; it is a reason to ask again.
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            Ok(got) => filled += got,
+        }
     }
     Ok(u16::from_be_bytes(bytes))
 }
