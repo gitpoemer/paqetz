@@ -249,12 +249,20 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
     println!("   [s] the server — stable address, the client connects to it");
     println!("   [c] the client — connects out");
     println!("   [n] neither — just generating the files to copy elsewhere");
+    println!("   [q] quit");
     let role = loop {
         match ask("   ", "c")?.to_ascii_lowercase().as_str() {
             "s" | "server" => break Some(Role::Server),
             "c" | "client" => break Some(Role::Client),
             "n" | "neither" => break None,
-            _ => println!("   Please answer s, c or n.\n"),
+            // Offered here because this is the last moment at which leaving is
+            // free: nothing has been generated, written, or installed yet, so
+            // there is nothing to undo and nothing to warn about.
+            "q" | "quit" | "exit" => {
+                println!("   Nothing was changed.");
+                return Ok(());
+            }
+            _ => println!("   Please answer s, c, n or q.\n"),
         }
     };
 
