@@ -14,19 +14,21 @@ use crate::sys::{self, IfReq};
 
 /// `ioctl` numbers. These are not in `libc` for every target, so they are
 /// spelled out; the values are architecture-independent on Linux.
+///
+/// Typed as [`libc::Ioctl`], whose width differs between glibc and musl.
 pub(crate) mod ioctls {
     /// Bind a file descriptor from `/dev/net/tun` to an interface.
-    pub(crate) const TUNSETIFF: libc::c_ulong = 0x4004_54CA;
+    pub(crate) const TUNSETIFF: libc::Ioctl = 0x4004_54CA;
     /// Set interface flags.
-    pub(crate) const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+    pub(crate) const SIOCSIFFLAGS: libc::Ioctl = 0x8914;
     /// Get interface flags.
-    pub(crate) const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+    pub(crate) const SIOCGIFFLAGS: libc::Ioctl = 0x8913;
     /// Set the interface MTU.
-    pub(crate) const SIOCSIFMTU: libc::c_ulong = 0x8922;
+    pub(crate) const SIOCSIFMTU: libc::Ioctl = 0x8922;
     /// Set the interface address.
-    pub(crate) const SIOCSIFADDR: libc::c_ulong = 0x8916;
+    pub(crate) const SIOCSIFADDR: libc::Ioctl = 0x8916;
     /// Set the interface netmask.
-    pub(crate) const SIOCSIFNETMASK: libc::c_ulong = 0x891C;
+    pub(crate) const SIOCSIFNETMASK: libc::Ioctl = 0x891C;
 }
 
 /// TUN interface flags.

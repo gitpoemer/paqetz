@@ -30,7 +30,7 @@ paqetz-net4 = { path = "crates/paqetz-net4" }
 # which is why chacha20poly1305 is not a direct dependency: the AEAD is reached
 # through the negotiated Noise suite. `chacha20` is used only for the header
 # mask (D7), `blake2` only for key derivation and mac1.
-snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-blake2", "use-getrandom"] }
 chacha20 = "0.9"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 blake2 = "0.10"

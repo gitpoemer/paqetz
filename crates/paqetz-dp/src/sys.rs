@@ -47,10 +47,14 @@ pub fn socket(domain: libc::c_int, ty: libc::c_int, protocol: libc::c_int) -> io
 
 /// Issues an `ioctl` whose argument is a pointer to `T`.
 ///
+/// `request` is [`libc::Ioctl`] rather than a concrete integer because its type
+/// is not the same everywhere: `c_ulong` against glibc, `c_int` against musl.
+/// Spelling it as either one compiles on that platform and fails on the other.
+///
 /// # Safety
 /// `request` must be an ioctl that expects a pointer to a `T`, and `T` must be
 /// laid out as that ioctl expects.
-pub unsafe fn ioctl_ptr<T>(fd: RawFd, request: libc::c_ulong, arg: &mut T) -> io::Result<()> {
+pub unsafe fn ioctl_ptr<T>(fd: RawFd, request: libc::Ioctl, arg: &mut T) -> io::Result<()> {
     // SAFETY: the caller guarantees `request` matches `T`'s layout. `arg` is a
     // valid, uniquely borrowed `T` for the duration of the call.
     check(unsafe { libc::ioctl(fd, request, std::ptr::from_mut(arg)) })?;
@@ -301,7 +305,9 @@ pub fn recvmmsg(fd: RawFd, bufs: &mut [Vec<u8>], lens: &mut [usize]) -> io::Resu
             fd,
             msgs.as_mut_ptr(),
             u32::try_from(n).unwrap_or(1),
-            libc::MSG_WAITFORONE,
+            // Signed against glibc, unsigned against musl; inferred so the
+            // same source compiles for both.
+            libc::MSG_WAITFORONE as _,
             std::ptr::null_mut(),
         )
     };
