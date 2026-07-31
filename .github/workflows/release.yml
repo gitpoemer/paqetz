@@ -54,7 +54,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # Advisories, licences, and the ban list — which is what holds the
+  # Advisories, licences, and the ban list -- which is what holds the
   # single-cipher-suite decision in place. Worth keeping precisely because a
   # second AEAD arriving through a transitive feature is exactly how `ring` got
   # into this tree unnoticed.
@@ -133,6 +133,8 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             cross: true
             static: false
+            platform: linux/arm64
+            image: debian:stable-slim
     steps:
       - uses: actions/checkout@v5
         with:
@@ -190,27 +192,53 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       # Compiling is not the same as running, and for every target but this
-      # runner's own the two had never been checked apart. `cross` carries qemu,
-      # so a foreign binary can be run here — which is how a 32-bit or
-      # big-endian mistake gets caught before someone finds it on a router.
+      # runner's own the two had never been checked apart. Registering qemu's
+      # binfmt handlers lets a foreign binary run here, which is how a 32-bit or
+      # endianness mistake gets caught before someone finds it on a router.
+      #
+      # What runs is the artifact itself, not a rebuild. An earlier version of
+      # this used `cross run`, which quietly ate the `--version` argument and
+      # launched the binary with none: clap printed its help and exited 2, and
+      # every emulated target failed. Running `dist/$NAME` has no such ambiguity
+      # and has the better property anyway of testing the exact file we upload.
       #
       # keygen is the useful thing to run: it exercises the curve and the
       # generator, needs no privilege, and fails loudly if either is wrong.
+      - name: Register qemu
+        if: ${{ matrix.cross }}
+        uses: docker/setup-qemu-action@v3
+
       - name: Smoke test (native)
         if: ${{ !matrix.cross }}
         shell: bash
+        env:
+          NAME: ${{ steps.artifact.outputs.name }}
         run: |
-          ./dist/${{ steps.artifact.outputs.name }} --version
-          ./dist/${{ steps.artifact.outputs.name }} keygen > /dev/null
+          "./dist/$NAME" --version
+          "./dist/$NAME" keygen > /dev/null
 
-      - name: Smoke test (emulated)
-        if: ${{ matrix.cross }}
+      # Static, so it needs nothing but the kernel's binfmt handler and runs
+      # straight from the host.
+      - name: Smoke test (emulated, static)
+        if: ${{ matrix.cross && matrix.static }}
         shell: bash
+        env:
+          NAME: ${{ steps.artifact.outputs.name }}
         run: |
-          cross run --locked --release --bin paqetz \
-            --target ${{ matrix.target }} -- --version
-          cross run --locked --release --bin paqetz \
-            --target ${{ matrix.target }} -- keygen > /dev/null
+          "./dist/$NAME" --version
+          "./dist/$NAME" keygen > /dev/null
+
+      # Dynamically linked, so it needs its target's libc and runs inside an
+      # image of that architecture rather than on the runner.
+      - name: Smoke test (emulated, dynamic)
+        if: ${{ matrix.cross && !matrix.static }}
+        shell: bash
+        env:
+          NAME: ${{ steps.artifact.outputs.name }}
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD/dist:/dist:ro" -e NAME "${{ matrix.image }}" \
+            sh -c '"/dist/$NAME" --version && "/dist/$NAME" keygen > /dev/null'
 
       - uses: actions/upload-artifact@v4
         with:
