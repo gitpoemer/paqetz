@@ -1,0 +1,22 @@
+[package]
+name = "paqetz"
+description = "Point-to-point L3 tunnel over crafted TCP segments."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "paqetz"
+path = "src/main.rs"
+
+[dependencies]
+paqetz-core = { workspace = true }
+paqetz-dp = { workspace = true }
+paqetz-fw = { workspace = true }
+paqetz-net4 = { workspace = true }
+paqetz-tcpwire = { workspace = true }
+
+[lints]
+workspace = true

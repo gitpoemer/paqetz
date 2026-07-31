@@ -1,0 +1,13 @@
+[package]
+name = "paqetz-net4"
+description = "L4 debugging front end: SOCKS5 listener whose egress is marked into the tunnel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

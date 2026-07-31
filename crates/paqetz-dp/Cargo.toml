@@ -1,0 +1,13 @@
+[package]
+name = "paqetz-dp"
+description = "Datapath: raw IP_HDRINCL transmit, AF_PACKET receive ring, TUN device."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

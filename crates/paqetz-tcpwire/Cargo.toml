@@ -1,0 +1,13 @@
+[package]
+name = "paqetz-tcpwire"
+description = "Fake-TCP wire format: segment emit/parse, OS profiles, per-endpoint seq/ack state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

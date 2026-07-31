@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/paqetz",
+    "crates/paqetz-core",
+    "crates/paqetz-tcpwire",
+    "crates/paqetz-dp",
+    "crates/paqetz-fw",
+    "crates/paqetz-net4",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/gitpoemer/paqetz"
+
+# Shared dependency versions. Member crates opt in with `dep = { workspace = true }`;
+# entries listed here are not fetched until a member actually uses one.
+[workspace.dependencies]
+paqetz-core = { path = "crates/paqetz-core" }
+paqetz-tcpwire = { path = "crates/paqetz-tcpwire" }
+paqetz-dp = { path = "crates/paqetz-dp" }
+paqetz-fw = { path = "crates/paqetz-fw" }
+paqetz-net4 = { path = "crates/paqetz-net4" }
+
+# Crypto — one suite, no agility (D1).
+chacha20poly1305 = { version = "0.10", default-features = false }
+chacha20 = { version = "0.9", default-features = false }
+x25519-dalek = { version = "2", default-features = false }
+blake2 = { version = "0.10", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+zeroize = { version = "1", default-features = false }
+
+# Syscalls. No async runtime on the datapath (§8.3, thread-per-core).
+libc = "0.2"
+
+# Plumbing.
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# The datapath is full of deliberate integer work over packet bytes; these are
+# on so that every cast and slice index is a decision rather than an accident.
+cast_possible_truncation = "warn"
+cast_lossless = "warn"
+indexing_slicing = "warn"
+undocumented_unsafe_blocks = "warn"
+todo = "warn"
+
+# Release profile targets the datapath: one codegen unit and LTO measurably
+# help the packet-per-second path, which is the whole product (§8.3).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Benchmarks and profiling runs need frame pointers and symbols.
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"
