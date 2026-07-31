@@ -535,6 +535,23 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Reads one answer, treating a closed stdin as an error rather than as an
+/// empty line.
+///
+/// Several of the questions here re-ask until the answer is valid. If
+/// end-of-file reported itself as an empty answer, those loops would never
+/// finish — the wizard would sit there re-printing a prompt nobody can answer.
+fn read_answer() -> io::Result<String> {
+    let mut line = String::new();
+    if io::stdin().lock().read_line(&mut line)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "no more input: setup needs a terminal, or answers on stdin",
+        ));
+    }
+    Ok(line)
+}
+
 /// Asks a question, returning the default when the answer is empty.
 fn ask(prompt: &str, default: &str) -> io::Result<String> {
     if default.is_empty() {
@@ -543,8 +560,7 @@ fn ask(prompt: &str, default: &str) -> io::Result<String> {
         print!("{prompt}\n   [{default}] > ");
     }
     io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
+    let line = read_answer()?;
     let answer = line.trim();
     Ok(if answer.is_empty() {
         default.to_owned()
@@ -559,8 +575,7 @@ fn yes_no(prompt: &str, default: bool) -> io::Result<bool> {
     loop {
         print!("{prompt}\n   [{hint}] > ");
         io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
+        let line = read_answer()?;
         match line.trim().to_ascii_lowercase().as_str() {
             "" => return Ok(default),
             "y" | "yes" => return Ok(true),
