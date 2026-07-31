@@ -162,15 +162,64 @@ fi
 
 # --- TCP through the tunnel -------------------------------------------------
 log "TCP through the tunnel"
-sudo ip netns exec "${SRV_NS}" bash -c \
-    "echo tunnel-works | timeout 10 nc -l -p 7777 -q1" > "${WORK}/nc.out" 2>/dev/null &
+cat > "${WORK}/echo_server.py" <<'PYEOF'
+import socket, sys
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 7777))
+srv.listen(8)
+srv.settimeout(180)
+while True:
+    try:
+        conn, _ = srv.accept()
+    except socket.timeout:
+        break
+    with conn:
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            conn.sendall(chunk)
+PYEOF
+
+cat > "${WORK}/echo_client.py" <<'PYEOF'
+import socket, sys, hashlib
+host, total = sys.argv[1], int(sys.argv[2])
+payload = bytes((i * 7 + 13) & 0xFF for i in range(total))
+s = socket.create_connection((host, 7777), timeout=15)
+s.settimeout(15)
+s.sendall(payload)
+s.shutdown(socket.SHUT_WR)
+got = bytearray()
+while len(got) < total:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    got += chunk
+if bytes(got) != payload:
+    print(f"mismatch: sent {total}, got {len(got)}")
+    sys.exit(1)
+print(hashlib.sha256(payload).hexdigest()[:16])
+PYEOF
+
+sudo ip netns exec "${SRV_NS}" python3 "${WORK}/echo_server.py" >/dev/null 2>&1 &
 sleep 1
-if timeout 8 sudo ip netns exec "${CLI_NS}" \
-        bash -c "nc -w3 ${SRV_INNER} 7777" > "${WORK}/nc.recv" 2>/dev/null \
-        && grep -q tunnel-works "${WORK}/nc.recv"; then
+
+# A single byte first: proves a connection completes at all.
+if timeout 20 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/echo_client.py" "${SRV_INNER}" 1 >/dev/null 2>&1; then
     ok "a TCP connection completes through the tunnel"
 else
     bad "a TCP connection does not complete through the tunnel"
+fi
+
+# Then a volume that must be split across many segments, which exercises the
+# MTU and the full seal/emit/parse/open path under load rather than once.
+if timeout 25 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/echo_client.py" "${SRV_INNER}" 262144 >/dev/null 2>&1; then
+    ok "256 KiB round-trips through the tunnel byte-for-byte"
+else
+    bad "256 KiB does not round-trip through the tunnel"
 fi
 
 # --- the wire looks like TCP ------------------------------------------------
@@ -227,17 +276,56 @@ sudo ip netns exec "${CLI_NS}" ip addr add "${CLI_OUTER}/24" dev veth-cli 2>/dev
 
 # --- state does not grow with connections -----------------------------------
 log "state is per peer, not per flow"
-srv_pid=$(pgrep -f "paqetz run -c ${WORK}/server.toml" | head -1)
-if [[ -n ${srv_pid} ]]; then
-    rss_before=$(awk '/VmRSS/ {print $2}' "/proc/${srv_pid}/status")
-    threads_before=$(awk '/Threads/ {print $2}' "/proc/${srv_pid}/status")
+# `pgrep -f` also matches the `sudo ip netns exec ...` wrapper, whose thread
+# count is 1 and whose memory never moves -- which would make this pass without
+# measuring anything. Ask the namespace which processes are in it instead.
+srv_pid=""
+for p in $(sudo ip netns pids "${SRV_NS}" 2>/dev/null); do
+    if [[ $(cat "/proc/${p}/comm" 2>/dev/null) == paqetz ]]; then
+        srv_pid=${p}
+        break
+    fi
+done
 
-    # Churn a few hundred inner connections. Under a design with per-flow state
-    # this is where memory and thread count would climb.
-    for _ in $(seq 1 200); do
-        timeout 1 sudo ip netns exec "${CLI_NS}" \
-            bash -c "exec 3<>/dev/tcp/${SRV_INNER}/7778" 2>/dev/null
-    done
+if [[ -n ${srv_pid} ]]; then
+    threads_before=$(awk '/Threads/ {print $2}' "/proc/${srv_pid}/status")
+    if [[ ${threads_before} -ge 4 ]]; then
+        ok "found the tunnel process (pid ${srv_pid}, ${threads_before} threads)"
+    else
+        bad "pid ${srv_pid} has ${threads_before} threads; expected the tunnel's 4"
+    fi
+
+    rss_before=$(awk '/VmRSS/ {print $2}' "/proc/${srv_pid}/status")
+
+    # Real accepted connections, each carrying data, so the tunnel actually
+    # handles them. A design with per-flow state would grow here. Driven from a
+    # single process: spawning 200 interpreters would measure process creation
+    # rather than the tunnel.
+    cat > "${WORK}/churn.py" <<'PYEOF'
+import socket, sys
+host, count = sys.argv[1], int(sys.argv[2])
+done = 0
+for _ in range(count):
+    try:
+        s = socket.create_connection((host, 7777), timeout=5)
+        s.settimeout(5)
+        s.sendall(b"x" * 512)
+        s.shutdown(socket.SHUT_WR)
+        while s.recv(4096):
+            pass
+        s.close()
+        done += 1
+    except OSError:
+        pass
+print(done)
+PYEOF
+    churned=$(timeout 120 sudo ip netns exec "${CLI_NS}" \
+        python3 "${WORK}/churn.py" "${SRV_INNER}" 200 2>/dev/null)
+    if [[ ${churned:-0} -ge 190 ]]; then
+        ok "${churned} of 200 connections completed through the tunnel"
+    else
+        bad "only ${churned:-0} of 200 connections completed"
+    fi
     sleep 1
 
     rss_after=$(awk '/VmRSS/ {print $2}' "/proc/${srv_pid}/status")
@@ -245,17 +333,17 @@ if [[ -n ${srv_pid} ]]; then
     growth=$((rss_after - rss_before))
 
     if [[ ${threads_after} -eq ${threads_before} ]]; then
-        ok "thread count is unchanged by connection churn (${threads_after})"
+        ok "thread count is unchanged by the churn (${threads_after})"
     else
         bad "threads grew from ${threads_before} to ${threads_after}"
     fi
     if [[ ${growth} -lt 1024 ]]; then
-        ok "memory is flat under connection churn (${growth} KiB)"
+        ok "memory is flat under the churn (${growth} KiB)"
     else
-        bad "memory grew by ${growth} KiB under connection churn"
+        bad "memory grew by ${growth} KiB under the churn"
     fi
 else
-    bad "could not find the server process"
+    bad "could not find the tunnel process inside ${SRV_NS}"
 fi
 
 # --- firewall rules were installed and are removed on exit ------------------
