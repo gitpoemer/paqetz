@@ -469,6 +469,24 @@ mod tests {
     }
 }
 
+/// Waits for a descriptor to become readable.
+///
+/// Returns `true` if it did, `false` if the timeout expired first. A timeout
+/// exists so a blocked thread can still notice a shutdown request.
+pub fn poll_readable(fd: RawFd, timeout_ms: i32) -> io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid `pollfd`, borrowed for the duration of the call.
+    let n = unsafe { libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod batch_tests {
     //! Exercises the batched syscall wrappers over loopback UDP.

@@ -63,9 +63,14 @@ try:
         print(f"{bits / 1e9:.2f} Gbit/s")
     else:
         summary = report["end"]["sum"]
-        bits = summary["bits_per_second"]
-        pps = summary["packets"] / duration / 1000
-        print(f"{bits / 1e9:.2f} Gbit/s ({pps:.0f}k pps)")
+        # iperf3's client-side sum counts what it *sent*. Without the loss
+        # figure a number here can be mostly datagrams the tunnel dropped,
+        # which would make the whole comparison meaningless.
+        lost = summary.get("lost_percent", 0.0)
+        delivered = summary["packets"] - summary.get("lost_packets", 0)
+        pps = delivered / duration / 1000
+        bits = summary["bits_per_second"] * (1.0 - lost / 100.0)
+        print(f"{bits / 1e9:.2f} Gbit/s ({pps:.0f}k pps, {lost:.1f}% lost)")
 except (ValueError, KeyError, TypeError, ZeroDivisionError):
     print("n/a")
 PYEOF

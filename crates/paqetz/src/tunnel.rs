@@ -340,6 +340,13 @@ impl Tunnel {
     /// it behaves exactly as the simple path does — batching costs latency only
     /// if you wait for a batch to form, and this does not.
     fn tun_to_wire_batched(&self) {
+        // Set once, not per read. Toggling it around each read cost two extra
+        // syscalls per packet, which made batching slower than not batching.
+        if let Err(e) = self.tun.set_nonblocking(true) {
+            eprintln!("could not set the device non-blocking: {e}");
+            return;
+        }
+
         let mut inner: Vec<Vec<u8>> = (0..sys::BATCH).map(|_| vec![0u8; MAX_INNER]).collect();
         let mut frames: Vec<Vec<u8>> = (0..sys::BATCH)
             .map(|_| vec![0u8; MAX_INNER + MAX_OVERHEAD + paqetz_core::framing::OVERHEAD])
@@ -417,15 +424,28 @@ impl Tunnel {
         }
     }
 
-    /// Blocks for one inner packet, returning its length.
+    /// Waits for one inner packet, returning its length.
+    ///
+    /// Blocks in `poll` rather than in `read`, so the device can stay
+    /// non-blocking for the drain that follows, and so the wait has a timeout
+    /// through which a shutdown request is noticed.
     fn read_inner_blocking(&self, inner: &mut [Vec<u8>]) -> Option<usize> {
         loop {
             if !self.running.load(Ordering::Relaxed) {
                 return None;
             }
+            match self.tun.wait_readable(250) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("waiting on the device failed: {e}");
+                    return None;
+                }
+            }
             let buf = inner.first_mut()?;
-            match self.tun.recv(buf) {
-                Ok(n) if n > 0 => return Some(n),
+            match self.tun.recv_nonblocking(buf) {
+                Ok(Some(n)) if n > 0 => return Some(n),
                 Ok(_) => continue,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
@@ -742,7 +762,17 @@ impl Tunnel {
             return Ok(());
         }
 
-        os("writing to the TUN device", self.tun.send(packet)).map(|_| ())
+        match self.tun.send(packet) {
+            Ok(_) => Ok(()),
+            // The device is non-blocking in batched mode, so a full queue
+            // refuses the write. That is a drop, exactly as a congested link
+            // would be, and inner protocols already cope with it.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(source) => Err(Error::Os {
+                context: "writing to the TUN device".to_owned(),
+                source,
+            }),
+        }
     }
 
     // -- timers --------------------------------------------------------------

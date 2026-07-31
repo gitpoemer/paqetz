@@ -97,24 +97,41 @@ impl Tun {
         sys::read(self.fd.as_raw_fd(), buf)
     }
 
+    /// Switches the device between blocking and non-blocking reads.
+    ///
+    /// Set once, at start-up, by whichever loop wants it. An earlier version
+    /// toggled this around every read, which cost two `fcntl` calls per packet
+    /// drained — so collecting a batch of N took 3N syscalls where reading them
+    /// one at a time took N. Batching was measurably *slower* than not
+    /// batching, which is what the benchmark caught.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error.
+    pub fn set_nonblocking(&self, on: bool) -> io::Result<()> {
+        sys::set_nonblocking(self.fd.as_raw_fd(), on)
+    }
+
+    /// Waits until a packet is available, or the timeout expires.
+    ///
+    /// Returns whether one is waiting. Used to block for the first packet of a
+    /// batch without making the descriptor blocking, and with a timeout so the
+    /// thread can still notice a shutdown request.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error.
+    pub fn wait_readable(&self, timeout_ms: i32) -> io::Result<bool> {
+        sys::poll_readable(self.fd.as_raw_fd(), timeout_ms)
+    }
+
     /// Reads one inner IP packet if one is already waiting.
     ///
-    /// Returns `Ok(None)` when nothing is queued, rather than blocking. This is
-    /// what lets the outbound path collect a batch without ever waiting for one
-    /// to form: block for the first packet, then take whatever else has already
-    /// arrived.
-    ///
-    /// The descriptor is switched to non-blocking for the call and back
-    /// afterwards, so a blocking read elsewhere is unaffected.
+    /// Returns `Ok(None)` when nothing is queued. Requires the device to have
+    /// been set non-blocking; on a blocking device this simply blocks.
     ///
     /// # Errors
     /// Returns the underlying OS error, other than "would block".
     pub fn recv_nonblocking(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        let fd = self.fd.as_raw_fd();
-        sys::set_nonblocking(fd, true)?;
-        let result = sys::read(fd, buf);
-        sys::set_nonblocking(fd, false)?;
-        match result {
+        match sys::read(self.fd.as_raw_fd(), buf) {
             Ok(n) => Ok(Some(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
