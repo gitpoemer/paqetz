@@ -360,8 +360,10 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
             public_address: public,
         })?;
 
+        // The REALITY private key is in here, so it gets the same treatment as
+        // the tunnel's own configuration rather than whatever the umask says.
         let config_path = dir.join("xray-config.json");
-        std::fs::write(&config_path, &generated.config)?;
+        write_private(&config_path, &generated.config)?;
         let unit_path = dir.join("xray.service");
         std::fs::write(
             &unit_path,
@@ -376,13 +378,59 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
             generated.public_key
         );
 
-        if yes_no(
-            "\n   Install Xray on *this* host now?\n                Only say yes if this is the client host. The download is verified\n                against the checksum published with the release, and aborts if\n                that checksum cannot be fetched.",
-            false,
-        )? {
-            match crate::xray::install(None, crate::xray::DEFAULT_PREFIX) {
-                Ok(v) => println!("   Installed {v}."),
-                Err(e) => println!("   Could not install: {e}"),
+        // Only offered to the host that would run it, and phrased by what is
+        // actually there: asking "install?" of a machine that already has it,
+        // or generating a configuration for software the host does not have,
+        // are both ways of wasting the reader's attention.
+        if role == Some(Role::Client) {
+            let installed = crate::xray::installed_version(crate::xray::DEFAULT_PREFIX);
+            let wanted = match installed.as_deref() {
+                None => yes_no(
+                    "\n   Xray is not installed on this host. Install it?\n   \
+                     The download is verified against the checksum published\n   \
+                     with the release, and aborts if that checksum cannot be\n   \
+                     fetched.",
+                    // Defaults to yes: a configuration was just generated for
+                    // it, so the answer to "and shall I install the thing that
+                    // reads it" is almost always the same answer.
+                    true,
+                )?,
+                Some(v) => yes_no(
+                    &format!(
+                        "\n   Xray {v} is already installed. Update it to the\n   \
+                         latest release?"
+                    ),
+                    false,
+                )?,
+            };
+
+            if wanted {
+                match crate::xray::install(None, crate::xray::DEFAULT_PREFIX) {
+                    Ok(v) => println!("   Now at {v}."),
+                    Err(e) => println!("   Could not install: {e}"),
+                }
+            }
+
+            // Put the generated configuration where a service would read it,
+            // and keep it running — whether it was installed just now or was
+            // already here.
+            if crate::xray::installed_version(crate::xray::DEFAULT_PREFIX).is_some() {
+                let cfg = "/etc/xray/config.json";
+                crate::service::write_file(std::path::Path::new(cfg), &generated.config, 0o600)?;
+                println!("   wrote {cfg}");
+
+                if crate::service::has_systemd() && yes_no("   Keep Xray running at boot?", true)? {
+                    crate::service::install_unit(
+                        "xray",
+                        &crate::xray::service_unit(crate::xray::DEFAULT_PREFIX, cfg),
+                        true,
+                    )?;
+                }
+            } else {
+                println!(
+                    "\n   Xray is not installed, so the configuration above is\n   \
+                     the file to give it once it is: `paqetz xray install`."
+                );
             }
         }
     }
@@ -631,6 +679,24 @@ mod tests {
         .expect("render");
         let client = crate::config::Config::parse(&pair.client).expect("parse");
         assert_eq!(client.socks5.expect("socks5").listen.port(), 1080);
+    }
+
+    #[test]
+    fn files_holding_a_private_key_are_readable_only_by_their_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("paqetz-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        for (name, contents) in [
+            ("a.toml", "private_key = \"x\""),
+            ("b.json", "\"privateKey\": \"x\""),
+        ] {
+            let path = dir.join(name);
+            write_private(&path, contents).expect("write");
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} is {mode:o}, and holds a private key");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

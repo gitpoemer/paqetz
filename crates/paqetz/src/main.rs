@@ -556,8 +556,9 @@ fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
                 upstream,
                 public_address,
             })?;
-            std::fs::write(&out, &generated.config)?;
-            println!("Wrote {}\n", out.display());
+            // Holds the REALITY private key.
+            service::write_file(&out, &generated.config, 0o600)?;
+            println!("Wrote {} (mode 0600)\n", out.display());
             println!("Give this to a client:\n");
             println!("{}\n", generated.uri);
             println!("The private key is in the configuration and not in that URI.");
