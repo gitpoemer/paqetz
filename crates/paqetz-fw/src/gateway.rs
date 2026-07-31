@@ -32,7 +32,37 @@ pub struct Gateway {
     pub device: String,
     /// The tunnel's inner subnet, whose traffic is translated.
     pub subnet: (Ipv4Addr, u8),
+    /// Send the peer's traffic out this interface rather than the default
+    /// route, translating it to that interface's address.
+    ///
+    /// The reason to want this is that the tunnel's own address is the one the
+    /// destination sees, and it is a datacentre address belonging to whoever
+    /// runs the server. Routing the forwarded traffic out something else — a
+    /// Cloudflare WARP interface being the usual choice — changes what the far
+    /// side sees without changing anything the client does.
+    ///
+    /// Bringing that interface up is not this program's job. It checks the
+    /// interface exists and says so if it does not.
+    pub egress: Option<Egress>,
 }
+
+/// An interface the forwarded traffic leaves by.
+#[derive(Debug, Clone)]
+pub struct Egress {
+    /// The interface name, e.g. `warp`.
+    pub interface: String,
+    /// The routing table holding that interface's default route.
+    ///
+    /// `wg-quick` with `Table = <n>` puts it there rather than in the main
+    /// table, which is exactly what makes this arrangement possible: the host's
+    /// own traffic is unaffected, and only what is directed at this table goes
+    /// out that way.
+    pub table: u32,
+}
+
+/// Priority of the source rule that sends the tunnel subnet to the egress
+/// table. Below the SOCKS5 mark rule so the two do not interleave.
+const EGRESS_RULE_PRIORITY: u32 = 9100;
 
 impl Gateway {
     /// The commands and settings [`apply`](Self::apply) would put in place.
@@ -44,10 +74,29 @@ impl Gateway {
         ]
     }
 
+    /// Whether the egress interface exists on this host.
+    #[must_use]
+    pub fn egress_present(&self) -> bool {
+        self.egress.as_ref().is_none_or(|e| {
+            std::path::Path::new(&format!("/sys/class/net/{}", e.interface)).exists()
+        })
+    }
+
     /// The `nftables` ruleset that forwards and translates tunnel traffic.
     fn ruleset(&self) -> String {
         let (net, prefix) = self.subnet;
         let device = &self.device;
+        // Translate to whichever interface the traffic actually leaves by, so
+        // the source address matches the path it took.
+        let masquerade = self.egress.as_ref().map_or_else(
+            || format!("ip saddr {net}/{prefix} oifname != \"{device}\" masquerade"),
+            |e| {
+                format!(
+                    "ip saddr {net}/{prefix} oifname \"{}\" masquerade",
+                    e.interface
+                )
+            },
+        );
         format!(
             "add table ip {TABLE}
 delete table ip {TABLE}
@@ -59,7 +108,7 @@ table ip {TABLE} {{
     }}
     chain postrouting {{
         type nat hook postrouting priority srcnat; policy accept;
-        ip saddr {net}/{prefix} oifname != \"{device}\" masquerade
+        {masquerade}
     }}
 }}
 "
@@ -80,11 +129,41 @@ table ip {TABLE} {{
             set_forwarding(true)?;
         }
         nft_script(&self.ruleset())?;
+
+        // Source-based routing, so only the peer's traffic takes the egress
+        // interface. A default route would take the host's own traffic with
+        // it, including the tunnel's, which would collapse the tunnel.
+        if let Some(e) = self.egress.as_ref() {
+            let (net, prefix) = self.subnet;
+            let from = format!("{net}/{prefix}");
+            let table = e.table.to_string();
+            let prio = EGRESS_RULE_PRIORITY.to_string();
+            // Removed first, so a repeat leaves one rule rather than a stack.
+            while run_ip(&[
+                "rule", "del", "from", &from, "lookup", &table, "priority", &prio,
+            ])
+            .is_ok()
+            {}
+            run_ip(&[
+                "rule", "add", "from", &from, "lookup", &table, "priority", &prio,
+            ])?;
+        }
         Ok(!was_on)
     }
 
     /// Removes the rules, and restores forwarding if we turned it on.
     pub fn revert(&self, restore_forwarding: bool) {
+        if let Some(e) = self.egress.as_ref() {
+            let (net, prefix) = self.subnet;
+            let from = format!("{net}/{prefix}");
+            let table = e.table.to_string();
+            let prio = EGRESS_RULE_PRIORITY.to_string();
+            while run_ip(&[
+                "rule", "del", "from", &from, "lookup", &table, "priority", &prio,
+            ])
+            .is_ok()
+            {}
+        }
         let _ = nft_script(&format!("add table ip {TABLE}\ndelete table ip {TABLE}\n"));
         if restore_forwarding {
             let _ = set_forwarding(false);
@@ -223,7 +302,42 @@ mod tests {
         Gateway {
             device: "paqetz0".to_owned(),
             subnet: (Ipv4Addr::new(10, 7, 0, 0), 24),
+            egress: None,
         }
+    }
+
+    fn with_egress() -> Gateway {
+        Gateway {
+            egress: Some(Egress {
+                interface: "warp".to_owned(),
+                table: 51_820,
+            }),
+            ..gateway()
+        }
+    }
+
+    #[test]
+    fn an_egress_interface_changes_what_the_translation_targets() {
+        // Without it, traffic is translated on whatever it leaves by. With it,
+        // only traffic leaving by that interface is translated -- so the source
+        // address always matches the path the packet actually took.
+        let rules = with_egress().ruleset();
+        assert!(rules.contains("oifname \"warp\" masquerade"), "{rules}");
+        assert!(
+            !rules.contains("oifname != "),
+            "the default-route form should be gone: {rules}"
+        );
+    }
+
+    #[test]
+    fn an_absent_egress_interface_is_detected() {
+        assert!(gateway().egress_present(), "no egress is always present");
+        let mut g = with_egress();
+        g.egress = Some(Egress {
+            interface: "definitely-not-real".to_owned(),
+            table: 1,
+        });
+        assert!(!g.egress_present());
     }
 
     #[test]

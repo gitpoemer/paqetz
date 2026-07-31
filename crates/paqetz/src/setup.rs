@@ -36,6 +36,8 @@ pub(crate) struct Plan {
     pub(crate) route_all: bool,
     /// A SOCKS5 listener on the client, if wanted.
     pub(crate) socks5: Option<String>,
+    /// An interface the server sends the forwarded traffic out by.
+    pub(crate) egress: Option<String>,
 }
 
 impl Default for Plan {
@@ -49,6 +51,7 @@ impl Default for Plan {
             gateway: true,
             route_all: false,
             socks5: None,
+            egress: None,
         }
     }
 }
@@ -85,6 +88,15 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(s, "# internet. Without this the two ends can reach each")?;
         writeln!(s, "# other and nothing beyond.")?;
         writeln!(s, "gateway = true")?;
+    }
+    if let Some(iface) = plan.egress.as_ref() {
+        writeln!(
+            s,
+            "\n# Send the forwarded traffic out this interface, so the"
+        )?;
+        writeln!(s, "# destination sees its address rather than this host's.")?;
+        writeln!(s, "# Bringing it up is not paqetz's job.")?;
+        writeln!(s, "egress = \"{iface}\"")?;
     }
     writeln!(s, "\n[peer]")?;
     writeln!(s, "# The client's public key.")?;
@@ -238,12 +250,28 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
 
+    // The server's egress. Only sensible when it is a way out at all.
+    let egress = if gateway {
+        let want = yes_no(
+            "\n5. Should the server send the forwarded traffic out a different\n                interface than its own?\n                The usual reason is a Cloudflare WARP tunnel: the destination then\n                sees WARP's address rather than the server's datacentre one.\n                paqetz routes and translates for it, but does not bring it up —\n                use wgcf and wg-quick for that, with `Table = 51820` in the profile.",
+            false,
+        )?;
+        if want {
+            Some(ask("   Which interface?", "warp")?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let plan = Plan {
         endpoint,
         port,
         gateway,
         route_all,
-        socks5,
+        socks5: socks5.clone(),
+        egress: egress.clone(),
         ..Plan::default()
     };
     let pair = render(&plan)?;
@@ -259,6 +287,66 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
     println!("  {}   → the SERVER", server_path.display());
     println!("  {}   → the CLIENT", client_path.display());
     println!("\nThe keys in them are already matched. Do not swap the files.\n");
+
+    // An Xray inbound, for the arrangement where users connect to the client
+    // host and their traffic leaves through the tunnel.
+    if yes_no(
+        "6. Generate an Xray REALITY inbound for the client host?\n            This is how users reach the tunnel: they connect to Xray, and Xray\n            forwards what it receives through paqetz.",
+        false,
+    )? {
+        let public = ask("   What address will users reach the client host at?", "")?;
+        println!(
+            "\n   REALITY impersonates a real site. It must speak TLS 1.3, sit on\n                a large network, and not itself be blocked where this runs.\n                Suggestions: {}",
+            crate::xray::SUGGESTED_DESTINATIONS.join(", ")
+        );
+        let dest = ask("   Which site?", "www.microsoft.com")?;
+
+        // Match the upstream to what the tunnel was configured for, rather
+        // than asking the same question twice in different words.
+        let upstream = socks5
+            .as_ref()
+            .map_or(crate::xray::Upstream::Marked(81), |listen| {
+                crate::xray::Upstream::Socks5(listen.clone())
+            });
+        if socks5.is_none() {
+            println!(
+                "\n   No SOCKS5 listener was configured, so Xray will mark its\n                    outbound sockets instead. Add `route_marked = 81` to the\n                    client's [interface] for the rule that steers them."
+            );
+        }
+
+        let generated = crate::xray::generate(&crate::xray::Plan {
+            listen_port: 443,
+            dest,
+            upstream,
+            public_address: public,
+        })?;
+
+        let config_path = dir.join("xray-config.json");
+        std::fs::write(&config_path, &generated.config)?;
+        let unit_path = dir.join("xray.service");
+        std::fs::write(
+            &unit_path,
+            crate::xray::service_unit("/usr/local/bin", "/etc/xray/config.json"),
+        )?;
+
+        println!("\n   Wrote {}", config_path.display());
+        println!("   Wrote {}", unit_path.display());
+        println!("\n   Give this to a user:\n\n   {}\n", generated.uri);
+        println!(
+            "   The private key is in the configuration, not in that URI.\n                Its public half is {}.",
+            generated.public_key
+        );
+
+        if yes_no(
+            "\n   Install Xray on *this* host now?\n                Only say yes if this is the client host. The download is verified\n                against the checksum published with the release, and aborts if\n                that checksum cannot be fetched.",
+            false,
+        )? {
+            match crate::xray::install(None, crate::xray::DEFAULT_PREFIX) {
+                Ok(v) => println!("   Installed {v}."),
+                Err(e) => println!("   Could not install: {e}"),
+            }
+        }
+    }
 
     // The one step that changes this host, asked for separately and last.
     let pending = paqetz_fw::tune::pending();
@@ -422,6 +510,20 @@ mod tests {
                 .interface
                 .gateway
         );
+    }
+
+    #[test]
+    fn an_egress_interface_reaches_the_server_file() {
+        let pair = render(&Plan {
+            egress: Some("warp".to_owned()),
+            ..plan()
+        })
+        .expect("render");
+        let server = crate::config::Config::parse(&pair.server).expect("parse");
+        assert_eq!(server.interface.egress.as_deref(), Some("warp"));
+        // And never the client's, which has nothing to forward.
+        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        assert!(client.interface.egress.is_none());
     }
 
     #[test]

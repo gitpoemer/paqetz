@@ -76,6 +76,11 @@ pub(crate) struct Interface {
     pub(crate) route_marked: Option<u32>,
     /// The routing table the mark rule points at.
     pub(crate) route_table: u32,
+    /// Send the peer's forwarded traffic out this interface instead of the
+    /// default route, so the destination sees that interface's address.
+    pub(crate) egress: Option<String>,
+    /// The routing table holding that interface's default route.
+    pub(crate) egress_table: u32,
     /// Whether to move packets in batches.
     pub(crate) datapath: Datapath,
     /// Which transmit path to use.
@@ -284,6 +289,10 @@ struct RawInterface {
     route_marked: Option<u32>,
     #[serde(default)]
     route_table: Option<u32>,
+    #[serde(default)]
+    egress: Option<String>,
+    #[serde(default)]
+    egress_table: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,6 +557,10 @@ impl Config {
                     other => other,
                 },
                 route_table: raw.interface.route_table.unwrap_or(51),
+                egress: raw.interface.egress,
+                // wg-quick's own default when `Table` is set to a number for a
+                // WARP profile, which is the usual reason to want this.
+                egress_table: raw.interface.egress_table.unwrap_or(51_820),
             },
             peer: Peer {
                 public_key,
@@ -656,6 +669,20 @@ tunnel_address = "10.7.0.2"
         let c = Config::parse(CLIENT).expect("parse");
         assert!(!c.interface.gateway);
         assert!(!c.interface.route_all);
+    }
+
+    #[test]
+    fn an_egress_interface_is_off_unless_named() {
+        let c = Config::parse(CLIENT).expect("parse");
+        assert!(c.interface.egress.is_none());
+    }
+
+    #[test]
+    fn an_egress_interface_can_be_named() {
+        let text = CLIENT.replace("[peer]", "egress = \"warp\"\n\n[peer]");
+        let c = Config::parse(&text).expect("parse");
+        assert_eq!(c.interface.egress.as_deref(), Some("warp"));
+        assert_eq!(c.interface.egress_table, 51_820);
     }
 
     #[test]

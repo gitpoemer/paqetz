@@ -9,6 +9,7 @@ mod log;
 mod setup;
 mod stats;
 mod tunnel;
+mod xray;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -84,6 +85,13 @@ enum Command {
         out: PathBuf,
     },
 
+    /// Generate an Xray REALITY inbound that feeds the tunnel, and optionally
+    /// install Xray itself.
+    Xray {
+        #[command(subcommand)]
+        action: XrayAction,
+    },
+
     /// Show kernel settings worth changing for a tunnel, and why.
     Tune {
         /// Apply them, rather than only printing them.
@@ -95,6 +103,45 @@ enum Command {
     Firewall {
         #[command(subcommand)]
         action: FirewallAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum XrayAction {
+    /// Write a REALITY inbound configuration and print the client URI.
+    Config {
+        /// The address users will reach this host at.
+        public_address: String,
+        /// The real site REALITY borrows a certificate from.
+        #[arg(long, default_value = "www.microsoft.com")]
+        dest: String,
+        /// The port users connect to.
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// Forward through the SOCKS5 listener at this address.
+        #[arg(long, value_name = "ADDR", conflicts_with = "mark")]
+        socks5: Option<String>,
+        /// Forward directly, marking sockets so a policy route tunnels them.
+        #[arg(long, conflicts_with = "socks5")]
+        mark: Option<u32>,
+        /// Where to write the configuration.
+        #[arg(short, long, default_value = "xray-config.json")]
+        out: PathBuf,
+    },
+    /// Download and install Xray, verifying the published checksum.
+    Install {
+        /// A specific version, rather than the latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Where to place the binary.
+        #[arg(long, default_value = xray::DEFAULT_PREFIX)]
+        prefix: String,
+    },
+    /// Install the latest version over whatever is there.
+    Update {
+        /// Where the binary lives.
+        #[arg(long, default_value = xray::DEFAULT_PREFIX)]
+        prefix: String,
     },
 }
 
@@ -135,6 +182,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             socks5,
         } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5),
         Command::Setup { out } => setup::interactive(&out),
+        Command::Xray { action } => xray_command(action),
         Command::Tune { apply } => tune(apply),
         Command::Doctor => {
             if doctor::run(&cli.config) {
@@ -208,6 +256,14 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         });
     let want_routes = cfg.interface.route_all;
     let subnet = cfg.tunnel_subnet();
+    let egress_choice = cfg
+        .interface
+        .egress
+        .clone()
+        .map(|interface| paqetz_fw::gateway::Egress {
+            interface,
+            table: cfg.interface.egress_table,
+        });
     let peer_endpoint = cfg.peer.endpoint;
 
     let mut tunnel = Tunnel::start(cfg)?;
@@ -292,7 +348,14 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         let gw = paqetz_fw::gateway::Gateway {
             device: device.clone(),
             subnet,
+            egress: egress_choice,
         };
+        if !gw.egress_present() {
+            log::error!(
+                "the egress interface named in the configuration does not exist; \
+                 bring it up first, or remove `egress` to use the default route"
+            );
+        }
         match gw.apply() {
             Ok(turned_on) => {
                 log::info!(
@@ -391,6 +454,52 @@ fn default_route() -> Result<(Option<std::net::Ipv4Addr>, String), Box<dyn std::
         return Ok((gateway, iface.to_owned()));
     }
     Err("no default route, so there is nothing to route around".into())
+}
+
+fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        XrayAction::Config {
+            public_address,
+            dest,
+            port,
+            socks5,
+            mark,
+            out,
+        } => {
+            let upstream = match (socks5, mark) {
+                (Some(addr), _) => xray::Upstream::Socks5(addr),
+                (None, Some(m)) => xray::Upstream::Marked(m),
+                (None, None) => xray::Upstream::Socks5("127.0.0.1:1080".to_owned()),
+            };
+            let generated = xray::generate(&xray::Plan {
+                listen_port: port,
+                dest,
+                upstream,
+                public_address,
+            })?;
+            std::fs::write(&out, &generated.config)?;
+            println!("Wrote {}\n", out.display());
+            println!("Give this to a client:\n");
+            println!("{}\n", generated.uri);
+            println!("The private key is in the configuration and not in that URI.");
+            Ok(())
+        }
+        XrayAction::Install { version, prefix } => {
+            let v = xray::install(version.as_deref(), &prefix)?;
+            println!("\nInstalled {v}.");
+            Ok(())
+        }
+        XrayAction::Update { prefix } => {
+            let before = xray::installed_version(&prefix);
+            let after = xray::install(None, &prefix)?;
+            match before {
+                Some(b) if b == after => println!("\nAlready at {after}."),
+                Some(b) => println!("\nUpdated {b} to {after}."),
+                None => println!("\nInstalled {after}."),
+            }
+            Ok(())
+        }
+    }
 }
 
 fn tune(apply: bool) -> Result<(), Box<dyn std::error::Error>> {

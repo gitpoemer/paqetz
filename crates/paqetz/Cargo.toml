@@ -12,6 +12,7 @@ name = "paqetz"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
