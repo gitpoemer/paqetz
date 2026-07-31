@@ -15,6 +15,10 @@ edition = "2024"
 rust-version = "1.90"
 license = "MIT"
 repository = "https://github.com/gitpoemer/paqetz"
+# Nothing here goes to crates.io. The library crates are internal seams of one
+# binary, not something anyone would depend on separately, and saying so stops
+# an accidental `cargo publish` as well.
+publish = false
 
 # Shared dependency versions. Member crates opt in with `dep = { workspace = true }`;
 # entries listed here are not fetched until a member actually uses one.

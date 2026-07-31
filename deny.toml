@@ -11,16 +11,27 @@ allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.
 
 [bans]
 multiple-versions = "warn"
+# A dependency pinned to `*` is one that can change under us between builds.
+# Our own crates are the exception: they are path dependencies within this
+# workspace, carry no version by design, and are built from the same tree.
 wildcards = "deny"
+allow-wildcard-paths = true
 # One cipher suite, no agility (D1). A second AEAD in the tree means something
 # pulled in an alternative — a design regression, so fail rather than let it
-# land quietly. `ring` is deliberately *not* banned: it is a live candidate for
-# the ChaCha20-Poly1305 implementation on performance grounds (§8.11), and
-# adopting it means extending the license allow-list above.
+# land quietly.
+#
+# `ring` was left off this list as a live candidate on performance grounds
+# (§8.11), and then arrived anyway: snow's `std` feature pulls `ring/std`, which
+# activates it transitively even with default-features off. It broke the musl
+# build, because it wants a C toolchain, and nothing had noticed it was there.
+# That is what this list is for, so it is banned now. Adopting it deliberately
+# means removing it here and extending the license allow-list above — a decision
+# that should be visible in a diff.
 deny = [
     { name = "openssl" },
     { name = "openssl-sys" },
     { name = "aes-gcm" },
+    { name = "ring" },
 ]
 
 [sources]
