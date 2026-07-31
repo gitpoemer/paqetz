@@ -1,0 +1,43 @@
+# Install to /etc/systemd/system/paqetz.service, then:
+#   systemctl enable --now paqetz
+
+[Unit]
+Description=paqetz tunnel
+Documentation=https://github.com/gitpoemer/paqetz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/paqetz doctor -c /etc/paqetz/paqetz.toml
+ExecStart=/usr/local/bin/paqetz run -c /etc/paqetz/paqetz.toml
+Restart=on-failure
+RestartSec=5
+
+# The datapath needs raw sockets and a TUN device; the firewall rules need
+# CAP_NET_ADMIN. Nothing else does, so nothing else is granted -- this runs
+# with two capabilities rather than as full root.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+# The configuration holds a private key.
+UMask=0077
+
+# The process needs the network and /dev/net/tun and very little else.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+DeviceAllow=/dev/net/tun rw
+
+# A tunnel with no per-flow state does not need many descriptors, but the
+# kernel's capture buffer is sized in the process's memory.
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

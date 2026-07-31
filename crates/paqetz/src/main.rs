@@ -4,6 +4,7 @@
 //! decisions that constrain it.
 
 mod config;
+mod doctor;
 mod tunnel;
 
 use std::path::PathBuf;
@@ -46,6 +47,11 @@ enum Command {
     /// Run the tunnel.
     Run,
 
+    /// Check the host for the things that stop a tunnel working.
+    ///
+    /// Read-only: creates, changes, and removes nothing.
+    Doctor,
+
     /// Inspect or change the firewall rules the tunnel needs.
     Firewall {
         #[command(subcommand)]
@@ -81,6 +87,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Keygen => keygen(),
         Command::Pubkey => pubkey(),
         Command::Run => start(&cli.config),
+        Command::Doctor => {
+            if doctor::run(&cli.config) {
+                Ok(())
+            } else {
+                Err("the host is not ready; see the failures above".into())
+            }
+        }
         Command::Firewall { action } => firewall(action, &cli.config),
     }
 }

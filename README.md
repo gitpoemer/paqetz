@@ -53,8 +53,17 @@ on each end, starting from [`example/server.toml`](example/server.toml) and
 [`example/client.toml`](example/client.toml), and run:
 
 ```bash
-sudo paqetz run -c /etc/paqetz/paqetz.toml
+sudo paqetz doctor -c /etc/paqetz/paqetz.toml   # read-only; changes nothing
+sudo paqetz run    -c /etc/paqetz/paqetz.toml
 ```
+
+`doctor` checks the things that otherwise fail silently — capabilities, the TUN
+driver, a free port, an MTU that fits the path, a routable peer — and says what
+to do about each. Run it first; it is why the tunnel not working should be a
+short conversation.
+
+For a permanent install, [`example/paqetz.service`](example/paqetz.service) runs
+it with two capabilities rather than as root.
 
 The kernel firewall rules the tunnel needs are installed at start-up and removed
 on exit. To inspect or manage them yourself:
