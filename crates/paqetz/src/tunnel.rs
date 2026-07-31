@@ -905,6 +905,24 @@ impl Tunnel {
         if !self.cfg.peer.permits(source) {
             Stats::bump(&self.stats.disallowed);
             debug!("inner packet refused: source {source} is outside the peer's range");
+            // Once, at a level that is on by default. The counter alone does
+            // not point anywhere, and this has a single overwhelming cause: a
+            // peer that is a way out sends back replies carrying the address of
+            // whatever site was reached, and a peer restricted to its own
+            // address refuses every one of them. Handshake fine, tunnel up,
+            // counters moving, nothing arrives -- with nothing to suggest the
+            // configuration is what is refusing it.
+            if !self
+                .stats
+                .explained_disallowed
+                .swap(true, Ordering::Relaxed)
+            {
+                warn_!("refused an inner packet from {source}: outside this peer's allowed_ips");
+                warn_!(
+                    "if this peer is a way out to the internet, it needs \
+                     `allowed_ips = [\"0.0.0.0/0\"]`"
+                );
+            }
             return Ok(());
         }
         if !plausible_source(source) {

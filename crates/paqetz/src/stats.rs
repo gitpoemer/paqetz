@@ -18,7 +18,7 @@
 //! rejection counters. That keeps the cache line they live on from bouncing
 //! between cores.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Everything worth counting.
 #[derive(Debug, Default)]
@@ -46,6 +46,11 @@ pub(crate) struct Stats {
     pub(crate) disallowed: AtomicU64,
     /// Inner packets refused for having an impossible source address.
     pub(crate) martian: AtomicU64,
+    /// Whether the first refused source has already been explained.
+    ///
+    /// The counter says how many; it cannot say why, and the why is almost
+    /// always a peer whose `allowed_ips` is narrower than what it forwards.
+    pub(crate) explained_disallowed: AtomicBool,
 
     /// Handshakes started by this side.
     pub(crate) handshakes_sent: AtomicU64,

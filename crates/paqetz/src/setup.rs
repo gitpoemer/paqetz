@@ -158,6 +158,26 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     writeln!(c, "public_key = \"{}\"", server.public.to_base64())?;
     writeln!(c, "endpoint = \"{}\"", plan.endpoint)?;
     writeln!(c, "tunnel_address = \"{}\"", plan.server_inner)?;
+    if plan.gateway {
+        writeln!(
+            c,
+            "\n# What this peer may use as an inner source address. It defaults"
+        )?;
+        writeln!(
+            c,
+            "# to the peer's own address, which is right for a tunnel"
+        )?;
+        writeln!(
+            c,
+            "# between two hosts and wrong for one that is a way out:"
+        )?;
+        writeln!(
+            c,
+            "# replies arrive carrying the address of whatever site was"
+        )?;
+        writeln!(c, "# reached, not the server's, and would all be refused.")?;
+        writeln!(c, "allowed_ips = [\"0.0.0.0/0\"]")?;
+    }
     if let Some(listen) = plan.socks5.as_ref() {
         writeln!(c, "\n# A SOCKS5 listener, for pointing one program at the")?;
         writeln!(c, "# tunnel without routing the whole host through it.")?;
@@ -850,6 +870,50 @@ mod tests {
         .expect("render");
         let client = crate::config::Config::parse(&pair.client).expect("parse");
         assert_eq!(client.socks5.expect("socks5").listen.port(), 1080);
+    }
+
+    #[test]
+    fn a_gateway_peer_is_allowed_to_send_from_anywhere() {
+        // The whole point of a way out: replies carry the address of the site
+        // that was reached, so a peer restricted to its own address drops all
+        // of them and the tunnel looks up while nothing crosses it.
+        let pair = render(&Plan {
+            gateway: true,
+            ..plan()
+        })
+        .expect("render");
+        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        assert!(client.peer.permits(Ipv4Addr::new(149, 154, 167, 91)));
+        assert!(client.peer.permits(Ipv4Addr::new(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn a_peer_that_is_not_a_way_out_stays_restricted_to_its_own_address() {
+        let pair = render(&Plan {
+            gateway: false,
+            ..plan()
+        })
+        .expect("render");
+        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        assert!(client.peer.permits(Ipv4Addr::new(10, 7, 0, 1)));
+        assert!(
+            !client.peer.permits(Ipv4Addr::new(1, 1, 1, 1)),
+            "cryptokey routing still applies when there is nothing to forward"
+        );
+    }
+
+    #[test]
+    fn the_server_never_widens_what_the_client_may_send_from() {
+        // Only one direction needs it. The client's inner source is always its
+        // own address, so widening here would give away the check for nothing.
+        let pair = render(&Plan {
+            gateway: true,
+            ..plan()
+        })
+        .expect("render");
+        let server = crate::config::Config::parse(&pair.server).expect("parse");
+        assert!(server.peer.permits(Ipv4Addr::new(10, 7, 0, 2)));
+        assert!(!server.peer.permits(Ipv4Addr::new(1, 1, 1, 1)));
     }
 
     #[test]
