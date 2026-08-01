@@ -101,6 +101,20 @@ enum Command {
     },
 
     /// Stop systemd-networkd deleting the policy rule the tunnel needs.
+    ///
+    /// systemd-networkd assumes it is the only thing managing routes and
+    /// routing policy rules. Whenever an interface changes state, or the
+    /// service restarts, it deletes every policy rule it did not create --
+    /// including the one that sends marked traffic into the tunnel.
+    ///
+    /// Losing that rule does not stop traffic, which is what makes it
+    /// dangerous. The lookup finds an empty table, moves on to the main table,
+    /// and what should have been tunnelled leaves this host in the clear, while
+    /// the tunnel stays up and every counter still looks healthy.
+    ///
+    /// Start with `status`. If it says the rule is at risk, `protect --restart`
+    /// is the one to run: `protect` alone writes the setting but nothing reads
+    /// it until networkd restarts.
     Networkd {
         #[command(subcommand)]
         action: NetworkdAction,
@@ -609,19 +623,59 @@ fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Whether standard input is a terminal, and so whether asking is possible.
+///
+/// A question printed into a pipe is a hang, not a question.
+fn at_a_terminal() -> bool {
+    // SAFETY: isatty takes a descriptor and touches no memory.
+    unsafe { libc::isatty(0) == 1 }
+}
+
+/// Asks a yes-or-no question, defaulting to no.
+fn confirm(prompt: &str) -> bool {
+    use std::io::{BufRead as _, Write as _};
+    print!("{prompt} [y/N] > ");
+    if std::io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// What `paqetz networkd` can do.
 #[derive(Subcommand, Debug)]
 enum NetworkdAction {
     /// Report whether networkd will delete the policy rule.
+    ///
+    /// Reads the configuration rather than asking networkd, which has no way to
+    /// report an effective setting. Changes nothing.
     Status,
-    /// Write the drop-in that tells it not to.
+
+    /// Write the drop-in that tells it not to. Use --restart with this.
+    ///
+    /// Writes /etc/systemd/networkd.conf.d/10-paqetz.conf, setting
+    /// ManageForeignRoutingPolicyRules=no. A drop-in rather than an edit to
+    /// networkd.conf, so nothing you wrote is touched and `unprotect` is a
+    /// complete undo.
+    ///
+    /// On its own this does not take effect. `networkctl reload` re-reads
+    /// .network and .netdev files, not networkd.conf or its drop-ins, so
+    /// nothing short of restarting networkd applies it -- which is what
+    /// --restart does, and what makes it the recommended form. Without it the
+    /// setting waits for the next reboot, and until then networkd still removes
+    /// the rule when an interface changes state.
     Protect {
         /// Restart networkd so it takes effect now, rather than at the next
         /// reboot. This reconfigures every interface on the host.
         #[arg(long)]
         restart: bool,
     },
-    /// Remove that drop-in.
+    /// Remove that drop-in, restoring networkd's default behaviour.
+    ///
+    /// Also needs a networkd restart to take effect.
     Unprotect,
 }
 
@@ -654,6 +708,22 @@ fn networkd_command(action: NetworkdAction) -> Result<(), Box<dyn std::error::Er
             println!("Writing {}:\n", networkd::drop_in_path().display());
             println!("{}", networkd::drop_in());
             networkd::apply(restart)?;
+
+            let restart = restart
+                || (at_a_terminal()
+                    && {
+                        println!(
+                            "\nWritten, but nothing reads it until networkd restarts.\n\
+                             Restarting reconfigures every interface on this host, so if\n\
+                             you are reading this over one of them there is a brief risk\n\
+                             to the session. A reboot does the same job later."
+                        );
+                        confirm("Restart systemd-networkd now?")
+                    }
+                    && {
+                        service::run_elevated("systemctl", &["restart", "systemd-networkd"])?;
+                        true
+                    });
 
             if restart {
                 println!("Written, and networkd restarted, so it is in force now.");

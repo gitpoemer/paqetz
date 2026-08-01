@@ -280,8 +280,8 @@ stop networkd removing it:
 
 ```bash
 sudo paqetz networkd status               # says whether it will
-sudo paqetz networkd protect              # writes the drop-in that stops it
-sudo paqetz networkd protect --restart    # and applies it immediately
+sudo paqetz networkd protect --restart    # writes it and applies it — use this
+sudo paqetz networkd protect              # writes it; applies at the next reboot
 sudo paqetz networkd unprotect            # removes it again
 ```
 

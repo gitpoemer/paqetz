@@ -366,7 +366,10 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
 
     // networkd, if it is running and would take the policy rule away. Asked for
     // the host that will run a tunnel, since that is the host with a rule to
-    // lose.
+    // lose. The restart it needs is deferred to the end of setup: it
+    // reconfigures every interface, and doing that halfway through would be
+    // done to the connection this is being typed over.
+    let mut networkd_written = false;
     if role.is_some()
         && crate::networkd::status() == crate::networkd::Status::WillDeleteRules
         && yes_no(
@@ -378,21 +381,10 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
             true,
         )?
     {
-        // Asked separately, because it is the part that touches the network of
-        // a host that is usually being administered over that network.
-        let restart = yes_no(
-            "   Restart networkd so it takes effect now? Only a restart re-reads\n   \
-             this setting, and it reconfigures every interface on this host.\n   \
-             Saying no leaves it to apply at the next reboot.",
-            false,
-        )?;
-        match crate::networkd::apply(restart) {
+        match crate::networkd::apply(false) {
             Ok(()) => {
                 println!("   Wrote {}", crate::networkd::drop_in_path().display());
-                if !restart {
-                    println!("   It applies at the next reboot, or after");
-                    println!("   `systemctl restart systemd-networkd`.");
-                }
+                networkd_written = true;
             }
             Err(e) => println!("   Could not write it: {e}"),
         }
@@ -413,6 +405,27 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
             println!("   Applied, and written to {}.", paqetz_fw::tune::PATH);
         } else {
             println!("   Skipped. Run `paqetz tune --apply` later if you want them.");
+        }
+    }
+
+    // Last, and on purpose. Everything above is finished and written, so if
+    // this restart does interrupt the session there is nothing left half-done.
+    if networkd_written {
+        println!("\n---\n");
+        println!("One thing left. The networkd setting above is written but not in");
+        println!("force: only restarting networkd re-reads it, and until then it will");
+        println!("still remove the policy rule when an interface changes state.");
+        println!("Restarting reconfigures every interface on this host, so if you are");
+        println!("reading this over one of them there is a brief risk to the session.");
+        println!("A reboot does the same job whenever it next happens.\n");
+        if yes_no("   Restart networkd now?", false)? {
+            match crate::service::run_elevated("systemctl", &["restart", "systemd-networkd"]) {
+                Ok(()) => println!("   Restarted; the setting is in force."),
+                Err(e) => println!("   Could not restart it: {e}"),
+            }
+        } else {
+            println!("   Left alone. `systemctl restart systemd-networkd` when you are");
+            println!("   ready, or it applies at the next reboot.");
         }
     }
 
