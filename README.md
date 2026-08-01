@@ -306,9 +306,19 @@ ManageForeignRoutingPolicyRules=no
 ManageForeignRoutes=no
 ```
 
+**This is not only the client.** It applies to any host that installs routing of
+its own, which `paqetz doctor` works out for you:
+
+| host | installs | at risk |
+| --- | --- | --- |
+| client with `route_marked` or `[socks5]` | `ip rule fwmark …` | yes |
+| client with `route_all` | routes, not rules | yes — `ManageForeignRoutes` defaults to yes too |
+| server with `egress` (WARP) | `ip rule from <subnet> …` | yes |
+| plain point-to-point server | nothing | no |
+
 `paqetz setup` offers this, and `paqetz doctor` reports it as a **failure** when
-networkd is running, the rule is needed, and nothing has turned the behaviour
-off. A failure rather than a warning because losing the rule does not stop
+networkd is running, routing of ours is needed, and nothing has turned the
+behaviour off. A failure rather than a warning because losing the rule does not stop
 traffic — it sends it out unprotected while everything still appears to work.
 
 ### Sequence numbers are deliberately incoherent

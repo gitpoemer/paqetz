@@ -249,22 +249,30 @@ fn check_service() -> Finding {
     }
 }
 
-/// Whether networkd will delete the policy rule the tunnel depends on.
+/// Whether networkd will delete routing this host depends on.
 ///
-/// Only asked when something on this host actually needs that rule. A tunnel
-/// with neither `route_marked` nor a SOCKS5 listener installs no rule, so
-/// networkd has nothing of ours to remove.
+/// Asked whenever this host installs a rule or a route of its own, which is not
+/// only the client. A server sending forwarded traffic out an egress interface
+/// installs `ip rule from <subnet> lookup <table>`, and `route_all` installs
+/// routes rather than rules — networkd manages foreign routes by default too.
+/// Only a plain point-to-point tunnel, with no proxy in front and no way out
+/// behind, has nothing of ours for it to remove.
 fn check_networkd(cfg: Option<&Config>) -> Finding {
-    let needs_rule = cfg.is_some_and(|c| c.interface.route_marked.is_some() || c.socks5.is_some());
+    let needs_rule = cfg.is_some_and(|c| {
+        c.interface.route_marked.is_some()
+            || c.socks5.is_some()
+            || c.interface.route_all
+            || c.interface.egress.is_some()
+    });
     if !needs_rule {
-        return Finding::pass("networkd", "no policy rule is needed here");
+        return Finding::pass("networkd", "this host installs no rule or route of its own");
     }
     match crate::networkd::status() {
         crate::networkd::Status::Absent => {
-            Finding::pass("networkd", "not running; nothing removes the policy rule")
+            Finding::pass("networkd", "not running; nothing removes the routing")
         }
         crate::networkd::Status::LeavesRulesAlone => {
-            Finding::pass("networkd", "configured to leave the policy rule alone")
+            Finding::pass("networkd", "configured to leave our routing alone")
         }
         // Deliberately a failure rather than a warning. It does not break the
         // tunnel visibly -- it sends the traffic out unprotected while
@@ -273,10 +281,10 @@ fn check_networkd(cfg: Option<&Config>) -> Finding {
         // visible where it sits.
         crate::networkd::Status::WillDeleteRules => Finding::fail(
             "networkd",
-            "will delete the policy rule when an interface changes or it restarts",
-            "the rule going does not stop traffic, it sends it out unprotected: \
-             run `paqetz networkd protect`, which takes effect once networkd is \
-             restarted",
+            "will delete the routing this host installs when an interface changes \
+             or it restarts",
+            "losing it does not stop traffic, it sends it out unprotected: run \
+             `paqetz networkd protect --restart`",
         ),
     }
 }
