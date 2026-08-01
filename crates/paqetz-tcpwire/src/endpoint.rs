@@ -390,7 +390,24 @@ impl Endpoint {
         if kind.is_syn() {
             return self.profile.syn_window;
         }
-        let scaled = self.profile.window >> self.profile.window_scale;
+        // Window scaling is negotiated on the SYN exchange and nowhere else.
+        // Under `Midstream` there is no SYN, so the shift that turns a real
+        // window into a scaled one has nothing behind it: our peer ignores the
+        // field, but anything on the path modelling this flow never saw a scale
+        // factor either and reads the number literally.
+        //
+        // 64240 >> 7 is 501. Advertising 501 bytes to a middlebox that enforces
+        // flow control limits the whole conversation to 501 bytes in flight --
+        // observed as a tunnel that ran for hours and then collapsed to a
+        // trickle with seconds of latency, heavy loss inbound, and none of our
+        // own counters showing a thing, because the packets were being kept
+        // from us rather than dropped by us. It is also implausible in itself:
+        // an established connection advertising half a kilobyte is not what a
+        // real one looks like.
+        let scaled = match self.carrier {
+            Carrier::Midstream => self.profile.window.min(u32::from(u16::MAX)),
+            Carrier::Handshake => self.profile.window >> self.profile.window_scale,
+        };
         // Vary within about ±6% using a cheap hash of the packet counter.
         let spread = (scaled / 16).max(1);
         let jitter = u64::from(self.counter.wrapping_mul(0x9E37_79B9)) >> 24;
@@ -558,6 +575,39 @@ mod tests {
         let n = server.data(&payload, &mut buf, 0).expect("emit");
         let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
         assert_eq!(seg.payload, &payload[..]);
+    }
+
+    #[test]
+    fn a_midstream_flow_advertises_a_window_someone_could_believe() {
+        // Nothing negotiated a scale factor, because nothing sent a SYN. A
+        // middlebox reads this number as it stands, and a middlebox that
+        // enforces flow control holds the conversation to it.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
+        let mut buf = [0u8; 2048];
+        let payload = [0u8; 600];
+
+        for _ in 0..16 {
+            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
+            assert!(
+                seg.window > 32_000,
+                "advertised {} bytes; anything enforcing this would throttle the \
+                 tunnel to it",
+                seg.window
+            );
+        }
+    }
+
+    #[test]
+    fn a_handshaken_flow_still_advertises_the_scaled_window() {
+        // There the shift is honest: the SYN said scale 7, so the peer and
+        // anything watching multiply it back.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Handshake, LINUX_6));
+        let mut buf = [0u8; 2048];
+        // Drive it past the handshake so the segments are data, not SYN.
+        let _ = e.handshake(&mut buf, 0).expect("syn");
+        let expected = LINUX_6.window >> LINUX_6.window_scale;
+        assert!(expected < 1_000, "sanity: the scaled value is small");
     }
 
     #[test]
