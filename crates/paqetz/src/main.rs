@@ -6,6 +6,7 @@
 mod config;
 mod doctor;
 mod log;
+mod networkd;
 mod service;
 mod setup;
 mod stats;
@@ -97,6 +98,12 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+
+    /// Stop systemd-networkd deleting the policy rule the tunnel needs.
+    Networkd {
+        #[command(subcommand)]
+        action: NetworkdAction,
     },
 
     /// Show kernel settings worth changing for a tunnel, and why.
@@ -227,6 +234,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action),
+        Command::Networkd { action } => networkd_command(action),
         Command::Tune { apply } => tune(apply),
         Command::Doctor => {
             if doctor::run(&cli.config) {
@@ -649,6 +657,58 @@ fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
                 Some(b) => println!("\nUpdated {b} to {after}."),
                 None => println!("\nInstalled {after}."),
             }
+            Ok(())
+        }
+    }
+}
+
+/// What `paqetz networkd` can do.
+#[derive(Subcommand, Debug)]
+enum NetworkdAction {
+    /// Report whether networkd will delete the policy rule.
+    Status,
+    /// Write the drop-in that tells it not to.
+    Protect,
+    /// Remove that drop-in.
+    Unprotect,
+}
+
+/// `paqetz networkd`.
+fn networkd_command(action: NetworkdAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        NetworkdAction::Status => {
+            match networkd::status() {
+                networkd::Status::Absent => {
+                    println!("systemd-networkd is not running; nothing removes the policy rule.");
+                }
+                networkd::Status::LeavesRulesAlone => {
+                    println!("systemd-networkd is running and leaves foreign policy rules alone.");
+                }
+                networkd::Status::WillDeleteRules => {
+                    println!(
+                        "systemd-networkd will delete the policy rule when an interface\n\
+                         changes state or the service restarts.\n\n\
+                         That does not stop traffic. The rule goes, the lookup falls through\n\
+                         to the main table, and what should have been tunnelled leaves this\n\
+                         host in the clear instead -- while the tunnel stays up and looks\n\
+                         healthy.\n\n\
+                         Fix it with: paqetz networkd protect"
+                    );
+                }
+            }
+            Ok(())
+        }
+        NetworkdAction::Protect => {
+            println!("Writing {}:\n", networkd::drop_in_path().display());
+            println!("{}", networkd::drop_in());
+            networkd::apply()?;
+            println!("Done. `paqetz networkd unprotect` removes it.");
+            Ok(())
+        }
+        NetworkdAction::Unprotect => {
+            let path = networkd::drop_in_path();
+            service::run_elevated("rm", &["-f", &path.display().to_string()])?;
+            println!("Removed {}.", path.display());
             Ok(())
         }
     }

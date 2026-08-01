@@ -274,12 +274,30 @@ own mark and therefore does need the rule. For that path the table also carries
 a blackhole default, so if the rule or route goes the traffic stops rather than
 escaping, and the routing is re-asserted every fifteen seconds.
 
-If you would rather networkd left it alone, `/etc/systemd/networkd.conf`:
+**The `route_marked` path cannot be protected that way**, because Xray sets the
+mark on its own sockets and so genuinely needs the rule. There the fix is to
+stop networkd removing it:
+
+```bash
+sudo paqetz networkd status     # says whether it will
+sudo paqetz networkd protect    # writes the drop-in that stops it
+sudo paqetz networkd unprotect  # removes it again
+```
+
+`protect` writes `/etc/systemd/networkd.conf.d/10-paqetz.conf` — a drop-in
+rather than an edit to `networkd.conf`, so nothing you wrote is overwritten and
+deleting the file is a complete undo:
 
 ```ini
 [Network]
 ManageForeignRoutingPolicyRules=no
+ManageForeignRoutes=no
 ```
+
+`paqetz setup` offers this, and `paqetz doctor` reports it as a **failure** when
+networkd is running, the rule is needed, and nothing has turned the behaviour
+off. A failure rather than a warning because losing the rule does not stop
+traffic — it sends it out unprotected while everything still appears to work.
 
 ### Sequence numbers are deliberately incoherent
 

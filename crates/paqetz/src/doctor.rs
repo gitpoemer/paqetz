@@ -105,6 +105,7 @@ pub(crate) fn run(path: &Path) -> bool {
     findings.push(check_default_route());
     findings.push(check_firewall_backend());
     findings.push(check_service());
+    findings.push(check_networkd(cfg.as_ref()));
 
     if let Some(cfg) = cfg.as_ref() {
         findings.push(check_device_free(&cfg.interface.device));
@@ -245,6 +246,38 @@ fn check_service() -> Finding {
             "fine if you run it by hand; `paqetz service install` if it should \
              start at boot and restart on failure",
         )
+    }
+}
+
+/// Whether networkd will delete the policy rule the tunnel depends on.
+///
+/// Only asked when something on this host actually needs that rule. A tunnel
+/// with neither `route_marked` nor a SOCKS5 listener installs no rule, so
+/// networkd has nothing of ours to remove.
+fn check_networkd(cfg: Option<&Config>) -> Finding {
+    let needs_rule = cfg.is_some_and(|c| c.interface.route_marked.is_some() || c.socks5.is_some());
+    if !needs_rule {
+        return Finding::pass("networkd", "no policy rule is needed here");
+    }
+    match crate::networkd::status() {
+        crate::networkd::Status::Absent => {
+            Finding::pass("networkd", "not running; nothing removes the policy rule")
+        }
+        crate::networkd::Status::LeavesRulesAlone => {
+            Finding::pass("networkd", "configured to leave the policy rule alone")
+        }
+        // Deliberately a failure rather than a warning. It does not break the
+        // tunnel visibly -- it sends the traffic out unprotected while
+        // everything still appears to work, which is worse than an outage on a
+        // host whose whole reason for existing is that its traffic is not
+        // visible where it sits.
+        crate::networkd::Status::WillDeleteRules => Finding::fail(
+            "networkd",
+            "will delete the policy rule when an interface changes or it restarts",
+            "the rule going does not stop traffic, it sends it out unprotected: \
+             run `paqetz networkd protect`, or set \
+             ManageForeignRoutingPolicyRules=no in /etc/systemd/networkd.conf",
+        ),
     }
 }
 

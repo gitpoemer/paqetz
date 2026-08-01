@@ -364,6 +364,26 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // networkd, if it is running and would take the policy rule away. Asked for
+    // the host that will run a tunnel, since that is the host with a rule to
+    // lose.
+    if role.is_some()
+        && crate::networkd::status() == crate::networkd::Status::WillDeleteRules
+        && yes_no(
+            "\nsystemd-networkd on this host deletes routing policy rules it did\n   \
+             not create, which includes the one that puts marked traffic in the\n   \
+             tunnel. When it goes the traffic does not stop -- it leaves this\n   \
+             host unprotected instead, while the tunnel still looks healthy.\n   \
+             Tell networkd to leave it alone?",
+            true,
+        )?
+    {
+        match crate::networkd::apply() {
+            Ok(()) => println!("   Wrote {}", crate::networkd::drop_in_path().display()),
+            Err(e) => println!("   Could not write it: {e}"),
+        }
+    }
+
     // The one step that changes this host, asked for separately and last.
     let pending = paqetz_fw::tune::pending();
     if pending.is_empty() {
