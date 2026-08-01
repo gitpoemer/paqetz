@@ -149,10 +149,112 @@ So both paths resolve on the far side, and both default to it:
 - The generated Xray configuration for `--mark` points Xray's own DNS at the
   same resolver, reached over the same marked outbound.
 
-If you write the Xray configuration yourself, the marked outbound needs
-`"settings": { "domainStrategy": "UseIPv4" }` and a `"dns"` block, or Xray
-hands each name to the host's resolver and the lookup is the one thing that
-never enters the tunnel.
+### What the generated Xray configuration looks like
+
+`paqetz xray config <public-address> --mark 81` writes this. Keys, UUID and
+short ID are generated per run; everything else is what makes the two halves fit
+together, and is what to copy if you are writing the file yourself.
+
+```json
+{
+  "log": { "loglevel": "warning" },
+
+  "dns": {
+    "servers": ["1.1.1.1"],
+    "queryStrategy": "UseIPv4"
+  },
+
+  "inbounds": [
+    {
+      "tag": "reality",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "<uuid>", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": ["www.microsoft.com"],
+          "privateKey": "<reality private key>",
+          "shortIds": ["<short id>"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+
+  "outbounds": [
+    {
+      "tag": "tunnel",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIPv4" },
+      "streamSettings": {
+        "sockopt": { "mark": 81 }
+      }
+    },
+    { "tag": "block", "protocol": "blackhole" }
+  ],
+
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      }
+    ]
+  }
+}
+```
+
+Four things in there are load-bearing, and dropping any of them leaves a tunnel
+that carries traffic while something important goes around it:
+
+- **`sockopt.mark` matching `route_marked`** is the entire join. Without it the
+  outbound is an ordinary connection leaving by the ordinary route.
+- **`settings.domainStrategy: "UseIPv4"`** makes Xray resolve with its own DNS
+  rather than handing the name to the host's resolver. This is the one that is
+  easy to leave out, and it fails as a stall rather than an error.
+- **`dns.servers`** is where that resolution goes. Queries route through the
+  same marked outbound, so they take the tunnel too.
+- **`queryStrategy: "UseIPv4"`** stops it asking for AAAA records, which the
+  tunnel cannot carry anyway.
+
+The `block` outbound with the `geoip:private` rule keeps proxied traffic off the
+host's own LAN — a user asking for `192.168.0.1` should not reach the client's
+network.
+
+For the SOCKS5 path the outbound is a `socks` protocol pointing at the listener,
+with no `domainStrategy` of its own:
+
+```json
+    {
+      "tag": "tunnel",
+      "protocol": "socks",
+      "settings": {
+        "servers": [{ "address": "127.0.0.1", "port": 1080 }]
+      }
+    }
+```
+
+and the rest of the file drops the `dns` block and sets
+`routing.domainStrategy` to `"AsIs"`. That is the opposite requirement, for the
+same reason: the name has to reach paqetz untouched, because paqetz is what
+resolves it at the far end. Resolving it early in Xray would put the lookup back
+on the local network.
 
 ### IPv4 only
 
