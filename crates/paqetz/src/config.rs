@@ -49,6 +49,12 @@ pub(crate) struct Interface {
     pub(crate) profile: paqetz_tcpwire::OsProfile,
     /// Whether the carrier performs a synthetic handshake (D14).
     pub(crate) carrier: paqetz_tcpwire::Carrier,
+    /// How the carrier numbers its segments.
+    ///
+    /// `opaque` by default. Numbering by payload bytes is truthful, and
+    /// therefore checkable by anything modelling the flow — including after a
+    /// loss this carrier cannot repair, which it then never recovers from.
+    pub(crate) sequencing: paqetz_tcpwire::Sequencing,
     /// Whether to manage firewall rules automatically.
     pub(crate) manage_firewall: bool,
     /// How much to say on stdout.
@@ -294,6 +300,8 @@ struct RawInterface {
     #[serde(default)]
     carrier: Option<String>,
     #[serde(default)]
+    sequencing: Option<String>,
+    #[serde(default)]
     manage_firewall: Option<bool>,
     #[serde(default)]
     datapath: Option<String>,
@@ -436,6 +444,17 @@ impl Config {
             }
         };
 
+        let sequencing = match raw.interface.sequencing.as_deref().unwrap_or("opaque") {
+            "opaque" => paqetz_tcpwire::Sequencing::Opaque,
+            "stream" => paqetz_tcpwire::Sequencing::Stream,
+            other => {
+                return Err(invalid(
+                    "interface.sequencing",
+                    format!("expected \"opaque\" or \"stream\", got {other:?}"),
+                ));
+            }
+        };
+
         let datapath = match raw.interface.datapath.as_deref().unwrap_or("simple") {
             "batched" => Datapath::Batched,
             "simple" => Datapath::Simple,
@@ -572,6 +591,7 @@ impl Config {
                 device: raw.interface.device.unwrap_or_else(|| "paqetz0".to_owned()),
                 profile,
                 carrier,
+                sequencing,
                 manage_firewall: raw.interface.manage_firewall.unwrap_or(true),
                 datapath,
                 transmit,
@@ -969,6 +989,27 @@ tunnel_address = "10.7.0.2"
         let msg = err.to_string();
         assert!(msg.contains("linux-6"), "should list what is valid: {msg}");
         assert!(msg.contains("windows-11"), "got: {msg}");
+    }
+
+    #[test]
+    fn segments_are_numbered_opaquely_unless_asked_otherwise() {
+        assert_eq!(
+            Config::parse(CLIENT).expect("parse").interface.sequencing,
+            paqetz_tcpwire::Sequencing::Opaque,
+            "byte-accurate numbering is checkable, and this carrier cannot keep \
+             the promise it makes once a packet is lost"
+        );
+        let text = CLIENT.replace("[peer]", "sequencing = \"stream\"\n\n[peer]");
+        assert_eq!(
+            Config::parse(&text).expect("parse").interface.sequencing,
+            paqetz_tcpwire::Sequencing::Stream
+        );
+    }
+
+    #[test]
+    fn an_unknown_sequencing_mode_is_rejected() {
+        let text = CLIENT.replace("[peer]", "sequencing = \"honest\"\n\n[peer]");
+        assert!(Config::parse(&text).is_err());
     }
 
     #[test]

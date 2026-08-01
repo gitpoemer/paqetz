@@ -1,25 +1,40 @@
 //! Per-endpoint connection state: the synthetic TCP conversation.
 //!
-//! paqet invented its sequence numbers — `seq = base + (counter << 7)`, and an
-//! acknowledgement derived from the same counter — so the numbers bore no
-//! relation to the bytes actually sent. Any middlebox modelling TCP state sees
-//! that immediately. This type keeps them honest instead: `seq` is the initial
-//! sequence number plus the payload bytes genuinely sent, and `ack` is the
-//! peer's initial sequence number plus the payload bytes genuinely received.
+//! # Two ways to number the segments, and why the sloppier one wins
 //!
-//! # The one place this cannot be perfectly faithful
+//! paqet invents its sequence numbers — `seq = base + (counter << 7)`, with an
+//! acknowledgement derived from the same counter — so they bear no relation to
+//! the bytes actually sent. This crate originally rejected that as obviously
+//! detectable and numbered its segments honestly instead, by payload bytes, the
+//! way a real stack does.
 //!
-//! The carrier never retransmits — nothing owns these segments, which is the
-//! whole premise (decision D2). So when a packet is lost in the network, the
-//! gap in our sequence space is never filled, and our acknowledgement stops
-//! advancing past what we actually received.
+//! That was wrong, and it was wrong in a way that only appears in production.
 //!
-//! An observer therefore sees a flow whose retransmissions are all missing.
-//! That is a real thing that happens to real TCP connections on bad paths, and
-//! it is the closest self-consistent behaviour available without a
-//! retransmission queue. The alternative — acknowledging bytes we never
-//! received, so the numbers stay contiguous — would mean acknowledging data
-//! that was never sent, which is *less* like real TCP, not more.
+//! Honest numbering makes the flow *reassemblable*, so a middlebox modelling
+//! TCP will track it as a byte stream. That costs nothing while every packet
+//! arrives. But the carrier never retransmits — nothing owns these segments,
+//! which is the premise (D2) — so the first packet the network drops leaves a
+//! hole that is never filled: our sequence runs on past it while our
+//! acknowledgement freezes at it, for ever. A sender that keeps sending to a
+//! receiver that has stopped acknowledging is not something a real connection
+//! does for more than a few milliseconds. It either retransmits or it dies.
+//!
+//! So the flow reads as ordinary TCP right up until the first loss, and as
+//! unmistakably synthetic from then until the five-tuple is abandoned — with a
+//! stalled reassembly buffer in front of it, which invites further loss, which
+//! adds further holes. It is a ratchet, and it only turns one way. Observed in
+//! the field as a tunnel that ran perfectly and then decayed to unusable, on a
+//! network where paqet, with its "detectable" numbers, kept working.
+//!
+//! Numbers that were never coherent cannot become incoherent. Nothing
+//! reassembles them, so nothing builds the state that honest numbering later
+//! violates. [`Sequencing::Opaque`] is therefore the default;
+//! [`Sequencing::Stream`] remains for a path that rejects implausible sequence
+//! numbers outright rather than tracking them, where the trade runs the other
+//! way.
+//!
+//! Neither end needs to agree with the other: nothing here validates an inbound
+//! `seq` or `ack`. They are read only to compose our own.
 //!
 //! # Windows
 //!
@@ -110,6 +125,22 @@ pub struct Config {
     /// Offset added to the clock to form the TCP timestamp, so the timestamp
     /// clock does not start near zero and reveal process start.
     pub ts_base: u32,
+    /// How to number the segments.
+    pub sequencing: Sequencing,
+}
+
+/// How the sequence and acknowledgement numbers are chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sequencing {
+    /// Numbers that do not describe a byte stream, so none can be rebuilt from
+    /// them. The default, and what survives a lossy path.
+    #[default]
+    Opaque,
+    /// Numbers that track the payload bytes genuinely sent and received.
+    ///
+    /// Truthful, and therefore checkable — including after a loss the carrier
+    /// cannot repair. See the module documentation.
+    Stream,
 }
 
 /// One end of a synthetic TCP conversation with one peer.
@@ -124,6 +155,8 @@ pub struct Endpoint {
     role: Role,
     carrier: Carrier,
     phase: Phase,
+
+    sequencing: Sequencing,
 
     local_isn: u32,
     remote_isn: Option<u32>,
@@ -166,6 +199,7 @@ impl Endpoint {
             } else {
                 Phase::Idle
             },
+            sequencing: cfg.sequencing,
             local_isn: cfg.isn,
             remote_isn: if midstream { Some(cfg.peer_isn) } else { None },
             sent: 0,
@@ -220,16 +254,32 @@ impl Endpoint {
     /// The next sequence number this endpoint will place on the wire.
     #[must_use]
     pub const fn next_seq(&self) -> u32 {
-        self.local_isn.wrapping_add(self.sent)
+        match self.sequencing {
+            // Advances by a fixed step per packet rather than by the payload,
+            // so consecutive segments overlap and contradict each other as a
+            // byte stream. That is the point: there is no stream to rebuild,
+            // and so no stream state for a later loss to break.
+            Sequencing::Opaque => self.local_isn.wrapping_add(self.counter << 7),
+            Sequencing::Stream => self.local_isn.wrapping_add(self.sent),
+        }
     }
 
-    /// The acknowledgement this endpoint will place on the wire, if the peer's
-    /// initial sequence number is known.
+    /// The acknowledgement this endpoint will place on the wire, if one can be
+    /// composed.
     #[must_use]
     pub const fn next_ack(&self) -> Option<u32> {
-        match self.remote_isn {
-            Some(isn) => Some(isn.wrapping_add(self.received)),
-            None => None,
+        match (self.sequencing, self.remote_isn) {
+            // Near our own sequence and drifting, which is what an
+            // acknowledgement looks like from the outside, without claiming
+            // anything about what arrived.
+            (Sequencing::Opaque, _) => Some(
+                self.local_isn
+                    .wrapping_add(self.counter << 7)
+                    .wrapping_sub(self.counter & 0x3FF)
+                    .wrapping_add(1400),
+            ),
+            (Sequencing::Stream, Some(isn)) => Some(isn.wrapping_add(self.received)),
+            (Sequencing::Stream, None) => None,
         }
     }
 
@@ -454,7 +504,170 @@ mod tests {
             isn: if initiator { CLIENT_ISN } else { SERVER_ISN },
             peer_isn: if initiator { SERVER_ISN } else { CLIENT_ISN },
             ts_base: if initiator { 5_000 } else { 7_000 },
+            // The tests below check the byte-accurate numbering specifically,
+            // so they ask for it. `Opaque` is the default and has its own.
+            sequencing: Sequencing::Stream,
         }
+    }
+
+    fn opaque(role: Role) -> Config {
+        Config {
+            sequencing: Sequencing::Opaque,
+            ..cfg(role, Carrier::Midstream, LINUX_6)
+        }
+    }
+
+    #[test]
+    fn opaque_endpoints_still_carry_data_both_ways() {
+        // Numbering is cosmetic: nothing validates an inbound seq or ack, so
+        // changing how they are composed must not affect what gets carried.
+        // This is the check that the change is safe to deploy on one end before
+        // the other.
+        let mut client = Endpoint::new(opaque(Role::Initiator));
+        let mut server = Endpoint::new(opaque(Role::Responder));
+        let mut buf = [0u8; 2048];
+
+        for i in 0..4u8 {
+            let payload = [i; 600];
+
+            let n = client.data(&payload, &mut buf, 0).expect("client emits");
+            let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("server parses");
+            assert_eq!(seg.payload, &payload[..], "client -> server");
+            server.on_receive(&seg);
+
+            let n = server.data(&payload, &mut buf, 0).expect("server emits");
+            let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("client parses");
+            assert_eq!(seg.payload, &payload[..], "server -> client");
+            client.on_receive(&seg);
+        }
+    }
+
+    #[test]
+    fn an_opaque_end_and_a_stream_end_still_understand_each_other() {
+        // They need not agree, which is what makes a staged rollout possible.
+        let mut client = Endpoint::new(opaque(Role::Initiator));
+        let mut server = Endpoint::new(cfg(Role::Responder, Carrier::Midstream, LINUX_6));
+        let mut buf = [0u8; 2048];
+        let payload = [7u8; 600];
+
+        let n = client.data(&payload, &mut buf, 0).expect("emit");
+        let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
+        assert_eq!(seg.payload, &payload[..]);
+        server.on_receive(&seg);
+
+        let n = server.data(&payload, &mut buf, 0).expect("emit");
+        let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
+        assert_eq!(seg.payload, &payload[..]);
+    }
+
+    #[test]
+    fn opaque_is_the_default() {
+        assert_eq!(Sequencing::default(), Sequencing::Opaque);
+    }
+
+    #[test]
+    fn opaque_numbers_do_not_describe_the_bytes_sent() {
+        // The whole point. If consecutive segments described a coherent byte
+        // stream, something would reassemble it -- and then the first packet the
+        // network drops leaves a hole this carrier can never fill, which is what
+        // took a working tunnel apart in the field.
+        let mut e = Endpoint::new(opaque(Role::Initiator));
+        let mut buf = [0u8; 2048];
+        let payload = [0u8; 1000];
+
+        let mut seqs = Vec::new();
+        for _ in 0..8 {
+            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
+            seqs.push(seg.seq);
+        }
+
+        for pair in seqs.windows(2) {
+            let (a, b) = (pair.first().expect("a"), pair.get(1).expect("b"));
+            let step = b.wrapping_sub(*a);
+            assert_ne!(
+                step, 1000,
+                "advancing by the payload length is exactly what makes it reassemblable"
+            );
+            assert_eq!(
+                step, 128,
+                "but it must still advance, and predictably to us"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_segments_overlap_so_no_stream_can_be_rebuilt() {
+        // Each segment claims 1000 bytes of space while the numbering leaves
+        // only 128 between them, so they contradict each other as a stream.
+        // Nothing can reassemble that, so nothing tries.
+        let mut e = Endpoint::new(opaque(Role::Initiator));
+        let mut buf = [0u8; 2048];
+        let payload = [0u8; 1000];
+
+        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let first = parse_ipv4(buf.get(..n).expect("emitted"))
+            .expect("parse")
+            .seq;
+        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let second = parse_ipv4(buf.get(..n).expect("emitted"))
+            .expect("parse")
+            .seq;
+
+        assert!(
+            second.wrapping_sub(first) < 1000,
+            "the second segment must start inside the first's claimed range"
+        );
+    }
+
+    #[test]
+    fn opaque_acknowledgements_do_not_stall_when_a_packet_is_lost() {
+        // The failure being fixed: under byte-accurate numbering a dropped
+        // inbound packet freezes our acknowledgement for ever, and a sender
+        // talking to a receiver that stopped acknowledging is not something a
+        // real connection does. Here the acknowledgement is composed from our
+        // own counter, so nothing the network does to inbound traffic can wedge
+        // it.
+        let mut e = Endpoint::new(opaque(Role::Initiator));
+        let mut buf = [0u8; 2048];
+        let payload = [0u8; 1000];
+
+        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let before = parse_ipv4(buf.get(..n).expect("emitted"))
+            .expect("parse")
+            .ack;
+
+        // Nothing arrives at all -- every inbound packet lost.
+        for _ in 0..4 {
+            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let ack = parse_ipv4(buf.get(..n).expect("emitted"))
+                .expect("parse")
+                .ack;
+            assert_ne!(ack, before, "a frozen acknowledgement is the signature");
+        }
+    }
+
+    #[test]
+    fn stream_numbering_stalls_on_loss_which_is_why_it_is_not_the_default() {
+        // Pinning the behaviour that motivated the change, so that if anyone
+        // makes `Stream` the default again this test says what that costs.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
+        let mut buf = [0u8; 2048];
+        let payload = [0u8; 1000];
+
+        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let first = parse_ipv4(buf.get(..n).expect("emitted"))
+            .expect("parse")
+            .ack;
+        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let second = parse_ipv4(buf.get(..n).expect("emitted"))
+            .expect("parse")
+            .ack;
+
+        assert_eq!(
+            first, second,
+            "nothing arrived, so the acknowledgement does not move -- for ever"
+        );
     }
 
     /// A handshaking client, since most tests here exercise the handshake path.

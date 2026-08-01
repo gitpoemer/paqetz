@@ -41,7 +41,7 @@ pub mod endpoint;
 pub mod profile;
 pub mod segment;
 
-pub use endpoint::{Carrier, Config, Endpoint, Phase, Role};
+pub use endpoint::{Carrier, Config, Endpoint, Phase, Role, Sequencing};
 pub use profile::OsProfile;
 pub use segment::{Kind, Segment};
 

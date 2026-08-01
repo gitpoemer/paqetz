@@ -256,6 +256,31 @@ same reason: the name has to reach paqetz untouched, because paqetz is what
 resolves it at the far end. Resolving it early in Xray would put the lookup back
 on the local network.
 
+### Sequence numbers are deliberately incoherent
+
+The segments are numbered so that they do **not** describe a byte stream, and
+this is load-bearing rather than laziness.
+
+Numbering them honestly — by the payload bytes actually sent — makes the flow
+reassemblable, so anything modelling TCP will track it as a stream. That is free
+while every packet arrives. But this carrier never retransmits, so the first
+packet the network drops leaves a hole that is never filled: the sequence runs
+on past it while the acknowledgement freezes at it, permanently. A sender still
+sending to a receiver that stopped acknowledging is not something a real
+connection does for more than a few milliseconds.
+
+So the flow reads as ordinary TCP until the first loss and as unmistakably
+synthetic from then on, with a stalled reassembly buffer in front of it — which
+invites more loss, which adds more holes. It only ratchets one way. It was
+observed in the field as a tunnel that ran perfectly and then decayed to
+unusable, recovering only on restart.
+
+Numbers that were never coherent cannot become incoherent, so `opaque` is the
+default. `sequencing = "stream"` under `[interface]` restores byte-accurate
+numbering for a path that rejects implausible sequence numbers outright instead
+of tracking them. The two ends need not agree — nothing validates an inbound
+`seq` or `ack` — so this can be changed on one host at a time.
+
 ### IPv4 only
 
 The tunnel carries IPv4. A destination reachable only over IPv6 is refused

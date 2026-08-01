@@ -794,6 +794,7 @@ impl Tunnel {
                 isn: isn_r,
                 peer_isn: isn_i,
                 ts_base,
+                sequencing: self.cfg.interface.sequencing,
             }));
         }
 
@@ -1018,6 +1019,7 @@ impl Tunnel {
                 isn: isn_i,
                 peer_isn: isn_r,
                 ts_base,
+                sequencing: self.cfg.interface.sequencing,
             }));
         }
 
