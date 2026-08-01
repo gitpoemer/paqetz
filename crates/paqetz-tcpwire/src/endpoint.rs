@@ -409,8 +409,17 @@ impl Endpoint {
             Carrier::Handshake => self.profile.window >> self.profile.window_scale,
         };
         // Vary within about ±6% using a cheap hash of the packet counter.
+        //
+        // Shifted by 8 rather than 24. The wider shift left only the top byte,
+        // so the jitter term never exceeded 255 -- fine while the window was a
+        // few hundred bytes and the modulus was smaller than that, and useless
+        // the moment it was not: a 64240-byte window has a modulus of 8031, so
+        // the offset covered 3% of its intended range and parked the result at
+        // the bottom of it. The window read ~60350 rather than ~64240 and moved
+        // by a quarter of a percent, where a real receive window moves as the
+        // application drains it.
         let spread = (scaled / 16).max(1);
-        let jitter = u64::from(self.counter.wrapping_mul(0x9E37_79B9)) >> 24;
+        let jitter = u64::from(self.counter.wrapping_mul(0x9E37_79B9)) >> 8;
         let offset = jitter % u64::from(spread.saturating_mul(2) + 1);
         let varied = u64::from(scaled) + offset - u64::from(spread);
         u16::try_from(varied.clamp(1, u64::from(u16::MAX))).unwrap_or(u16::MAX)
@@ -575,6 +584,37 @@ mod tests {
         let n = server.data(&payload, &mut buf, 0).expect("emit");
         let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
         assert_eq!(seg.payload, &payload[..]);
+    }
+
+    #[test]
+    fn the_window_actually_covers_the_range_it_claims() {
+        // The previous test asked only that the window varied and stayed
+        // plausible, which a value moving over 256 of its intended 8031 values
+        // satisfies -- so a jitter term capped at 255 went unnoticed until it
+        // showed up on the wire. This asks that the spread is real.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
+        let mut buf = [0u8; 2048];
+        let payload = [0u8; 100];
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4000 {
+            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
+            seen.insert(seg.window);
+        }
+
+        let low = *seen.iter().min().expect("some");
+        let high = *seen.iter().max().expect("some");
+        assert!(
+            u32::from(high) - u32::from(low) > 4_000,
+            "window moved only {low}..{high}; a band that narrow is a constant \
+             with decoration"
+        );
+        assert!(
+            seen.len() > 1_000,
+            "only {} distinct windows across 4000 packets",
+            seen.len()
+        );
     }
 
     #[test]
