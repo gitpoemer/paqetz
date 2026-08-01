@@ -100,10 +100,17 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
     }}"#
             )
         }
+        // `domainStrategy` here is what makes Xray resolve the name with its
+        // own DNS -- which routes through this same marked outbound, and so
+        // through the tunnel -- rather than handing it to the host's resolver.
+        // Without it the connection is tunnelled but the lookup that chose its
+        // destination is not, which is the failure this whole path exists to
+        // avoid. `UseIPv4` because the tunnel carries IPv4.
         Upstream::Marked(mark) => format!(
             r#"    {{
       "tag": "tunnel",
       "protocol": "freedom",
+      "settings": {{ "domainStrategy": "UseIPv4" }},
       "streamSettings": {{
         "sockopt": {{ "mark": {mark} }}
       }}
@@ -111,12 +118,23 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
         ),
     };
 
-    // With SOCKS5, paqetz resolves the name at the far end, so Xray must pass
-    // it through untouched. With a marked socket Xray resolves it here, which
-    // is why that path needs DNS reached through the tunnel.
-    let domain_strategy = match plan.upstream {
-        Upstream::Socks5(_) => "AsIs",
-        Upstream::Marked(_) => "AsIs",
+    // With SOCKS5 the name goes to paqetz untouched and is resolved at the far
+    // end, so Xray must not resolve it first. With a marked socket there is no
+    // far end to defer to, so Xray does the lookup -- and needs a resolver it
+    // reaches through the tunnel, or the local network sees every name and
+    // chooses the answers.
+    let (domain_strategy, dns) = match plan.upstream {
+        Upstream::Socks5(_) => ("AsIs", String::new()),
+        Upstream::Marked(_) => (
+            "IPIfNonMatch",
+            format!(
+                r#"  "dns": {{
+    "servers": ["{RESOLVER}"],
+    "queryStrategy": "UseIPv4"
+  }},
+"#
+            ),
+        ),
     };
 
     let dest = &plan.dest;
@@ -124,7 +142,7 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
     let config = format!(
         r#"{{
   "log": {{ "loglevel": "warning" }},
-  "inbounds": [
+{dns}  "inbounds": [
     {{
       "tag": "reality",
       "listen": "0.0.0.0",
@@ -244,6 +262,13 @@ fn urlencode(s: &str) -> String {
 /// from a large network so its address is unremarkable, and is not itself
 /// blocked where this runs — that last one being why the choice is offered
 /// rather than fixed.
+/// The resolver Xray is pointed at on the marked path.
+///
+/// Reached through the tunnel, so the network this host sits in neither learns
+/// the names nor answers for them. Matches what paqetz's own SOCKS5 resolver
+/// defaults to, so the two paths behave the same way.
+const RESOLVER: &str = "1.1.1.1";
+
 pub(crate) const SUGGESTED_DESTINATIONS: &[&str] = &[
     "www.microsoft.com",
     "www.cloudflare.com",
@@ -394,6 +419,49 @@ mod tests {
         let g = generate(&plan()).expect("generate");
         assert!(g.config.contains("\"protocol\": \"socks\""), "{}", g.config);
         assert!(g.config.contains("\"port\": 1080"), "{}", g.config);
+    }
+
+    #[test]
+    fn the_marked_path_resolves_through_the_tunnel() {
+        // Without this the connection is tunnelled while the lookup that chose
+        // its destination is not -- so the local network still sees every name
+        // and still decides what it means, which is most of what the tunnel was
+        // for. There is no far end to defer the name to on this path, so Xray
+        // has to do it and has to be pointed somewhere reached through the
+        // tunnel.
+        let g = generate(&Plan {
+            upstream: Upstream::Marked(81),
+            ..plan()
+        })
+        .expect("generate");
+        assert!(g.config.contains(RESOLVER), "no resolver: {}", g.config);
+        assert!(
+            g.config.contains(r#""domainStrategy": "UseIPv4""#),
+            "freedom would hand the name to the host's resolver: {}",
+            g.config
+        );
+        assert!(
+            g.config.contains(r#""queryStrategy": "UseIPv4""#),
+            "the tunnel carries IPv4, so asking for anything else wastes a round trip: {}",
+            g.config
+        );
+    }
+
+    #[test]
+    fn the_socks5_path_leaves_the_name_alone() {
+        // The opposite requirement: paqetz resolves at the far end, so Xray
+        // resolving first would defeat it.
+        let g = generate(&Plan {
+            upstream: Upstream::Socks5("127.0.0.1:1080".to_owned()),
+            ..plan()
+        })
+        .expect("generate");
+        assert!(
+            g.config.contains(r#""domainStrategy": "AsIs""#),
+            "{}",
+            g.config
+        );
+        assert!(!g.config.contains(r#""dns""#), "{}", g.config);
     }
 
     #[test]
