@@ -196,13 +196,6 @@ enum FirewallAction {
 /// that loops forever on a typo and one that gives up on a boot race.
 const EXIT_CONFIG: u8 = 78;
 
-/// How often the policy routing is checked and repaired.
-///
-/// Frequent enough that a device flap costs seconds rather than the hours it
-/// took to notice by hand, cheap enough to be irrelevant: two `ip` invocations
-/// that read and usually change nothing.
-const ROUTE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -476,53 +469,7 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         (false, _) => None,
     };
 
-    // The rule and route are installed once and then depend on the tunnel
-    // device continuing to exist. The kernel deletes a route naming a device
-    // when that device goes, so a device that is recreated leaves the rule
-    // pointing at an empty table -- and a lookup finding nothing falls through
-    // to the ordinary route, sending marked traffic out in the clear. Observed
-    // as a tunnel that ran for hours and then quietly stopped carrying
-    // anything while its own counters sat still.
-    //
-    // So the routing is re-asserted on a timer rather than trusted. The table
-    // also holds a blackhole, so the window between losing the device route and
-    // repairing it fails closed instead of leaking.
-    let watched: Vec<paqetz_net4::route::Policy> = [policy, marked].into_iter().flatten().collect();
-    let route_guard = if watched.is_empty() {
-        None
-    } else {
-        let running = tunnel.running_flag();
-        let device = device.clone();
-        Some(
-            std::thread::Builder::new()
-                .name("route-watch".to_owned())
-                .spawn(move || {
-                    while running.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::thread::sleep(ROUTE_CHECK_INTERVAL);
-                        if !running.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        for p in &watched {
-                            match p.ensure(&device) {
-                                Ok(true) => log::warn_!(
-                                    "the policy route for mark {} had gone and was reinstalled; \
-                                     marked traffic was not reaching the tunnel until now",
-                                    p.mark
-                                ),
-                                Ok(false) => {}
-                                Err(e) => log::error!("could not check the policy route: {e}"),
-                            }
-                        }
-                    }
-                })?,
-        )
-    };
-
     let result = tunnel.run();
-
-    if let Some(t) = route_guard {
-        let _ = t.join();
-    }
 
     if let Some(routes) = routes {
         routes.revert();
@@ -722,8 +669,10 @@ fn networkd_command(action: NetworkdAction) -> Result<(), Box<dyn std::error::Er
                      which reconfigures every interface on this host -- worth thinking\n\
                      about if you are reading this over one of them. `paqetz networkd\n\
                      protect --restart` does it for you.\n\n\
-                     Until then the policy rule is still re-asserted every 15 seconds and\n\
-                     the table still fails closed, so traffic stops rather than leaking."
+                     Until networkd restarts it will still remove the rule when an\n\
+                     interface changes state, and nothing here puts it back. The table\n\
+                     fails closed, so that is an outage rather than traffic leaving in\n\
+                     the clear -- `systemctl restart paqetz` ends it."
                 );
             }
             println!("\n`paqetz networkd unprotect` removes it.");

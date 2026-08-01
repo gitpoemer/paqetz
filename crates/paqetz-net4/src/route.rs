@@ -28,7 +28,9 @@
 //! the device exists its route wins on metric; if the device disappears the
 //! blackhole is what remains, the lookup terminates there, and marked
 //! connections fail instead of escaping. Failing closed is the only safe
-//! direction for this particular rule.
+//! direction for this particular rule: an outage on a host inside the network
+//! being tunnelled out of is recoverable, and traffic leaving that host in the
+//! clear because a lookup quietly moved on to the next table is not.
 
 use std::io;
 use std::process::Command;
@@ -71,68 +73,6 @@ impl Policy {
                 self.table, BLACKHOLE_METRIC
             ),
         ]
-    }
-
-    /// Reinstalls anything missing, and reports whether it had to.
-    ///
-    /// Cheap enough to call on a timer, which is the point: the device route is
-    /// removed by the kernel whenever the tunnel device is recreated, and
-    /// nothing else would ever put it back. Without this a tunnel that has been
-    /// up for hours quietly stops carrying anything, and the traffic it should
-    /// be carrying goes out in the clear.
-    ///
-    /// # Errors
-    /// Returns an error if `ip` cannot be run or reports failure.
-    pub fn ensure(&self, device: &str) -> io::Result<bool> {
-        let mut repaired = false;
-
-        if !self.rule_present()? {
-            run(&[
-                "rule",
-                "add",
-                "fwmark",
-                &self.mark.to_string(),
-                "lookup",
-                &self.table.to_string(),
-                "priority",
-                &PRIORITY.to_string(),
-            ])?;
-            repaired = true;
-        }
-
-        // `replace` rather than `add`: idempotent, so this says what the table
-        // should contain rather than asking first and racing with the answer.
-        if !self.device_route_present(device)? {
-            run(&[
-                "route",
-                "replace",
-                "default",
-                "dev",
-                device,
-                "table",
-                &self.table.to_string(),
-                "metric",
-                &DEVICE_METRIC.to_string(),
-            ])?;
-            repaired = true;
-        }
-        Ok(repaired)
-    }
-
-    /// Whether the fwmark rule is installed.
-    fn rule_present(&self) -> io::Result<bool> {
-        let out = output(&["rule", "show"])?;
-        let wanted = format!("fwmark {:#x} lookup {}", self.mark, self.table);
-        Ok(out.contains(&wanted)
-            || out.contains(&format!("fwmark {} lookup {}", self.mark, self.table)))
-    }
-
-    /// Whether the table still routes the default through the device.
-    fn device_route_present(&self, device: &str) -> io::Result<bool> {
-        let out = output(&["route", "show", "table", &self.table.to_string()])?;
-        Ok(out
-            .lines()
-            .any(|l| l.starts_with("default") && l.contains(&format!("dev {device}"))))
     }
 
     /// Installs the rule and route. Safe to call when they already exist.
@@ -212,17 +152,6 @@ impl Policy {
             &self.table.to_string(),
         ]);
     }
-}
-
-/// Runs one `ip` command and returns its output.
-fn output(args: &[&str]) -> io::Result<String> {
-    let out = Command::new("ip").args(args).output().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("could not run `ip {}`: {e}", args.join(" ")),
-        )
-    })?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Runs one `ip` command.

@@ -272,7 +272,7 @@ undone from outside the process. The mark and the rule are still installed, for
 anything else pointed at them — Xray on the `route_marked` path, which sets its
 own mark and therefore does need the rule. For that path the table also carries
 a blackhole default, so if the rule or route goes the traffic stops rather than
-escaping, and the routing is re-asserted every fifteen seconds.
+escaping.
 
 **The `route_marked` path cannot be protected that way**, because Xray sets the
 mark on its own sockets and so genuinely needs the rule. There the fix is to
@@ -291,9 +291,10 @@ short of `systemctl restart systemd-networkd` picks this up. That restart
 reconfigures every interface on the host — worth thinking about if you are
 reading this over one of them — so `protect` writes the file and says so rather
 than doing it quietly. `--restart` opts in. Waiting for the next reboot is a
-perfectly good answer: until then the rule is still re-asserted every fifteen
-seconds and the table still fails closed, so the exposure is bounded either
-way.
+reasonable answer, with one thing to know: until networkd restarts it will still
+delete the rule when an interface changes state, and nothing puts it back. The
+table fails closed, so that is an outage rather than a leak — but it is an
+outage, and `systemctl restart paqetz` is what ends it.
 
 `protect` writes `/etc/systemd/networkd.conf.d/10-paqetz.conf` — a drop-in
 rather than an edit to `networkd.conf`, so nothing you wrote is overwritten and

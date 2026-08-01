@@ -137,9 +137,9 @@ fn says_no(path: &Path) -> bool {
 /// Which is why the restart is a decision rather than something done quietly. It
 /// reconfigures every interface on the host, and the host in question is usually
 /// remote and reached over one of them. The setting can equally wait for the
-/// next reboot: until then the policy rule is still re-asserted every few
-/// seconds and the table still fails closed, so the exposure is bounded either
-/// way.
+/// next reboot, as long as it is understood that until then networkd still
+/// removes the rule when an interface changes state. The table fails closed, so
+/// that is an outage rather than traffic leaving unprotected.
 ///
 /// # Errors
 /// Returns an error if the file cannot be written, or if a requested restart
