@@ -54,7 +54,12 @@ fn set_mark(fd: RawFd, mark: u32) -> io::Result<()> {
 }
 
 /// Creates a socket of the given domain and type, marked before use.
-fn marked_socket(domain: libc::c_int, ty: libc::c_int, mark: u32) -> io::Result<OwnedFd> {
+fn marked_socket(
+    domain: libc::c_int,
+    ty: libc::c_int,
+    mark: u32,
+    device: Option<&str>,
+) -> io::Result<OwnedFd> {
     // SAFETY: no pointer arguments; returns a fresh descriptor or -1.
     let fd = unsafe { libc::socket(domain, ty | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -65,7 +70,57 @@ fn marked_socket(domain: libc::c_int, ty: libc::c_int, mark: u32) -> io::Result<
     if mark > 0 {
         set_mark(owned.as_raw_fd(), mark)?;
     }
+    // Binding to the device is what actually puts this connection in the
+    // tunnel. The mark above only matters to a policy rule, which is state
+    // living outside this process that something else can remove -- and did:
+    // systemd-networkd deletes routing policy rules it did not create, so a
+    // routine reconfiguration left the rule gone, the lookup falling through to
+    // the main table, and marked traffic leaving in the clear.
+    //
+    // SO_BINDTODEVICE needs no rule, no table and no route. It cannot be
+    // undone from outside the process, because there is nothing outside the
+    // process to undo.
+    if let Some(name) = device {
+        bind_to_device(owned.as_raw_fd(), name)?;
+    }
     Ok(owned)
+}
+
+/// Pins a socket to one interface, bypassing the routing table entirely.
+fn bind_to_device(fd: RawFd, name: &str) -> io::Result<()> {
+    // The kernel copies up to IFNAMSIZ bytes and wants no trailing NUL beyond
+    // the length it is given.
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() >= 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a usable interface name: {name:?}"),
+        ));
+    }
+    let len = libc::socklen_t::try_from(bytes.len())
+        .map_err(|_| io::Error::other("implausible option size"))?;
+    // SAFETY: SO_BINDTODEVICE takes a byte string and its length, and that is
+    // what is passed; the slice outlives the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            bytes.as_ptr().cast(),
+            len,
+        )
+    };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            return Err(io::Error::new(
+                e.kind(),
+                "binding a socket to an interface requires CAP_NET_RAW",
+            ));
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Resolves a SOCKS5 address to socket addresses.
@@ -131,6 +186,7 @@ fn tunnelable(targets: Vec<SocketAddr>, address: &Address) -> io::Result<Vec<Soc
 pub fn connect_tcp(
     address: &Address,
     mark: u32,
+    device: Option<&str>,
     resolver: Option<&Resolver>,
 ) -> io::Result<TcpStream> {
     let targets = tunnelable(resolve(address, resolver)?, address)?;
@@ -140,7 +196,7 @@ pub fn connect_tcp(
     );
 
     for target in targets {
-        let fd = match marked_socket(libc::AF_INET, libc::SOCK_STREAM, mark) {
+        let fd = match marked_socket(libc::AF_INET, libc::SOCK_STREAM, mark, device) {
             Ok(fd) => fd,
             Err(e) => {
                 last = e;
@@ -170,8 +226,8 @@ pub fn connect_tcp(
 ///
 /// # Errors
 /// Returns the underlying OS error.
-pub fn bind_udp(mark: u32) -> io::Result<UdpSocket> {
-    let fd = marked_socket(libc::AF_INET, libc::SOCK_DGRAM, mark)?;
+pub fn bind_udp(mark: u32, device: Option<&str>) -> io::Result<UdpSocket> {
+    let fd = marked_socket(libc::AF_INET, libc::SOCK_DGRAM, mark, device)?;
     // SAFETY: `fd` is an owned, unbound datagram socket; ownership moves in.
     let sock = unsafe { UdpSocket::from_raw_fd(into_raw(fd)) };
     sock.bind_any()?;
@@ -289,6 +345,27 @@ fn raw_connect(fd: RawFd, target: SocketAddr) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_interface_name_that_cannot_work_is_refused() {
+        // The kernel takes at most IFNAMSIZ bytes. A name that does not fit
+        // would be silently truncated and bind the socket to the wrong device,
+        // or to none, which is the failure this whole option exists to remove.
+        let sock = marked_socket(libc::AF_INET, libc::SOCK_STREAM, 0, None).expect("socket");
+        for name in ["", "an-interface-name-far-too-long"] {
+            assert!(
+                bind_to_device(sock.as_raw_fd(), name).is_err(),
+                "{name:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs CAP_NET_RAW"]
+    fn binding_to_the_loopback_device_is_accepted() {
+        let sock = marked_socket(libc::AF_INET, libc::SOCK_STREAM, 0, None).expect("socket");
+        bind_to_device(sock.as_raw_fd(), "lo").expect("lo always exists");
+    }
+
+    #[test]
     fn a_resolution_failure_names_the_host_it_was_looking_up() {
         let e = resolve(
             &Address::Domain("no-such-host.invalid".to_owned(), 443),
@@ -369,7 +446,7 @@ mod tests {
     #[test]
     fn an_unmarked_socket_can_be_created() {
         // Mark 0 means "no mark", which needs no privilege at all.
-        let fd = marked_socket(libc::AF_INET, libc::SOCK_STREAM, 0).expect("socket");
+        let fd = marked_socket(libc::AF_INET, libc::SOCK_STREAM, 0, None).expect("socket");
         assert!(fd.as_raw_fd() >= 0);
     }
 
@@ -380,7 +457,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let fd = marked_socket(libc::AF_INET, libc::SOCK_STREAM, 0).expect("socket");
+        let fd = marked_socket(libc::AF_INET, libc::SOCK_STREAM, 0, None).expect("socket");
         match set_mark(fd.as_raw_fd(), 0x51) {
             Err(e) => assert!(
                 e.to_string().contains("CAP_NET_ADMIN"),
@@ -395,7 +472,7 @@ mod tests {
         // Loopback only: binds nothing, and the connection is refused because
         // nothing is listening.
         let a = Address::Socket("127.0.0.1:1".parse().expect("addr"));
-        let err = connect_tcp(&a, 0, None).expect_err("nothing listens on port 1");
+        let err = connect_tcp(&a, 0, None, None).expect_err("nothing listens on port 1");
         assert_eq!(
             crate::protocol::reply_code_for(&err),
             crate::protocol::reply::CONNECTION_REFUSED
@@ -408,7 +485,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let a = Address::Socket(format!("127.0.0.1:{port}").parse().expect("addr"));
-        let stream = connect_tcp(&a, 0, None).expect("connect");
+        let stream = connect_tcp(&a, 0, None, None).expect("connect");
         assert_eq!(stream.peer_addr().expect("peer").port(), port);
     }
 }

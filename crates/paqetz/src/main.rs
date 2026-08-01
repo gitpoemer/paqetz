@@ -373,11 +373,17 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 listen: cfg.listen,
                 mark: cfg.mark,
                 credentials: cfg.credentials,
+                // What actually carries these connections. The mark and its
+                // policy rule are kept as well, for anything else pointed at
+                // them, but nothing here now depends on state outside this
+                // process staying where it was put.
+                device: Some(device.clone()),
                 // Marked the same way the proxied connections are, so the
                 // query takes the tunnel rather than the local network.
                 resolver: cfg.dns.map(|server| paqetz_net4::Resolver {
                     server,
                     mark: cfg.mark,
+                    device: Some(device.clone()),
                 }),
             };
             match cfg.dns {

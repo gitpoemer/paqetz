@@ -45,12 +45,14 @@ const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
 
 /// Where to send queries, and how to mark them so they take the tunnel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Resolver {
     /// The DNS server, reached through the tunnel rather than beside it.
     pub server: SocketAddrV4,
     /// The firewall mark that steers a socket into the tunnel.
     pub mark: u32,
+    /// The tunnel device to pin queries to, which needs no routing state.
+    pub device: Option<String>,
 }
 
 impl Resolver {
@@ -86,7 +88,7 @@ impl Resolver {
 
     /// Asks over UDP, retrying once before giving up.
     fn ask_udp(&self, query: &[u8]) -> io::Result<Reply> {
-        let sock = dial::bind_udp(self.mark)?;
+        let sock = dial::bind_udp(self.mark, self.device.as_deref())?;
         sock.set_read_timeout(Some(TIMEOUT))?;
         let mut buf = vec![0u8; MAX_REPLY];
 
@@ -529,6 +531,7 @@ mod tests {
         let r = Resolver {
             server: SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53),
             mark: 0,
+            device: None,
         };
 
         let addrs = r

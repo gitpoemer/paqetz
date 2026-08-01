@@ -256,6 +256,31 @@ same reason: the name has to reach paqetz untouched, because paqetz is what
 resolves it at the far end. Resolving it early in Xray would put the lookup back
 on the local network.
 
+### The SOCKS5 listener does not depend on the routing rule
+
+`SO_MARK` only means something if a policy rule says so, and that rule is state
+outside the process. `systemd-networkd` deletes routing policy rules it did not
+create — `ManageForeignRoutingPolicyRules` defaults to yes — so an ordinary
+network reconfiguration can remove it hours after start-up. The rule goes, the
+route stays, and a lookup that finds an empty table does not fail: it falls
+through to the main table and the traffic leaves in the clear, with the tunnel
+still up and its counters still.
+
+So connections the listener makes are pinned to the tunnel device with
+`SO_BINDTODEVICE`, which needs no rule, no table and no route, and cannot be
+undone from outside the process. The mark and the rule are still installed, for
+anything else pointed at them — Xray on the `route_marked` path, which sets its
+own mark and therefore does need the rule. For that path the table also carries
+a blackhole default, so if the rule or route goes the traffic stops rather than
+escaping, and the routing is re-asserted every fifteen seconds.
+
+If you would rather networkd left it alone, `/etc/systemd/networkd.conf`:
+
+```ini
+[Network]
+ManageForeignRoutingPolicyRules=no
+```
+
 ### Sequence numbers are deliberately incoherent
 
 The segments are numbered so that they do **not** describe a byte stream, and

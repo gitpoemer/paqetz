@@ -38,6 +38,12 @@ pub struct Config {
     pub mark: u32,
     /// Required credentials, if any.
     pub credentials: Option<(String, String)>,
+    /// The tunnel device outbound connections are pinned to.
+    ///
+    /// This is what actually puts them in the tunnel. The mark above depends on
+    /// a policy rule, which lives outside this process and can be removed by
+    /// something else; binding to the device cannot.
+    pub device: Option<String>,
     /// Where to resolve names, through the tunnel.
     ///
     /// `None` falls back to this host's own resolver, which is the network the
@@ -174,7 +180,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Relays a TCP connection.
 fn connect(mut client: TcpStream, address: &Address, config: &Config) -> io::Result<()> {
-    let target = match dial::connect_tcp(address, config.mark, config.resolver.as_ref()) {
+    let target = match dial::connect_tcp(
+        address,
+        config.mark,
+        config.device.as_deref(),
+        config.resolver.as_ref(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             let bound = Address::Socket(SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -238,7 +249,7 @@ fn copy_then_shutdown(mut from: TcpStream, mut to: TcpStream) -> io::Result<()> 
 
 /// Runs a UDP association for as long as its control connection is open.
 fn udp_associate(mut client: TcpStream, config: &Config, running: &AtomicBool) -> io::Result<()> {
-    let relay_socket = dial::bind_udp(config.mark)?;
+    let relay_socket = dial::bind_udp(config.mark, config.device.as_deref())?;
     let local = relay_socket.local_addr()?;
 
     // The client is told where to send, on the address it reached us at — its
