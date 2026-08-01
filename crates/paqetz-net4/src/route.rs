@@ -13,6 +13,22 @@
 //! are (D9): forgetting them produces a SOCKS5 proxy that works perfectly and
 //! sends every connection out the ordinary route, which is the failure hardest
 //! to notice, because everything appears to function.
+//!
+//! # Why the table also holds a blackhole
+//!
+//! Installing the route once is not enough, because the kernel deletes routes
+//! that name a device when that device goes away. If that happens the rule
+//! survives, the table it points at is empty, and a lookup that finds nothing
+//! simply moves on to the next rule — the main table, the ordinary route, out
+//! of the host in the clear. Marked traffic then leaves *unprotected* and
+//! nothing reports it, which is the same silent failure as never installing the
+//! rule at all, arriving hours later.
+//!
+//! So the table carries a second, worse-metric default that goes nowhere. While
+//! the device exists its route wins on metric; if the device disappears the
+//! blackhole is what remains, the lookup terminates there, and marked
+//! connections fail instead of escaping. Failing closed is the only safe
+//! direction for this particular rule.
 
 use std::io;
 use std::process::Command;
@@ -20,6 +36,13 @@ use std::process::Command;
 /// The rule's priority. High enough to sit above the main table's own rules,
 /// low enough not to displace anything an operator is likely to have added.
 const PRIORITY: u32 = 9000;
+
+/// Metric of the route through the tunnel device. Lower wins, so this is the
+/// one in force whenever the device exists.
+const DEVICE_METRIC: u32 = 1;
+
+/// Metric of the blackhole that remains when the device route does not.
+const BLACKHOLE_METRIC: u32 = 100;
 
 /// Describes the routing this front end needs.
 #[derive(Debug, Clone, Copy)]
@@ -39,8 +62,77 @@ impl Policy {
                 "ip rule add fwmark {} lookup {} priority {}",
                 self.mark, self.table, PRIORITY
             ),
-            format!("ip route add default dev {} table {}", device, self.table),
+            format!(
+                "ip route replace default dev {} table {} metric {}",
+                device, self.table, DEVICE_METRIC
+            ),
+            format!(
+                "ip route replace blackhole default table {} metric {}",
+                self.table, BLACKHOLE_METRIC
+            ),
         ]
+    }
+
+    /// Reinstalls anything missing, and reports whether it had to.
+    ///
+    /// Cheap enough to call on a timer, which is the point: the device route is
+    /// removed by the kernel whenever the tunnel device is recreated, and
+    /// nothing else would ever put it back. Without this a tunnel that has been
+    /// up for hours quietly stops carrying anything, and the traffic it should
+    /// be carrying goes out in the clear.
+    ///
+    /// # Errors
+    /// Returns an error if `ip` cannot be run or reports failure.
+    pub fn ensure(&self, device: &str) -> io::Result<bool> {
+        let mut repaired = false;
+
+        if !self.rule_present()? {
+            run(&[
+                "rule",
+                "add",
+                "fwmark",
+                &self.mark.to_string(),
+                "lookup",
+                &self.table.to_string(),
+                "priority",
+                &PRIORITY.to_string(),
+            ])?;
+            repaired = true;
+        }
+
+        // `replace` rather than `add`: idempotent, so this says what the table
+        // should contain rather than asking first and racing with the answer.
+        if !self.device_route_present(device)? {
+            run(&[
+                "route",
+                "replace",
+                "default",
+                "dev",
+                device,
+                "table",
+                &self.table.to_string(),
+                "metric",
+                &DEVICE_METRIC.to_string(),
+            ])?;
+            repaired = true;
+        }
+        Ok(repaired)
+    }
+
+    /// Whether the fwmark rule is installed.
+    fn rule_present(&self) -> io::Result<bool> {
+        let out = output(&["rule", "show"])?;
+        let wanted = format!("fwmark {:#x} lookup {}", self.mark, self.table);
+        Ok(out.contains(&wanted)
+            || out.contains(&format!("fwmark {} lookup {}", self.mark, self.table)))
+    }
+
+    /// Whether the table still routes the default through the device.
+    fn device_route_present(&self, device: &str) -> io::Result<bool> {
+        let out = output(&["route", "show", "table", &self.table.to_string()])?;
+        Ok(out
+            .lines()
+            .any(|l| l.starts_with("default") && l.contains(&format!("dev {device}"))))
     }
 
     /// Installs the rule and route. Safe to call when they already exist.
@@ -63,12 +155,26 @@ impl Policy {
         ])?;
         run(&[
             "route",
-            "add",
+            "replace",
             "default",
             "dev",
             device,
             "table",
             &self.table.to_string(),
+            "metric",
+            &DEVICE_METRIC.to_string(),
+        ])?;
+        // The fallback that makes a vanished device fail closed rather than
+        // silently route around the tunnel.
+        run(&[
+            "route",
+            "replace",
+            "blackhole",
+            "default",
+            "table",
+            &self.table.to_string(),
+            "metric",
+            &BLACKHOLE_METRIC.to_string(),
         ])
     }
 
@@ -97,7 +203,26 @@ impl Policy {
             "table",
             &self.table.to_string(),
         ]);
+        let _ = run(&[
+            "route",
+            "del",
+            "blackhole",
+            "default",
+            "table",
+            &self.table.to_string(),
+        ]);
     }
+}
+
+/// Runs one `ip` command and returns its output.
+fn output(args: &[&str]) -> io::Result<String> {
+    let out = Command::new("ip").args(args).output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not run `ip {}`: {e}", args.join(" ")),
+        )
+    })?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Runs one `ip` command.
@@ -132,11 +257,40 @@ mod tests {
             table: 51,
         }
         .plan("paqetz0");
-        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.len(), 3);
         assert!(plan[0].contains("fwmark 81"), "got: {}", plan[0]);
         assert!(plan[0].contains("lookup 51"), "got: {}", plan[0]);
         assert!(plan[1].contains("dev paqetz0"), "got: {}", plan[1]);
         assert!(plan[1].contains("table 51"), "got: {}", plan[1]);
+        assert!(plan[2].contains("blackhole"), "got: {}", plan[2]);
+        assert!(plan[2].contains("table 51"), "got: {}", plan[2]);
+    }
+
+    #[test]
+    fn the_blackhole_loses_to_the_device_but_outlives_it() {
+        // The whole reason it is there: while the device exists its route wins
+        // on metric, and when the kernel removes that route with the device the
+        // blackhole is what a lookup finds. Without it the lookup finds nothing,
+        // falls through to the main table, and marked traffic leaves the host in
+        // the clear -- which is the failure this module exists to prevent,
+        // arriving hours after start-up instead of at it.
+        const { assert!(DEVICE_METRIC < BLACKHOLE_METRIC) }
+
+        let plan = Policy {
+            mark: 0x51,
+            table: 51,
+        }
+        .plan("paqetz0");
+        assert!(
+            plan[1].contains(&format!("metric {DEVICE_METRIC}")),
+            "got: {}",
+            plan[1]
+        );
+        assert!(
+            plan[2].contains(&format!("metric {BLACKHOLE_METRIC}")),
+            "got: {}",
+            plan[2]
+        );
     }
 
     #[test]
