@@ -275,8 +275,8 @@ fn check_networkd(cfg: Option<&Config>) -> Finding {
             "networkd",
             "will delete the policy rule when an interface changes or it restarts",
             "the rule going does not stop traffic, it sends it out unprotected: \
-             run `paqetz networkd protect`, or set \
-             ManageForeignRoutingPolicyRules=no in /etc/systemd/networkd.conf",
+             run `paqetz networkd protect`, which takes effect once networkd is \
+             restarted",
         ),
     }
 }

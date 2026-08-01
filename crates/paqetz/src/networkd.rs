@@ -128,27 +128,31 @@ fn says_no(path: &Path) -> bool {
         })
 }
 
-/// Writes the drop-in and asks networkd to reload.
+/// Writes the drop-in, and restarts networkd only if asked.
+///
+/// `networkctl reload` is not enough and it would be misleading to run it:
+/// reload re-reads `.network` and `.netdev` files, not `networkd.conf` or its
+/// drop-ins. Nothing short of restarting the service picks this up.
+///
+/// Which is why the restart is a decision rather than something done quietly. It
+/// reconfigures every interface on the host, and the host in question is usually
+/// remote and reached over one of them. The setting can equally wait for the
+/// next reboot: until then the policy rule is still re-asserted every few
+/// seconds and the table still fails closed, so the exposure is bounded either
+/// way.
 ///
 /// # Errors
-/// Returns an error if the file cannot be written.
-pub(crate) fn apply() -> io::Result<()> {
+/// Returns an error if the file cannot be written, or if a requested restart
+/// fails.
+pub(crate) fn apply(restart: bool) -> io::Result<()> {
     let path = drop_in_path();
     if let Some(dir) = path.parent() {
         crate::service::run_elevated("mkdir", &["-p", &dir.display().to_string()])?;
     }
     crate::service::write_file(&path, &drop_in(), 0o644)?;
 
-    // Reloaded rather than restarted. A restart of networkd on a remote host
-    // reconfigures every interface, which is a poor thing to do to the
-    // connection you are administering it over -- and it is the very event that
-    // deletes the rule, so restarting to fix the deletion would cause one more.
-    if let Err(e) = crate::service::run_elevated("networkctl", &["reload"]) {
-        crate::log::warn_!(
-            "wrote {} but could not reload networkd ({e}); it takes effect at the \
-             next reload or reboot",
-            path.display()
-        );
+    if restart {
+        crate::service::run_elevated("systemctl", &["restart", "systemd-networkd"])?;
     }
     Ok(())
 }

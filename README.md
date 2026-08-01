@@ -279,10 +279,21 @@ mark on its own sockets and so genuinely needs the rule. There the fix is to
 stop networkd removing it:
 
 ```bash
-sudo paqetz networkd status     # says whether it will
-sudo paqetz networkd protect    # writes the drop-in that stops it
-sudo paqetz networkd unprotect  # removes it again
+sudo paqetz networkd status               # says whether it will
+sudo paqetz networkd protect              # writes the drop-in that stops it
+sudo paqetz networkd protect --restart    # and applies it immediately
+sudo paqetz networkd unprotect            # removes it again
 ```
+
+**It is not in force until networkd restarts.** `networkctl reload` re-reads
+`.network` and `.netdev` files, not `networkd.conf` or its drop-ins, so nothing
+short of `systemctl restart systemd-networkd` picks this up. That restart
+reconfigures every interface on the host — worth thinking about if you are
+reading this over one of them — so `protect` writes the file and says so rather
+than doing it quietly. `--restart` opts in. Waiting for the next reboot is a
+perfectly good answer: until then the rule is still re-asserted every fifteen
+seconds and the table still fails closed, so the exposure is bounded either
+way.
 
 `protect` writes `/etc/systemd/networkd.conf.d/10-paqetz.conf` — a drop-in
 rather than an edit to `networkd.conf`, so nothing you wrote is overwritten and

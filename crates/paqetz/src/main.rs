@@ -668,7 +668,12 @@ enum NetworkdAction {
     /// Report whether networkd will delete the policy rule.
     Status,
     /// Write the drop-in that tells it not to.
-    Protect,
+    Protect {
+        /// Restart networkd so it takes effect now, rather than at the next
+        /// reboot. This reconfigures every interface on the host.
+        #[arg(long)]
+        restart: bool,
+    },
     /// Remove that drop-in.
     Unprotect,
 }
@@ -698,11 +703,30 @@ fn networkd_command(action: NetworkdAction) -> Result<(), Box<dyn std::error::Er
             }
             Ok(())
         }
-        NetworkdAction::Protect => {
+        NetworkdAction::Protect { restart } => {
             println!("Writing {}:\n", networkd::drop_in_path().display());
             println!("{}", networkd::drop_in());
-            networkd::apply()?;
-            println!("Done. `paqetz networkd unprotect` removes it.");
+            networkd::apply(restart)?;
+
+            if restart {
+                println!("Written, and networkd restarted, so it is in force now.");
+            } else {
+                // Said plainly because the opposite -- believing a host is
+                // protected when it is not -- is worse than knowing it is
+                // exposed. `networkctl reload` does not help: it re-reads
+                // .network and .netdev files, not networkd.conf or its drop-ins.
+                println!(
+                    "Written, but NOT yet in force: only restarting networkd re-reads\n\
+                     this file. Either accept that it applies at the next reboot, or:\n\n\
+                     \x20   sudo systemctl restart systemd-networkd\n\n\
+                     which reconfigures every interface on this host -- worth thinking\n\
+                     about if you are reading this over one of them. `paqetz networkd\n\
+                     protect --restart` does it for you.\n\n\
+                     Until then the policy rule is still re-asserted every 15 seconds and\n\
+                     the table still fails closed, so traffic stops rather than leaking."
+                );
+            }
+            println!("\n`paqetz networkd unprotect` removes it.");
             Ok(())
         }
         NetworkdAction::Unprotect => {

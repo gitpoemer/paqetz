@@ -378,8 +378,22 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
             true,
         )?
     {
-        match crate::networkd::apply() {
-            Ok(()) => println!("   Wrote {}", crate::networkd::drop_in_path().display()),
+        // Asked separately, because it is the part that touches the network of
+        // a host that is usually being administered over that network.
+        let restart = yes_no(
+            "   Restart networkd so it takes effect now? Only a restart re-reads\n   \
+             this setting, and it reconfigures every interface on this host.\n   \
+             Saying no leaves it to apply at the next reboot.",
+            false,
+        )?;
+        match crate::networkd::apply(restart) {
+            Ok(()) => {
+                println!("   Wrote {}", crate::networkd::drop_in_path().display());
+                if !restart {
+                    println!("   It applies at the next reboot, or after");
+                    println!("   `systemctl restart systemd-networkd`.");
+                }
+            }
             Err(e) => println!("   Could not write it: {e}"),
         }
     }
