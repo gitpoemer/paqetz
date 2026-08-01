@@ -94,6 +94,73 @@ broken.
 `paqetz setup` walks the whole path, including generating an Xray REALITY
 inbound and pointing it at the tunnel.
 
+## Putting a proxy in front of it
+
+The usual arrangement: users reach an Xray REALITY inbound on the client, and
+what it forwards leaves through the tunnel. There are two ways to join them, and
+the difference is where names are resolved.
+
+**Marked sockets (L3).** Xray sets `SO_MARK` on its outbound connections and a
+policy route sends those — and only those — into the tunnel. Its own inbound
+connections keep the host's ordinary route, which is what `route_all` cannot
+express: that would capture the replies to Xray's own users and break them.
+
+```toml
+# client, under [interface]
+route_marked = 81
+route_table  = 81
+```
+
+```bash
+paqetz xray config <public-address> --mark 81 -o /etc/xray/config.json
+```
+
+**A SOCKS5 listener.** For anything that speaks SOCKS5 but cannot set a mark.
+Self-contained: the listener installs its own policy route when it starts.
+
+```toml
+# client
+[socks5]
+listen = "127.0.0.1:1080"
+```
+
+```bash
+paqetz xray config <public-address> --socks5 127.0.0.1:1080 -o /etc/xray/config.json
+```
+
+Both are configurable at once, and keeping the listener even on the L3 path is
+worth it for `curl -x socks5h://127.0.0.1:1080 https://ifconfig.me`, which
+answers "is the tunnel carrying anything" in one line.
+
+### Names are resolved through the tunnel
+
+This is the part that is easy to get wrong, and it fails in a way that looks
+like anything but DNS. The client sits inside the network being tunnelled out
+of. Resolve a name with that network's resolver and it sees every destination
+before you reach it — and if it answers with an address that goes nowhere, the
+connection hangs until it times out, with the tunnel healthy and the counters
+moving. Sites that resolve normally work; sites that do not simply stall.
+
+So both paths resolve on the far side, and both default to it:
+
+- The SOCKS5 listener resolves names itself over a marked socket. `socks5.dns`
+  chooses the resolver, defaulting to `1.1.1.1`. `dns = "system"` opts out, and
+  says so at start-up.
+- The generated Xray configuration for `--mark` points Xray's own DNS at the
+  same resolver, reached over the same marked outbound.
+
+If you write the Xray configuration yourself, the marked outbound needs
+`"settings": { "domainStrategy": "UseIPv4" }` and a `"dns"` block, or Xray
+hands each name to the host's resolver and the lookup is the one thing that
+never enters the tunnel.
+
+### IPv4 only
+
+The tunnel carries IPv4. A destination reachable only over IPv6 is refused
+rather than sent around the tunnel — which is what would otherwise happen, since
+the policy route is a v4 rule and a marked v6 socket matches nothing and leaves
+by the ordinary route. Dual-stack destinations are unaffected.
+
 ## Testing
 
 `cargo test` is safe on a workstation: it creates no device, opens no socket,
