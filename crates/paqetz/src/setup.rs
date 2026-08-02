@@ -391,7 +391,15 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // The one step that changes this host, asked for separately and last.
-    let pending = paqetz_fw::tune::pending();
+    // Only the settings this host will actually use: the NAT-shaped ones tune
+    // nothing on a client, and offering them there is how a host acquires
+    // settings nobody can justify later. Read from the file this host will run,
+    // which covers the adopted configuration as well as the generated one.
+    let forwards = role
+        .and_then(|r| std::fs::read_to_string(dir.join(r.file())).ok())
+        .and_then(|t| crate::config::Config::parse(&t).ok())
+        .is_some_and(|c| c.interface.gateway);
+    let pending = paqetz_fw::tune::pending(forwards);
     if pending.is_empty() {
         println!("This host's kernel settings already suit a tunnel.");
     } else {
@@ -401,7 +409,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         );
         println!("   for a tunnel. `paqetz tune` shows each one and why.");
         if yes_no("   Apply them now?", false)? {
-            paqetz_fw::tune::apply()?;
+            paqetz_fw::tune::apply(forwards)?;
             println!("   Applied, and written to {}.", paqetz_fw::tune::PATH);
         } else {
             println!("   Skipped. Run `paqetz tune --apply` later if you want them.");

@@ -242,7 +242,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action),
         Command::Networkd { action } => networkd_command(action),
-        Command::Tune { apply } => tune(apply),
+        Command::Tune { apply } => tune(apply, &cli.config),
         Command::Doctor => {
             if doctor::run(&cli.config) {
                 Ok(())
@@ -757,8 +757,15 @@ fn networkd_command(action: NetworkdAction) -> Result<(), Box<dyn std::error::Er
     }
 }
 
-fn tune(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let pending = paqetz_fw::tune::pending();
+fn tune(apply: bool, config: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Whether this host forwards for its peer decides half the list. Read from
+    // the configuration rather than asked, and assumed false when there is none
+    // -- offering a client the settings a gateway needs is worse than offering
+    // a gateway too few, since the first leaves settings behind that nobody can
+    // explain and the second prints one more line.
+    let gateway = config::Config::load(config).is_ok_and(|c| c.interface.gateway);
+
+    let pending = paqetz_fw::tune::pending(gateway);
     if pending.is_empty() {
         println!("Every setting already has the value a tunnel wants.");
         return Ok(());
@@ -782,7 +789,7 @@ fn tune(apply: bool) -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    paqetz_fw::tune::apply()?;
+    paqetz_fw::tune::apply(gateway)?;
     println!("Applied, and written to {}.", paqetz_fw::tune::PATH);
     Ok(())
 }
