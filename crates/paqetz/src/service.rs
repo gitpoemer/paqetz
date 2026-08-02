@@ -220,6 +220,16 @@ pub(crate) fn remove_unit(name: &str) {
     let _ = run_elevated("systemctl", &["daemon-reload"]);
 }
 
+/// Whether the unit file is there at all.
+///
+/// Distinct from enabled: a unit can be installed without being set to start at
+/// boot, and "there is no service" wants a different answer than "there is one
+/// and it is switched off".
+#[must_use]
+pub(crate) fn unit_exists(name: &str) -> bool {
+    Path::new(&unit_path(name)).exists()
+}
+
 /// Whether a unit exists and is enabled.
 #[must_use]
 pub(crate) fn unit_enabled(name: &str) -> bool {
@@ -255,6 +265,15 @@ pub(crate) fn install_binary(prefix: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_unit_is_not_reported_as_present() {
+        // The distinction the start/stop commands rely on: without it they
+        // would hand systemd a unit name it has never heard of and report
+        // whatever it says about that, rather than the one thing the operator
+        // needs to hear -- that no service was ever installed.
+        assert!(!unit_exists("paqetz-definitely-not-installed"));
+    }
+
     use super::*;
 
     #[test]

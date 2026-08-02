@@ -100,6 +100,18 @@ enum Command {
         action: ServiceAction,
     },
 
+    /// Start the tunnel service.
+    Start,
+
+    /// Stop the tunnel service.
+    Stop,
+
+    /// Restart the tunnel service.
+    ///
+    /// What to run after changing the configuration or replacing the binary:
+    /// neither is picked up by a process that is already running.
+    Restart,
+
     /// Stop systemd-networkd deleting the policy rule the tunnel needs.
     ///
     /// systemd-networkd assumes it is the only thing managing routes and
@@ -241,6 +253,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action),
+        Command::Start => unit_command("start"),
+        Command::Stop => unit_command("stop"),
+        Command::Restart => unit_command("restart"),
         Command::Networkd { action } => networkd_command(action),
         Command::Tune { apply } => tune(apply, &cli.config),
         Command::Doctor => {
@@ -621,6 +636,32 @@ fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// `paqetz start`, `stop` and `restart`, which are systemd's with the unit name
+/// filled in.
+///
+/// Thin on purpose. They exist because the unit is called `paqetz` and everyone
+/// reaches for `paqetz restart` first, not because there is anything to add to
+/// what systemd already does -- so the failures are systemd's, reported as
+/// systemd reported them.
+fn unit_command(verb: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !service::has_systemd() {
+        return Err(format!(
+            "no systemd on this host, so there is no service to {verb};              run `paqetz run -c <file>` however this system starts things"
+        )
+        .into());
+    }
+    if !service::unit_exists("paqetz") {
+        return Err("no paqetz service is installed; `paqetz service install` writes one".into());
+    }
+
+    service::run_elevated("systemctl", &[verb, "paqetz"])?;
+    if verb != "stop" {
+        println!("Check it with:   systemctl status paqetz");
+        println!("Follow it with:  journalctl -u paqetz -f");
+    }
+    Ok(())
 }
 
 /// Whether standard input is a terminal, and so whether asking is possible.
