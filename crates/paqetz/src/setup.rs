@@ -315,7 +315,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         if crate::service::has_systemd() {
             if yes_no(
                 &format!(
-                    "\n7. Install paqetz as a system service on this host,\n   \
+                    "\n5. Install paqetz as a system service on this host,\n   \
                      running {}, so it starts at boot and restarts on failure?",
                     role.file()
                 ),
@@ -335,7 +335,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
                 println!("   Follow it with: journalctl -u paqetz -f");
             }
         } else {
-            println!("\n7. No systemd on this host, so nothing to install.");
+            println!("\n5. No systemd on this host, so nothing to install.");
             println!("   Run it however this system starts things:");
             println!("     paqetz run -c {}", source.display());
         }
@@ -404,7 +404,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         println!("This host's kernel settings already suit a tunnel.");
     } else {
         println!(
-            "5. This host has {} kernel setting(s) worth changing",
+            "6. This host has {} kernel setting(s) worth changing",
             pending.len()
         );
         println!("   for a tunnel. `paqetz tune` shows each one and why.");
@@ -574,26 +574,23 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
          disturb this host's own traffic on it.\n"
     );
 
-    let gateway = yes_no(
-        "2. Should the server be a way out to the internet for the client?\n   \
-         This turns on forwarding and address translation there.\n   \
-         Say no if you only want the two hosts to reach each other.",
-        true,
-    )?;
+    // Not asked. Both had one answer that fits almost every deployment and one
+    // that fits an arrangement most people setting this up do not have, and a
+    // question whose answer is the same every time is a question that only
+    // creates a chance to get it wrong. Both remain settings in the file, which
+    // is where an unusual arrangement belongs.
+    let gateway = true;
+    let route_all = false;
+    println!(
+        "   Assuming the usual arrangement: the server is a way out to the\n   \
+         internet, and the client sends only what you point at the tunnel\n   \
+         rather than everything. Both are settings in the files if you want\n   \
+         the other shape -- `gateway` on the server, `route_all` on the client.\n"
+    );
 
-    let route_all = yes_no(
-        "\n3. Should the client send all its traffic through the tunnel?\n   \
-         The tunnel's own packets are excepted automatically, so this\n   \
-         does not cut the connection it depends on.\n   \
-         Say no if you will point one program at it instead.",
-        false,
-    )?;
-
-    let socks5 = if route_all {
-        None
-    } else {
+    let socks5 = {
         let want = yes_no(
-            "\n4. Add a SOCKS5 listener on the client?\n   \
+            "2. Add a SOCKS5 listener on the client?\n   \
              This is how you point one program — Xray, a browser, curl —\n   \
              at the tunnel while the rest of the host carries on as normal.",
             true,
@@ -608,7 +605,13 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
     // The server's egress. Only sensible when it is a way out at all.
     let egress = if gateway {
         let want = yes_no(
-            "\n5. Should the server send the forwarded traffic out a different\n                interface than its own?\n                The usual reason is a Cloudflare WARP tunnel: the destination then\n                sees WARP's address rather than the server's datacentre one.\n                paqetz routes and translates for it, but does not bring it up —\n                use wgcf and wg-quick for that, with `Table = 51820` in the profile.",
+            "\n3. Should the server send the forwarded traffic out a different\n   \
+             interface than its own?\n   \
+             The usual reason is a Cloudflare WARP tunnel: the destination\n   \
+             then sees WARP's address rather than the server's datacentre\n   \
+             one. paqetz routes and translates for it but does not bring it\n   \
+             up — use wgcf and wg-quick for that, with `Table = 51820` in\n   \
+             the profile.",
             false,
         )?;
         if want {
@@ -653,7 +656,9 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
              there, so the key is only ever on the host that uses it.\n"
         );
     } else if yes_no(
-        "6. Generate an Xray REALITY inbound for the client host?\n            This is how users reach the tunnel: they connect to Xray, and Xray\n            forwards what it receives through paqetz.",
+        "4. Generate an Xray REALITY inbound for the client host?\n   \
+         This is how users reach the tunnel: they connect to Xray, and\n   \
+         Xray forwards what it receives through paqetz.",
         false,
     )? {
         let public = ask("   What address will users reach the client host at?", "")?;
