@@ -664,6 +664,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_payload_survives_the_round_trip() {
+        // What a keepalive is: nothing at all, sealed. If this did not work the
+        // liveness mechanism above it would send frames the far end rejected,
+        // which is worse than not sending them.
+        let mut p = handshake();
+        round_trip(&mut p.client, &mut p.server, &[], 0);
+        round_trip(&mut p.server, &mut p.client, &[], 0);
+    }
+
+    #[test]
     fn handshake_establishes_matching_indices() {
         let p = handshake();
         assert_eq!(p.client.local_index(), 0x1111_1111);

@@ -42,6 +42,39 @@ const TICK: Duration = Duration::from_millis(250);
 /// enough that a transient loss costs a few seconds rather than a minute.
 const REKEY_TIMEOUT: Millis = 5_000;
 
+/// Random extra delay added to each repeat, up to this many milliseconds.
+///
+/// WireGuard's, and for its reason: two peers that lost each other at the same
+/// moment would otherwise retry in step for ever, so a collision repeats rather
+/// than resolves. A third of a second is enough to break the lockstep.
+const REKEY_TIMEOUT_JITTER: Millis = 334;
+
+/// How long to keep trying before giving up and waiting for traffic.
+///
+/// WireGuard's. Past this the peer is not transiently unreachable, it is gone,
+/// and handshaking at it every five seconds for ever tells nobody anything.
+/// Sending resumes the moment there is something to send.
+const REKEY_ATTEMPT_TIME: Millis = 90_000;
+
+/// How long a session may go unanswered before it is presumed dead.
+///
+/// WireGuard's, and the piece this had been missing entirely. A session is only
+/// known to work while the peer keeps answering; if we have sent data and heard
+/// nothing authenticated back for this long, the peer has forgotten us -- it
+/// restarted, or its state diverged -- and no amount of waiting fixes it,
+/// because nothing in the protocol says so out loud.
+///
+/// Without this the only thing that ever replaced a session was the rekey timer
+/// at two minutes, so a server restart cost up to that long while the client
+/// encrypted confidently into nothing.
+const KEEPALIVE_TIMEOUT: Millis = 10_000;
+
+/// Silence after sending that means the session is dead.
+///
+/// One keepalive interval for the peer to answer in, plus one handshake
+/// interval, which is how WireGuard arrives at fifteen seconds.
+const PRESUMED_DEAD: Millis = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+
 /// Largest inner packet we will handle.
 const MAX_INNER: usize = 9000;
 
@@ -57,6 +90,23 @@ struct PeerState {
     endpoint: Option<SocketAddrV4>,
     /// When the last handshake was sent.
     last_handshake: Millis,
+    /// When the first handshake of the current attempt was sent.
+    ///
+    /// Separate from `last_handshake` so that giving up is measured from when
+    /// trying started, not from the most recent try.
+    attempt_started: Option<Millis>,
+    /// When a packet from the peer last authenticated.
+    ///
+    /// The only evidence that the peer still has the session we are using.
+    last_receive: Option<Millis>,
+    /// When we last sent something under the current session.
+    last_send: Option<Millis>,
+    /// When a packet carrying actual data last arrived.
+    ///
+    /// Separate from `last_receive` so a keepalive cannot arm another one. Both
+    /// ends answering every keepalive with a keepalive is a loop that never
+    /// stops, and an empty packet is not something that needs acknowledging.
+    last_data_receive: Option<Millis>,
 }
 
 impl PeerState {
@@ -67,7 +117,38 @@ impl PeerState {
             carrier: None,
             endpoint,
             last_handshake: 0,
+            attempt_started: None,
+            last_receive: None,
+            last_send: None,
+            last_data_receive: None,
         }
+    }
+
+    /// Whether the peer has stopped answering a session we are still using.
+    ///
+    /// Only asked of a session we have actually sent under: a tunnel that has
+    /// been idle since it came up has heard nothing back because it has said
+    /// nothing, which is not the same as being ignored.
+    /// Whether the peer has spoken and we owe it a word back.
+    ///
+    /// WireGuard's passive keepalive: after data arrives, if we have said
+    /// nothing for a keepalive interval, send an empty packet. It holds any NAT
+    /// mapping in the path open, and it gives the peer the evidence it needs to
+    /// decide whether *we* are still here -- which is the same question this end
+    /// asks with `presumed_dead`, from the other side.
+    fn owes_keepalive(&self, now: Millis) -> bool {
+        let Some(heard) = self.last_data_receive else {
+            return false;
+        };
+        self.last_send.unwrap_or(0) < heard && now.saturating_sub(heard) >= KEEPALIVE_TIMEOUT
+    }
+
+    fn presumed_dead(&self, now: Millis) -> bool {
+        let Some(sent) = self.last_send else {
+            return false;
+        };
+        let heard = self.last_receive.unwrap_or(0);
+        sent > heard && now.saturating_sub(heard) >= PRESUMED_DEAD
     }
 }
 
@@ -619,6 +700,9 @@ impl Tunnel {
             return Ok(None);
         };
         let n = session.seal(packet, sealed, now)?;
+        // Half of the liveness question: something went out under this session,
+        // so silence from here on means something.
+        state.last_send = Some(now);
         Stats::bump(&self.stats.tx_packets);
         Stats::add(&self.stats.tx_bytes, packet.len() as u64);
 
@@ -884,6 +968,15 @@ impl Tunnel {
         if let Some(carrier) = state.carrier.as_mut() {
             carrier.on_receive(seg);
         }
+        // The other half. This is reached only for a packet that decrypted and
+        // passed the replay window, so it is the peer speaking and no one else:
+        // the one piece of evidence that it still holds this session.
+        state.last_receive = Some(now);
+        // An empty packet is a keepalive and needs no reply; answering one would
+        // have the two ends trading them for ever.
+        if n > 0 {
+            state.last_data_receive = Some(now);
+        }
         drop(state);
 
         let Some(packet) = inner.get(..n) else {
@@ -949,22 +1042,54 @@ impl Tunnel {
 
     /// Starts and refreshes handshakes.
     fn timers(&self) {
-        if !self.is_initiator() {
-            // A responder answers handshakes but never starts one, so it has
-            // nothing to do on a timer.
-            while self.running.load(Ordering::Relaxed) {
-                std::thread::sleep(TICK);
-            }
-            return;
-        }
-
+        // A responder never starts a handshake, but it does owe keepalives: the
+        // peer decides whether this end is still here from what it hears back,
+        // and an end that only ever answers goes quiet the moment the other
+        // stops asking. So both roles run this loop; only one of them
+        // handshakes.
+        let initiator = self.is_initiator();
         let mut frame = vec![0u8; MAX_FRAME];
+        let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
+        let mut keepalive_frame =
+            vec![0u8; MAX_INNER + MAX_OVERHEAD + paqetz_core::framing::OVERHEAD];
+
         while self.running.load(Ordering::Relaxed) {
-            if let Err(e) = self.maybe_handshake(&mut frame) {
+            if initiator && let Err(e) = self.maybe_handshake(&mut frame) {
                 warn_!("handshake attempt failed: {e}");
+            }
+            if let Err(e) = self.maybe_keepalive(&mut sealed, &mut keepalive_frame) {
+                debug!("keepalive failed: {e}");
             }
             std::thread::sleep(TICK);
         }
+    }
+
+    /// Sends an empty packet when the peer has spoken and we have not answered.
+    ///
+    /// The payload is empty on purpose: the far end drops a zero-length inner
+    /// packet without looking at it, so this costs one frame and says the only
+    /// thing it needs to -- that this end is still here and still holds the
+    /// session.
+    fn maybe_keepalive(&self, sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
+        let now = self.now();
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.session.is_none() || !state.owes_keepalive(now) {
+                return Ok(());
+            }
+        }
+        debug!("keepalive");
+        self.send_inner(&[], sealed, frame)
+    }
+
+    /// How long to wait before repeating a handshake, jittered.
+    ///
+    /// Two peers that lost each other at the same instant would otherwise retry
+    /// in lockstep, so a collision repeats rather than resolves.
+    fn rekey_interval() -> Millis {
+        // No randomness available is a reason to retry on the flat interval,
+        // not a reason to fail a handshake.
+        REKEY_TIMEOUT + random_u32().map_or(0, |r| Millis::from(r) % REKEY_TIMEOUT_JITTER)
     }
 
     /// Sends a handshake if one is due.
@@ -972,14 +1097,35 @@ impl Tunnel {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
+        // A repeat waits a jittered interval; a first attempt does not wait at
+        // all, so a tunnel with something to send starts talking immediately.
+        let waited = now.saturating_sub(state.last_handshake) >= Self::rekey_interval();
+
+        // Giving up is measured from when trying started. Past that the peer is
+        // not briefly unreachable, it is gone, and the attempt stops until there
+        // is traffic again -- which `last_send` moving will show.
+        let exhausted = state
+            .attempt_started
+            .is_some_and(|began| now.saturating_sub(began) >= REKEY_ATTEMPT_TIME);
+
         let due = match state.session.as_ref() {
-            None => {
-                state.pending.is_none() || now.saturating_sub(state.last_handshake) >= REKEY_TIMEOUT
-            }
-            Some(s) => s.needs_rekey(now),
+            None if exhausted => false,
+            None => state.pending.is_none() || waited,
+            // A session is only known to work while the peer answers. Rekeying
+            // on the timer alone left a peer that had forgotten us undetected
+            // for two minutes, with everything sent in between encrypted to a
+            // key nobody holds.
+            Some(s) => s.needs_rekey(now) || (state.presumed_dead(now) && waited),
         };
         if !due {
             return Ok(());
+        }
+        if state.presumed_dead(now) && state.session.is_some() {
+            warn_!(
+                "no authenticated packet for {}s while sending; the peer has \
+                 forgotten this session, starting a new handshake",
+                PRESUMED_DEAD / 1000
+            );
         }
         let Some(peer) = state.endpoint else {
             return Ok(());
@@ -1031,6 +1177,7 @@ impl Tunnel {
 
         state.pending = Some(initiator);
         state.last_handshake = now;
+        state.attempt_started.get_or_insert(now);
         drop(state);
 
         Stats::bump(&self.stats.handshakes_sent);
@@ -1163,6 +1310,99 @@ fn random_u32() -> io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// A peer state that has sent and received at the given times.
+    fn spoke(sent: Option<Millis>, heard: Option<Millis>) -> PeerState {
+        PeerState {
+            last_send: sent,
+            last_receive: heard,
+            last_data_receive: heard,
+            ..PeerState::new(None)
+        }
+    }
+
+    #[test]
+    fn a_session_nobody_answers_is_presumed_dead() {
+        // The gap this closes: before it, the only thing that ever replaced a
+        // session was the rekey timer at two minutes, so a peer that had
+        // forgotten us went undetected for that long while everything sent in
+        // between was encrypted to a key nobody held.
+        let s = spoke(Some(1_000), Some(500));
+        assert!(!s.presumed_dead(1_000), "silence has not lasted yet");
+        assert!(!s.presumed_dead(500 + PRESUMED_DEAD - 1));
+        assert!(s.presumed_dead(500 + PRESUMED_DEAD));
+    }
+
+    #[test]
+    fn an_idle_tunnel_is_not_presumed_dead() {
+        // Nothing has been sent, so hearing nothing back is not evidence of
+        // anything. Rehandshaking here would mean a tunnel nobody is using
+        // handshaking for ever.
+        let s = spoke(None, None);
+        assert!(!s.presumed_dead(10 * PRESUMED_DEAD));
+
+        let never_sent = spoke(None, Some(1_000));
+        assert!(!never_sent.presumed_dead(10 * PRESUMED_DEAD));
+    }
+
+    #[test]
+    fn a_peer_that_answers_keeps_its_session() {
+        let s = spoke(Some(1_000), Some(1_500));
+        assert!(
+            !s.presumed_dead(1_500 + PRESUMED_DEAD + 1),
+            "it answered after we spoke, so the silence since is ours"
+        );
+    }
+
+    #[test]
+    fn a_keepalive_is_owed_only_after_the_peer_speaks_and_we_do_not() {
+        let s = spoke(Some(100), Some(1_000));
+        assert!(!s.owes_keepalive(1_000), "not yet");
+        assert!(!s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT - 1));
+        assert!(s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT));
+
+        let answered = spoke(Some(2_000), Some(1_000));
+        assert!(
+            !answered.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT),
+            "we already said something after they did"
+        );
+    }
+
+    #[test]
+    fn a_keepalive_does_not_arm_another_keepalive() {
+        // Two ends answering every keepalive with a keepalive is a loop that
+        // never stops. Only a packet carrying data sets `last_data_receive`, so
+        // an empty one cannot start it.
+        let mut s = spoke(Some(100), Some(1_000));
+        s.last_data_receive = None;
+        assert!(!s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT * 10));
+    }
+
+    #[test]
+    fn the_retry_interval_is_wireguards_plus_jitter() {
+        // Flat retries let two peers that lost each other at the same moment
+        // collide for ever.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let v = Tunnel::rekey_interval();
+            assert!(
+                (REKEY_TIMEOUT..REKEY_TIMEOUT + REKEY_TIMEOUT_JITTER).contains(&v),
+                "{v} outside the interval"
+            );
+            seen.insert(v);
+        }
+        assert!(seen.len() > 8, "not varying: {} values", seen.len());
+    }
+
+    #[test]
+    fn the_timers_are_the_ones_wireguard_uses() {
+        assert_eq!(REKEY_TIMEOUT, 5_000);
+        assert_eq!(KEEPALIVE_TIMEOUT, 10_000);
+        assert_eq!(REKEY_ATTEMPT_TIME, 90_000);
+        assert_eq!(PRESUMED_DEAD, 15_000);
+        assert_eq!(paqetz_core::noise::REKEY_AFTER_TIME, 120_000);
+        assert_eq!(paqetz_core::noise::REJECT_AFTER_TIME, 180_000);
+    }
+
     use super::*;
 
     #[test]
