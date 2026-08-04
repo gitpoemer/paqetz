@@ -129,6 +129,20 @@ impl PeerState {
     /// Only asked of a session we have actually sent under: a tunnel that has
     /// been idle since it came up has heard nothing back because it has said
     /// nothing, which is not the same as being ignored.
+    /// Records that a handshake just completed.
+    ///
+    /// The peer answered, which is the freshest evidence available that it holds
+    /// this session -- so the liveness timers start from here rather than
+    /// carrying over whatever made the previous session look dead. Without this
+    /// the condition that triggered the handshake survives it, and the next tick
+    /// triggers another, and the tunnel spends its life handshaking.
+    fn established(&mut self, now: Millis) {
+        self.last_receive = Some(now);
+        self.last_send = None;
+        self.last_data_receive = None;
+        self.attempt_started = None;
+    }
+
     /// Whether the peer has spoken and we owe it a word back.
     ///
     /// WireGuard's passive keepalive: after data arrives, if we have said
@@ -700,9 +714,16 @@ impl Tunnel {
             return Ok(None);
         };
         let n = session.seal(packet, sealed, now)?;
-        // Half of the liveness question: something went out under this session,
-        // so silence from here on means something.
-        state.last_send = Some(now);
+        // Half of the liveness question -- but only for a packet carrying data.
+        //
+        // A keepalive is empty, and the far end answers an empty packet with
+        // nothing, because there is nothing to answer. Arming this on one would
+        // therefore ask a question that cannot be answered and then read the
+        // silence as proof the peer had gone: an idle tunnel would send a
+        // keepalive, wait fifteen seconds, and rehandshake, for ever.
+        if !packet.is_empty() {
+            state.last_send = Some(now);
+        }
         Stats::bump(&self.stats.tx_packets);
         Stats::add(&self.stats.tx_bytes, packet.len() as u64);
 
@@ -895,6 +916,7 @@ impl Tunnel {
 
         state.session = Some(session);
         state.pending = None;
+        state.established(now);
         state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
         drop(state);
 
@@ -923,6 +945,7 @@ impl Tunnel {
                     carrier.on_receive(seg);
                 }
                 state.session = Some(session);
+                state.established(now);
                 drop(state);
                 self.stats.note_handshake(now);
                 info!("handshake completed with {}", self.cfg.peer.public_key);
@@ -1318,6 +1341,59 @@ mod tests {
             last_data_receive: heard,
             ..PeerState::new(None)
         }
+    }
+
+    #[test]
+    fn an_idle_tunnel_does_not_handshake_itself_to_death() {
+        // The regression this exists to stop. A keepalive is empty, so the peer
+        // answers it with nothing -- there is nothing to answer. Arming the
+        // liveness timer on one asks a question that cannot be answered and then
+        // reads the silence as proof the peer had gone, so a healthy idle tunnel
+        // rehandshakes for ever. Shipped, and observed in production as
+        // throughput collapsing while the tunnel looked up.
+        let heard = 1_000;
+        let s = spoke(None, Some(heard));
+
+        // The peer spoke, we owe it a keepalive, and we send one.
+        assert!(s.owes_keepalive(heard + KEEPALIVE_TIMEOUT));
+        // A keepalive must leave `last_send` alone: `seal_into` skips it for an
+        // empty packet, so nothing here moves and the state is unchanged.
+        assert!(
+            !s.presumed_dead(heard + KEEPALIVE_TIMEOUT + PRESUMED_DEAD + 1),
+            "an unanswered keepalive is not evidence of anything"
+        );
+    }
+
+    #[test]
+    fn a_completed_handshake_settles_the_liveness_timers() {
+        // Otherwise the condition that triggered the handshake survives it, the
+        // next tick triggers another, and each one replaces the session on both
+        // ends and rejects whatever was in flight.
+        let mut s = spoke(Some(1_000), Some(0));
+        assert!(
+            s.presumed_dead(PRESUMED_DEAD + 1),
+            "dead before the handshake"
+        );
+
+        s.established(PRESUMED_DEAD + 1);
+        assert!(
+            !s.presumed_dead(PRESUMED_DEAD + 1),
+            "the peer just answered; it cannot be dead in the same instant"
+        );
+        assert!(
+            !s.presumed_dead(PRESUMED_DEAD * 2),
+            "and stays alive until something is sent and goes unanswered"
+        );
+        assert_eq!(s.attempt_started, None, "the attempt succeeded");
+    }
+
+    #[test]
+    fn data_after_a_handshake_still_arms_the_liveness_timer() {
+        // The fix must not disable the mechanism it is fixing.
+        let mut s = spoke(None, None);
+        s.established(0);
+        s.last_send = Some(1_000);
+        assert!(s.presumed_dead(1_000 + PRESUMED_DEAD));
     }
 
     #[test]
