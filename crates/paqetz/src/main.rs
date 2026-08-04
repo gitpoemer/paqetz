@@ -11,6 +11,7 @@ mod service;
 mod setup;
 mod stats;
 mod tunnel;
+mod update;
 mod xray;
 
 use std::path::PathBuf;
@@ -98,6 +99,18 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+
+    /// Download the latest release and replace this binary.
+    ///
+    /// Fetches the build matching this one, checks it against the digest
+    /// published with the release, and refuses to install anything it cannot
+    /// verify. Replacing the file does not replace the running process, so it
+    /// offers to restart the service afterwards.
+    Update {
+        /// Answer yes to both questions: install it, and restart the service.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 
     /// Start the tunnel service.
@@ -253,6 +266,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action),
+        Command::Update { yes } => update::run(yes),
         Command::Start => unit_command("start"),
         Command::Stop => unit_command("stop"),
         Command::Restart => unit_command("restart"),
