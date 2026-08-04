@@ -332,7 +332,7 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // name is only settled here: the initiating side takes an ephemeral one.
     // Scoping the rules to anything else — the peer's port, say — would leave
     // the kernel free to reset the very traffic they exist to protect.
-    let socks5 = cfg.socks5.clone();
+    let mut socks5 = cfg.socks5.clone();
     let device = cfg.interface.device.clone();
     let want_gateway = cfg.interface.gateway;
     let mark_route = cfg
@@ -342,6 +342,31 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             mark,
             table: cfg.interface.route_table,
         });
+    // One rule per mark. `route_marked` and the SOCKS5 listener both steer by
+    // mark, and both default to 0x51, so a host using both installed two rules
+    // at one priority for one mark pointing at different tables. The second is
+    // unreachable -- which of the two decides the route is settled by insertion
+    // order -- and telling the operator to renumber their configuration would be
+    // asking them to work around us.
+    //
+    // So the listener follows the interface's table when the marks agree. Its
+    // own connections are pinned to the device and do not consult a table at
+    // all; the rule exists for the traffic that is not ours.
+    if let (Some(policy), Some(s5)) = (mark_route.as_ref(), socks5.as_mut())
+        && s5.mark == policy.mark
+        && s5.table != policy.table
+    {
+        log::info!(
+            "socks5.table {} and interface.route_table {} both steer mark {}; \
+             using {} for both, since one mark cannot use two tables",
+            s5.table,
+            policy.table,
+            policy.mark,
+            policy.table
+        );
+        s5.table = policy.table;
+    }
+
     let want_routes = cfg.interface.route_all;
     let subnet = cfg.tunnel_subnet();
     let egress_choice = cfg
@@ -410,7 +435,12 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 mark: cfg.mark,
                 table: cfg.table,
             };
-            policy.apply(&device)?;
+            // Already installed if `route_marked` asked for the same thing.
+            // Applying it again would revert and reinstate the identical rule,
+            // taking the routes with it for the moment in between.
+            if marked != Some(policy) {
+                policy.apply(&device)?;
+            }
 
             let running = tunnel.running_flag();
             let listener = paqetz_net4::Config {

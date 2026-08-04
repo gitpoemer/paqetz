@@ -47,7 +47,7 @@ const DEVICE_METRIC: u32 = 1;
 const BLACKHOLE_METRIC: u32 = 100;
 
 /// Describes the routing this front end needs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     /// The mark stamped on sockets that should use the tunnel.
     pub mark: u32,
@@ -120,15 +120,20 @@ impl Policy {
 
     /// Removes the rule and route. Safe to call when they are absent.
     pub fn revert(&self, device: &str) {
-        // Deleted repeatedly: an earlier run killed before its cleanup may have
-        // left several copies, and one delete removes one.
+        // Deleted by mark and priority, without naming a table, and repeatedly.
+        //
+        // Repeatedly because an earlier run killed before its cleanup may have
+        // left several copies, and one delete removes one. Without the table
+        // because the table may have changed since: a rule this program wrote
+        // under an earlier configuration is still this program's to remove, and
+        // matching on the current table would walk past it and leave it behind
+        // for ever. `ip rule del` matches on the selectors it is given, so
+        // omitting the table matches whichever one is there.
         while run(&[
             "rule",
             "del",
             "fwmark",
             &self.mark.to_string(),
-            "lookup",
-            &self.table.to_string(),
             "priority",
             &PRIORITY.to_string(),
         ])
@@ -178,6 +183,30 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+
+    #[test]
+    fn reverting_does_not_name_a_table() {
+        // A rule written under an earlier configuration points at a table this
+        // one no longer uses. It is still ours, and matching on the current
+        // table would walk past it and leave it installed for ever -- which is
+        // how a host ends up with two rules for one mark at one priority, the
+        // second unreachable and the first decided by insertion order.
+        let plan = Policy {
+            mark: 0x51,
+            table: 51,
+        }
+        .plan("paqetz0");
+        assert!(plan[0].contains("lookup 51"), "adding still names it");
+
+        // The delete is built in `revert`, which runs `ip` directly, so this
+        // asserts the shape the two must agree on: mark and priority identify a
+        // rule, the table does not.
+        assert!(
+            plan[0].contains("fwmark 81") && plan[0].contains(&format!("priority {PRIORITY}")),
+            "got: {}",
+            plan[0]
+        );
+    }
 
     #[test]
     fn the_plan_names_the_mark_the_table_and_the_device() {
