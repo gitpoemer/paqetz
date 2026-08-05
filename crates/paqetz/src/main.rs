@@ -388,7 +388,7 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // resets the flow. Installing them here means one less way for a setup to
     // fail silently.
     let fw = if manage_firewall {
-        match Firewall::detect(port) {
+        match Firewall::detect(&[port]) {
             Ok(fw) => {
                 fw.apply()?;
                 Some(fw)
@@ -893,15 +893,15 @@ fn firewall(
     // `plan` must work on a host with neither tool installed — printing what to
     // run by hand is exactly what it is for.
     if matches!(action, FirewallAction::Plan) {
-        let fw = Firewall::detect(port)
-            .unwrap_or_else(|_| Firewall::with_backend(paqetz_fw::Backend::Nft, port));
+        let fw = Firewall::detect(&[port])
+            .unwrap_or_else(|_| Firewall::with_backend(paqetz_fw::Backend::Nft, &[port]));
         for line in fw.plan() {
             println!("{line}");
         }
         return Ok(());
     }
 
-    let fw = Firewall::detect(port)?;
+    let fw = Firewall::detect(&[port])?;
     match action {
         FirewallAction::Plan => unreachable!("handled above"),
         FirewallAction::Apply => fw.apply()?,
