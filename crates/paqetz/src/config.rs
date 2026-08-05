@@ -108,17 +108,19 @@ pub(crate) struct Interface {
     pub(crate) transmit: TransmitPath,
     /// Whether to answer a quiet peer with an empty packet.
     ///
-    /// WireGuard's passive keepalive, and off unless asked for. It holds a NAT
-    /// mapping open and lets each end judge whether the other is still there —
-    /// but it also emits a fixed-size packet on a fixed interval, which is a
-    /// metronome on a carrier whose whole purpose is to be unremarkable.
+    /// WireGuard's passive keepalive, and on by default because a silent tunnel
+    /// goes cold: measured on a live path, the first two seconds of traffic
+    /// after any idle period were lost to a mapping that had lapsed, while every
+    /// packet under load arrived. It costs a fixed-size packet every ten
+    /// seconds, which is a metronome — a real trade, and the wrong side of it is
+    /// losing the first click after a pause.
     pub(crate) keepalive: bool,
     /// Whether the carrier moves between outer ports while it runs.
     ///
-    /// Off unless asked for. A five-tuple that lives for hours accumulates
-    /// attention on some paths, and moving sheds it; but it is a change of
-    /// behaviour under load, and one worth turning on deliberately rather than
-    /// discovering.
+    /// On by default. A five-tuple that lives for hours and carries gigabytes
+    /// gets classified and then shaped: throughput collapses with no loss at
+    /// all, and a restart cures it, because a restart is a new five-tuple.
+    /// Moving on a timer is the same cure without the outage.
     pub(crate) rotate: bool,
 }
 
@@ -783,10 +785,11 @@ impl Config {
                 sequencing,
                 datapath,
                 transmit,
-                // Both off unless asked for: each changes what the carrier puts
-                // on the wire, and neither should arrive with an upgrade.
-                keepalive: iface.keepalive.unwrap_or(false),
-                rotate: iface.rotate.unwrap_or(false),
+                // Both on unless declined. Each was measured on a live path
+                // before being made the default, and each is one line to turn
+                // off for a path that does not want it.
+                keepalive: iface.keepalive.unwrap_or(true),
+                rotate: iface.rotate.unwrap_or(true),
                 gateway: iface.gateway.unwrap_or(false),
                 route_all: iface.route_all.unwrap_or(false),
                 route_marked: match iface.route_marked {
@@ -1369,16 +1372,34 @@ tunnel_address = "10.7.0.2"
     }
 
     #[test]
-    fn the_keepalive_and_rotation_are_off_unless_asked_for() {
-        // Both change what the carrier puts on the wire -- one adds a
-        // fixed-size packet on a fixed interval, the other moves the five-tuple
-        // under load -- so neither should arrive with an upgrade.
+    fn the_keepalive_and_rotation_are_on_unless_declined() {
+        // A silent tunnel goes cold -- the first two seconds after an idle
+        // period were lost on a live path -- and a five-tuple that never moves
+        // gets classified and shaped. Both defaults were measured before being
+        // chosen.
         let c = Config::parse(CLIENT)
             .expect("parse")
             .into_only()
             .expect("one tunnel");
-        assert!(!c.interface.keepalive);
-        assert!(!c.interface.rotate);
+        assert!(c.interface.keepalive);
+        assert!(c.interface.rotate);
+    }
+
+    #[test]
+    fn the_keepalive_and_rotation_can_be_turned_off() {
+        for (line, keepalive) in [("keepalive = false", true), ("rotate = false", false)] {
+            let text = CLIENT.replace("[peer]", &format!("{line}\n\n[peer]"));
+            let c = Config::parse(&text)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel");
+            let off = if keepalive {
+                c.interface.keepalive
+            } else {
+                c.interface.rotate
+            };
+            assert!(!off, "{line} should have taken effect");
+        }
     }
 
     #[test]

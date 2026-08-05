@@ -346,28 +346,31 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
-### Two things that are off unless you ask
+### Two things you can turn off
 
-Both change what the carrier puts on the wire, so neither is on by default.
+Both are on by default, and both were measured on a live path before being made
+the default.
 
 ```toml
 # under [tunnel.interface]
-keepalive = true    # answer a quiet peer with an empty packet, every 10s
-rotate    = true    # move the carrier between outer ports every ~30 minutes
+keepalive = false   # stop answering a quiet peer with an empty packet
+rotate    = false   # keep one outer port for the life of the process
 ```
 
-`keepalive` is WireGuard's passive keepalive. It holds a NAT mapping open and
-lets each end judge whether the other is still there — but it emits a
-fixed-size packet on a fixed interval, which is a metronome on a carrier whose
-whole purpose is to be unremarkable.
+`keepalive` is WireGuard's passive keepalive: an empty packet every ten seconds
+when the peer has spoken and this end has not. Without it a silent tunnel goes
+cold — on a live path, **the first two seconds of traffic after any idle period
+were lost** to a mapping that had lapsed, while every packet under load arrived.
+It costs a fixed-size packet on a fixed interval, which is a metronome, and that
+is a real trade; losing the first click after a pause is the worse side of it.
 
 `rotate` gives the carrier several outer ports at start-up and moves between
-them. A five-tuple that lives for hours and carries gigabytes accumulates
-attention on some paths, and moving sheds it. It is a change of behaviour under
-load, and worth turning on deliberately rather than discovering.
+them every half hour or so. A five-tuple that lives for hours and carries
+gigabytes gets classified and then shaped: throughput collapses **with no packet
+loss at all**, latency climbs, and a restart cures it — because a restart is a
+new five-tuple. Moving on a timer is the same cure without the outage.
 
-Neither is needed for a tunnel to work. Turn them on to solve a problem you have
-measured, not in advance.
+Turn either off if your path does not want it.
 
 ### IPv4 only
 
