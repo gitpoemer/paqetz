@@ -404,8 +404,8 @@ keepalive = false   # stop answering a quiet peer with an empty packet
 rotate    = false   # keep one outer port for the life of the process
 ```
 
-`keepalive` is WireGuard's passive keepalive: an empty packet every ten seconds
-when the peer has spoken and this end has not. Without it a silent tunnel goes
+`keepalive` is WireGuard's passive keepalive: one empty packet when the peer has
+spoken and this end has not, at most once per thing the peer says. Without it a silent tunnel goes
 cold — on a live path, **the first two seconds of traffic after any idle period
 were lost** to a mapping that had lapsed, while every packet under load arrived.
 It costs a fixed-size packet on a fixed interval, which is a metronome, and that

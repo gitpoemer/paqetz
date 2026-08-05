@@ -119,6 +119,21 @@ fn next_port(ports: &[u16], current: u16) -> u16 {
 struct PeerState {
     /// The established session, once there is one.
     session: Option<Session>,
+    /// A session this end has accepted but the peer has not yet used.
+    ///
+    /// Only the responder fills this. A responder answers any handshake that
+    /// authenticates, and a replayed initiation authenticates perfectly well --
+    /// it was genuine when it was recorded. Installing that session as the one
+    /// to seal under would hand anyone who once captured an initiation a way to
+    /// black out the tunnel at will: the peer never negotiated those keys and
+    /// cannot open anything sealed under them, so traffic stops until a liveness
+    /// timer notices, and the same packet replayed again stops it again.
+    ///
+    /// So an accepted session waits here until a transport packet arrives under
+    /// it. That is proof the peer holds it, and it is proof a replay cannot
+    /// manufacture. Until then the established session keeps carrying traffic
+    /// and a replay changes nothing an observer can see.
+    next: Option<Session>,
     /// The session this one replaced, kept until it expires on its own.
     ///
     /// The two ends do not change session at the same instant, and cannot: a
@@ -141,6 +156,14 @@ struct PeerState {
     endpoint: Option<SocketAddrV4>,
     /// When the last handshake was sent.
     last_handshake: Millis,
+    /// When the handshake just sent may be repeated.
+    ///
+    /// Stored rather than recomputed, because the interval is jittered: drawing
+    /// it afresh on every tick is a new coin flip each time rather than one
+    /// deadline, and the earliest of many draws wins -- which collapses the
+    /// interval back onto its own lower bound and cancels the decorrelation the
+    /// jitter exists to provide.
+    retry_at: Millis,
     /// When the first handshake of the current attempt was sent.
     ///
     /// Separate from `last_handshake` so that giving up is measured from when
@@ -152,6 +175,21 @@ struct PeerState {
     last_receive: Option<Millis>,
     /// When we last sent something under the current session.
     last_send: Option<Millis>,
+    /// When the last keepalive went out.
+    ///
+    /// Separate from `last_send`, which only real data may set: a keepalive has
+    /// to count as having spoken for the *keepalive* timer, or the timer never
+    /// stops firing, but it must not count for the *liveness* timer, or an idle
+    /// tunnel asks a question nobody can answer and reads the silence as death.
+    last_keepalive: Option<Millis>,
+    /// Whether a handshake has completed with nothing sent under it yet.
+    ///
+    /// The responder will not seal under a session until it has seen the peer
+    /// use it, so the initiator owes it one packet. Without that, an idle
+    /// tunnel leaves the responder on the old session until that session
+    /// expires, and a responder that then needs to speak first has nothing to
+    /// speak with.
+    confirm_owed: bool,
     /// When the carrier should move to the next port.
     rotate_at: Millis,
     /// When a packet carrying actual data last arrived.
@@ -166,22 +204,49 @@ impl PeerState {
     const fn new(endpoint: Option<SocketAddrV4>) -> Self {
         Self {
             session: None,
+            next: None,
             previous: None,
             pending: None,
             carrier: None,
             endpoint,
             last_handshake: 0,
+            retry_at: 0,
             attempt_started: None,
             last_receive: None,
             last_send: None,
+            last_keepalive: None,
+            confirm_owed: false,
             last_data_receive: None,
             rotate_at: Millis::MAX,
         }
     }
 
     /// Makes `session` the one to seal under, keeping the old one for reading.
+    ///
+    /// For the initiating side, which asked for this session and therefore
+    /// knows the peer holds it: the handshake reply is itself the proof.
     fn install(&mut self, session: Session) {
         self.previous = self.session.replace(session);
+        // A session that arrives by rekey supersedes anything still waiting to
+        // be confirmed; keeping it would be a third set of keys nobody has used.
+        self.next = None;
+        self.confirm_owed = true;
+    }
+
+    /// Accepts `session` without sealing under it yet.
+    ///
+    /// For the responding side, which has only the peer's word -- and a replay
+    /// carries the peer's word just as convincingly as the peer does. See
+    /// [`Self::next`].
+    fn accept(&mut self, session: Session) {
+        self.next = Some(session);
+    }
+
+    /// Promotes the waiting session, now that the peer has used it.
+    fn confirm(&mut self) {
+        if let Some(session) = self.next.take() {
+            self.previous = self.session.replace(session);
+        }
     }
 
     /// Decrypts under whichever session the packet belongs to.
@@ -200,14 +265,31 @@ impl PeerState {
         out: &mut [u8],
         now: Millis,
     ) -> Option<paqetz_core::Result<usize>> {
-        let current = self.session.as_mut()?.open(packet, out, now);
-        if matches!(current, Err(paqetz_core::Error::Rejected)) {
-            // Not ours: either the session that just went, or noise on the wire.
-            if let Some(previous) = self.previous.as_mut() {
-                return Some(previous.open(packet, out, now));
+        let mut tried = None;
+        if let Some(current) = self.session.as_mut() {
+            match current.open(packet, out, now) {
+                // Not ours: try the others before calling it noise.
+                Err(paqetz_core::Error::Rejected) => tried = Some(paqetz_core::Error::Rejected),
+                result => return Some(result),
             }
         }
-        Some(current)
+        if let Some(previous) = self.previous.as_mut() {
+            match previous.open(packet, out, now) {
+                Err(paqetz_core::Error::Rejected) => tried = Some(paqetz_core::Error::Rejected),
+                result => return Some(result),
+            }
+        }
+        if let Some(waiting) = self.next.as_mut() {
+            let result = waiting.open(packet, out, now);
+            // The peer has used the session it was offered, which no replay of
+            // an old handshake can do. Only now does it become the one to seal
+            // under.
+            if result.is_ok() {
+                self.confirm();
+            }
+            return Some(result);
+        }
+        tried.map(Err)
     }
 
     /// Records that a handshake just completed.
@@ -220,6 +302,7 @@ impl PeerState {
     fn established(&mut self, now: Millis) {
         self.last_receive = Some(now);
         self.last_send = None;
+        self.last_keepalive = None;
         self.last_data_receive = None;
         self.attempt_started = None;
     }
@@ -235,7 +318,14 @@ impl PeerState {
         let Some(heard) = self.last_data_receive else {
             return false;
         };
-        self.last_send.unwrap_or(0) < heard && now.saturating_sub(heard) >= KEEPALIVE_TIMEOUT
+        // Either kind of packet counts as having spoken. Counting only data
+        // meant a keepalive never satisfied the condition that produced it, so
+        // once this went true it stayed true and the tunnel emitted one every
+        // tick -- four a second, indefinitely, until the peer happened to send
+        // data again. That is the metronome this feature is supposed to be a
+        // measured version of.
+        let spoke = self.last_send.max(self.last_keepalive).unwrap_or(0);
+        spoke < heard && now.saturating_sub(heard) >= KEEPALIVE_TIMEOUT
     }
 
     /// Whether the peer has stopped answering a session we are still using.
@@ -1074,7 +1164,7 @@ impl Tunnel {
         let written = carrier.data(&msg2, reply, now)?;
         let dst = seg.src.0;
 
-        state.install(session);
+        state.accept(session);
         state.pending = None;
         state.established(now);
         state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
@@ -1346,18 +1436,29 @@ impl Tunnel {
     /// thing it needs to -- that this end is still here and still holds the
     /// session.
     fn maybe_keepalive(&self, sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
-        if !self.cfg.interface.keepalive {
-            return Ok(());
-        }
         let now = self.now();
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.session.is_none() || !state.owes_keepalive(now) {
+            if state.session.is_none() {
+                return Ok(());
+            }
+            // The confirmation is owed regardless of the keepalive setting: it
+            // is one packet per handshake, and without it a tunnel that turned
+            // keepalives off can leave the responder holding a session it is
+            // not allowed to use and an old one it can no longer use.
+            let owed =
+                state.confirm_owed || (self.cfg.interface.keepalive && state.owes_keepalive(now));
+            if !owed {
                 return Ok(());
             }
         }
         debug!("keepalive");
-        self.send_inner(&[], sealed, frame)
+        self.send_inner(&[], sealed, frame)?;
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.confirm_owed = false;
+        state.last_keepalive = Some(now);
+        Ok(())
     }
 
     /// How long to wait before repeating a handshake, jittered.
@@ -1377,7 +1478,7 @@ impl Tunnel {
 
         // A repeat waits a jittered interval; a first attempt does not wait at
         // all, so a tunnel with something to send starts talking immediately.
-        let waited = now.saturating_sub(state.last_handshake) >= Self::rekey_interval();
+        let waited = now >= state.retry_at;
 
         // Giving up is measured from when trying started. Past that the peer is
         // not briefly unreachable, it is gone, and the attempt stops until there
@@ -1455,6 +1556,7 @@ impl Tunnel {
 
         state.pending = Some(initiator);
         state.last_handshake = now;
+        state.retry_at = now.saturating_add(Self::rekey_interval());
         state.attempt_started.get_or_insert(now);
         drop(state);
 
@@ -1769,6 +1871,140 @@ mod tests {
                 .expect("and the new session still reads its own"),
             b"after".len(),
             "and the new session still reads its own"
+        );
+    }
+
+    #[test]
+    fn a_responder_does_not_seal_under_a_session_the_peer_has_not_used() {
+        // A replayed handshake authenticates perfectly -- it was genuine when it
+        // was recorded -- so a responder that installed every session it
+        // accepted would hand anyone who once captured an initiation a way to
+        // black out the tunnel on demand: the peer never negotiated those keys
+        // and cannot read anything sealed under them.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+
+        let (mut live_peer, live) = session_pair(&client, &server, 60);
+        let (_, replayed) = session_pair(&client, &server, 70);
+
+        let mut state = PeerState::new(None);
+        state.install(live);
+        let established = state.session.as_ref().expect("a session").local_index();
+
+        // The replay lands. It must change nothing about what goes out.
+        state.accept(replayed);
+        assert_eq!(
+            state.session.as_ref().expect("a session").local_index(),
+            established,
+            "an accepted session is not the one to seal under"
+        );
+
+        // And the real peer is still heard, on the session it actually holds.
+        let mut wire = [0u8; 256];
+        let mut inner = [0u8; 256];
+        let n = live_peer.seal(b"still here", &mut wire, 0).expect("seal");
+        assert_eq!(
+            state
+                .open(wire.get(..n).expect("sealed"), &mut inner, 0)
+                .expect("a session")
+                .expect("still here"),
+            b"still here".len()
+        );
+        assert_eq!(
+            state.session.as_ref().expect("a session").local_index(),
+            established,
+            "and traffic on the live session does not promote the waiting one"
+        );
+    }
+
+    #[test]
+    fn using_an_accepted_session_is_what_promotes_it() {
+        // The peer using the session is proof it holds the keys, which is
+        // exactly what a replay of an old handshake cannot manufacture.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+
+        let (_, old) = session_pair(&client, &server, 80);
+        let (mut peer, fresh) = session_pair(&client, &server, 90);
+
+        let mut state = PeerState::new(None);
+        state.install(old);
+        state.accept(fresh);
+        let waiting = state.next.as_ref().expect("waiting").local_index();
+
+        let mut wire = [0u8; 256];
+        let mut inner = [0u8; 256];
+        let n = peer.seal(b"using it", &mut wire, 0).expect("seal");
+        assert_eq!(
+            state
+                .open(wire.get(..n).expect("sealed"), &mut inner, 0)
+                .expect("a session")
+                .expect("using it"),
+            b"using it".len()
+        );
+        assert_eq!(
+            state.session.as_ref().expect("a session").local_index(),
+            waiting,
+            "the peer used it, so it is now the one to seal under"
+        );
+        assert!(state.next.is_none(), "and nothing is left waiting");
+    }
+
+    #[test]
+    fn a_keepalive_satisfies_the_timer_that_produced_it() {
+        // It did not, once: only data counted as having spoken, so the
+        // condition survived the packet it emitted and fired again on the next
+        // tick -- four empty packets a second for as long as the peer stayed
+        // quiet.
+        let mut s = PeerState::new(None);
+        s.last_data_receive = Some(1_000);
+        assert!(!s.owes_keepalive(1_000), "not yet");
+        assert!(
+            s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT),
+            "the peer spoke"
+        );
+
+        s.last_keepalive = Some(1_000 + KEEPALIVE_TIMEOUT);
+        assert!(
+            !s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT),
+            "answered once, and once is the whole point"
+        );
+        assert!(
+            !s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT * 10),
+            "and it stays answered until the peer speaks again"
+        );
+
+        s.last_data_receive = Some(2_000 + KEEPALIVE_TIMEOUT * 10);
+        assert!(s.owes_keepalive(2_000 + KEEPALIVE_TIMEOUT * 11), "it spoke");
+    }
+
+    #[test]
+    fn a_keepalive_still_does_not_make_the_peer_look_alive() {
+        // The other half of the same distinction: answering a peer is not
+        // evidence the peer answered us, and conflating the two is what made an
+        // idle tunnel handshake itself to death.
+        let mut s = PeerState::new(None);
+        s.last_keepalive = Some(1_000);
+        assert!(
+            !s.presumed_dead(1_000 + PRESUMED_DEAD * 10),
+            "a keepalive asks nothing, so silence after one proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_initiator_owes_one_packet_after_a_handshake() {
+        // Which is what lets the responder promote. Without it an idle tunnel
+        // leaves the responder on a session that eventually expires.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (session, _) = session_pair(&client, &server, 100);
+
+        let mut s = PeerState::new(None);
+        assert!(!s.confirm_owed, "nothing has happened yet");
+        s.install(session);
+        assert!(
+            s.confirm_owed,
+            "a handshake completed and nothing has used it"
         );
     }
 
