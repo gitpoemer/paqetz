@@ -346,6 +346,29 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+### Two things that are off unless you ask
+
+Both change what the carrier puts on the wire, so neither is on by default.
+
+```toml
+# under [tunnel.interface]
+keepalive = true    # answer a quiet peer with an empty packet, every 10s
+rotate    = true    # move the carrier between outer ports every ~30 minutes
+```
+
+`keepalive` is WireGuard's passive keepalive. It holds a NAT mapping open and
+lets each end judge whether the other is still there — but it emits a
+fixed-size packet on a fixed interval, which is a metronome on a carrier whose
+whole purpose is to be unremarkable.
+
+`rotate` gives the carrier several outer ports at start-up and moves between
+them. A five-tuple that lives for hours and carries gigabytes accumulates
+attention on some paths, and moving sheds it. It is a change of behaviour under
+load, and worth turning on deliberately rather than discovering.
+
+Neither is needed for a tunnel to work. Turn them on to solve a problem you have
+measured, not in advance.
+
 ### IPv4 only
 
 The tunnel carries IPv4. A destination reachable only over IPv6 is refused

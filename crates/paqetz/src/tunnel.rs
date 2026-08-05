@@ -1223,6 +1223,9 @@ impl Tunnel {
     /// capture filter already accepts every port in the pool, so replies still
     /// arriving for the one just left are received as normal.
     fn maybe_rotate(&self) {
+        if !self.cfg.interface.rotate {
+            return;
+        }
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.session.is_none() {
@@ -1297,6 +1300,9 @@ impl Tunnel {
     /// thing it needs to -- that this end is still here and still holds the
     /// session.
     fn maybe_keepalive(&self, sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
+        if !self.cfg.interface.keepalive {
+            return Ok(());
+        }
         let now = self.now();
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());

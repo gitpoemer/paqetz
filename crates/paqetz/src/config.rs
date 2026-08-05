@@ -106,6 +106,20 @@ pub(crate) struct Interface {
     pub(crate) datapath: Datapath,
     /// Which transmit path to use.
     pub(crate) transmit: TransmitPath,
+    /// Whether to answer a quiet peer with an empty packet.
+    ///
+    /// WireGuard's passive keepalive, and off unless asked for. It holds a NAT
+    /// mapping open and lets each end judge whether the other is still there —
+    /// but it also emits a fixed-size packet on a fixed interval, which is a
+    /// metronome on a carrier whose whole purpose is to be unremarkable.
+    pub(crate) keepalive: bool,
+    /// Whether the carrier moves between outer ports while it runs.
+    ///
+    /// Off unless asked for. A five-tuple that lives for hours accumulates
+    /// attention on some paths, and moving sheds it; but it is a change of
+    /// behaviour under load, and one worth turning on deliberately rather than
+    /// discovering.
+    pub(crate) rotate: bool,
 }
 
 /// The SOCKS5 debugging front end.
@@ -379,6 +393,10 @@ struct RawInterface {
     datapath: Option<String>,
     #[serde(default)]
     transmit: Option<String>,
+    #[serde(default)]
+    keepalive: Option<bool>,
+    #[serde(default)]
+    rotate: Option<bool>,
     #[serde(default)]
     log: Option<String>,
     #[serde(default)]
@@ -765,6 +783,10 @@ impl Config {
                 sequencing,
                 datapath,
                 transmit,
+                // Both off unless asked for: each changes what the carrier puts
+                // on the wire, and neither should arrive with an upgrade.
+                keepalive: iface.keepalive.unwrap_or(false),
+                rotate: iface.rotate.unwrap_or(false),
                 gateway: iface.gateway.unwrap_or(false),
                 route_all: iface.route_all.unwrap_or(false),
                 route_marked: match iface.route_marked {
@@ -1344,6 +1366,36 @@ tunnel_address = "10.7.0.2"
         let msg = err.to_string();
         assert!(msg.contains("linux-6"), "should list what is valid: {msg}");
         assert!(msg.contains("windows-11"), "got: {msg}");
+    }
+
+    #[test]
+    fn the_keepalive_and_rotation_are_off_unless_asked_for() {
+        // Both change what the carrier puts on the wire -- one adds a
+        // fixed-size packet on a fixed interval, the other moves the five-tuple
+        // under load -- so neither should arrive with an upgrade.
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert!(!c.interface.keepalive);
+        assert!(!c.interface.rotate);
+    }
+
+    #[test]
+    fn the_keepalive_and_rotation_can_be_turned_on() {
+        for (line, get) in [("keepalive = true", true), ("rotate = true", false)] {
+            let text = CLIENT.replace("[peer]", &format!("{line}\n\n[peer]"));
+            let c = Config::parse(&text)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel");
+            let on = if get {
+                c.interface.keepalive
+            } else {
+                c.interface.rotate
+            };
+            assert!(on, "{line} should have taken effect");
+        }
     }
 
     #[test]
