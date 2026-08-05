@@ -119,6 +119,20 @@ fn next_port(ports: &[u16], current: u16) -> u16 {
 struct PeerState {
     /// The established session, once there is one.
     session: Option<Session>,
+    /// The session this one replaced, kept until it expires on its own.
+    ///
+    /// The two ends do not change session at the same instant, and cannot: a
+    /// rekey is a handshake, so there is a round trip between one end
+    /// installing the new keys and the other learning of them. Whichever end
+    /// moves first spends that round trip receiving packets sealed under keys
+    /// it has already discarded, and with one slot those packets are simply
+    /// lost -- twice a minute, for ever, on a tunnel that is otherwise
+    /// perfectly healthy.
+    ///
+    /// So the old session is kept for reading. It is never sealed under again;
+    /// `open` refuses it past `REJECT_AFTER_TIME` on its own, and the next
+    /// rekey drops it.
+    previous: Option<Session>,
     /// A handshake we have sent and are awaiting a reply to.
     pending: Option<Initiator>,
     /// The synthetic TCP conversation with this peer.
@@ -152,6 +166,7 @@ impl PeerState {
     const fn new(endpoint: Option<SocketAddrV4>) -> Self {
         Self {
             session: None,
+            previous: None,
             pending: None,
             carrier: None,
             endpoint,
@@ -162,6 +177,37 @@ impl PeerState {
             last_data_receive: None,
             rotate_at: Millis::MAX,
         }
+    }
+
+    /// Makes `session` the one to seal under, keeping the old one for reading.
+    fn install(&mut self, session: Session) {
+        self.previous = self.session.replace(session);
+    }
+
+    /// Decrypts under whichever session the packet belongs to.
+    ///
+    /// The current one first, because all but a round trip's worth of traffic
+    /// belongs to it. `open` compares the session index before it attempts the
+    /// AEAD and touches nothing when it does not match, so trying a second
+    /// session costs one comparison and cannot corrupt the replay window of the
+    /// first.
+    ///
+    /// `None` means there is no session at all; anything else is the result of
+    /// the session the packet was addressed to.
+    fn open(
+        &mut self,
+        packet: &[u8],
+        out: &mut [u8],
+        now: Millis,
+    ) -> Option<paqetz_core::Result<usize>> {
+        let current = self.session.as_mut()?.open(packet, out, now);
+        if matches!(current, Err(paqetz_core::Error::Rejected)) {
+            // Not ours: either the session that just went, or noise on the wire.
+            if let Some(previous) = self.previous.as_mut() {
+                return Some(previous.open(packet, out, now));
+            }
+        }
+        Some(current)
     }
 
     /// Records that a handshake just completed.
@@ -1028,7 +1074,7 @@ impl Tunnel {
         let written = carrier.data(&msg2, reply, now)?;
         let dst = seg.src.0;
 
-        state.session = Some(session);
+        state.install(session);
         state.pending = None;
         state.established(now);
         state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
@@ -1061,7 +1107,7 @@ impl Tunnel {
                 if let Some(carrier) = state.carrier.as_mut() {
                     carrier.on_receive(seg);
                 }
-                state.session = Some(session);
+                state.install(session);
                 state.established(now);
                 drop(state);
                 self.stats.note_handshake(now);
@@ -1086,10 +1132,10 @@ impl Tunnel {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-        let Some(session) = state.session.as_mut() else {
+        let Some(opened) = state.open(seg.payload, inner, now) else {
             return Ok(());
         };
-        let n = session.open(seg.payload, inner, now)?;
+        let n = opened?;
 
         // Authenticated, so the endpoint is trustworthy. Roaming (D5): the peer
         // may have moved, and following it here is what makes a NAT rebinding
@@ -1645,6 +1691,121 @@ mod tests {
         s.established(0);
         s.last_send = Some(1_000);
         assert!(s.presumed_dead(1_000 + PRESUMED_DEAD));
+    }
+
+    /// One complete handshake, returning the two ends of the same session.
+    ///
+    /// `index` keeps successive sessions distinguishable, which is the whole
+    /// point of the test below: a packet has to be routed to the session it was
+    /// sealed under, and the index is what says which that is.
+    fn session_pair(
+        client: &paqetz_core::KeyPair,
+        server: &paqetz_core::KeyPair,
+        index: u32,
+    ) -> (Session, Session) {
+        let (initiator, msg1) = Initiator::start(
+            &client.private,
+            &client.public,
+            &server.public,
+            index,
+            index,
+        )
+        .expect("start");
+        let pending = PendingResponder::read(&server.private, &server.public, &msg1).expect("read");
+        let (server_side, msg2) = pending.accept(index + 1, 0).expect("accept");
+        let client_side = initiator.finish(&msg2, 0).expect("finish");
+        (client_side, server_side)
+    }
+
+    #[test]
+    fn a_rekey_does_not_lose_what_was_already_in_flight() {
+        // The two ends cannot change session in the same instant: a rekey is a
+        // handshake, so there is a round trip between one end installing the new
+        // keys and the other hearing about it. Everything the peer sends in that
+        // window is sealed under the session this end has just replaced. With
+        // one slot it was all dropped -- a burst of loss twice a minute, on a
+        // tunnel with nothing else wrong with it.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+
+        let (old_client, mut old_server) = session_pair(&client, &server, 10);
+        let (new_client, mut new_server) = session_pair(&client, &server, 20);
+
+        let mut state = PeerState::new(None);
+        state.install(old_client);
+
+        let mut wire = [0u8; 256];
+        let mut inner = [0u8; 256];
+
+        let n = old_server.seal(b"before", &mut wire, 0).expect("seal");
+        assert_eq!(
+            state
+                .open(&wire[..n], &mut inner, 0)
+                .expect("a session")
+                .expect("the current session reads its own traffic"),
+            b"before".len(),
+            "the current session reads its own traffic"
+        );
+
+        // The rekey lands, and the peer has not yet noticed.
+        state.install(new_client);
+
+        let n = old_server.seal(b"in flight", &mut wire, 0).expect("seal");
+        assert_eq!(
+            state
+                .open(&wire[..n], &mut inner, 0)
+                .expect("a session")
+                .expect("a packet sealed under the session just replaced is still readable"),
+            b"in flight".len(),
+            "a packet sealed under the session just replaced is still readable"
+        );
+        assert_eq!(&inner[..b"in flight".len()], b"in flight");
+
+        let n = new_server.seal(b"after", &mut wire, 0).expect("seal");
+        assert_eq!(
+            state
+                .open(&wire[..n], &mut inner, 0)
+                .expect("a session")
+                .expect("and the new session still reads its own"),
+            b"after".len(),
+            "and the new session still reads its own"
+        );
+    }
+
+    #[test]
+    fn only_the_session_before_this_one_is_kept() {
+        // Two rekeys, and the first session is gone. Keeping every session a
+        // tunnel ever had would be an unbounded set of live keys, which is a
+        // worse problem than the one being solved.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+
+        let (first, mut first_server) = session_pair(&client, &server, 30);
+        let (second, _) = session_pair(&client, &server, 40);
+        let (third, _) = session_pair(&client, &server, 50);
+
+        let mut state = PeerState::new(None);
+        state.install(first);
+        state.install(second);
+        state.install(third);
+
+        let mut wire = [0u8; 256];
+        let mut inner = [0u8; 256];
+        let n = first_server.seal(b"stale", &mut wire, 0).expect("seal");
+        assert!(
+            matches!(
+                state.open(&wire[..n], &mut inner, 0),
+                Some(Err(paqetz_core::Error::Rejected))
+            ),
+            "two rekeys back is not kept"
+        );
+    }
+
+    #[test]
+    fn nothing_opens_before_there_is_a_session() {
+        let mut state = PeerState::new(None);
+        let mut inner = [0u8; 64];
+        assert!(state.open(&[0u8; 32], &mut inner, 0).is_none());
     }
 
     #[test]
