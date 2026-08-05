@@ -24,6 +24,13 @@ use std::path::Path;
 
 use paqetz_core::KeyPair;
 
+/// What a generated tunnel is called.
+///
+/// The device name, which is what `config migrate` names a converted file after
+/// too — so a file written by `setup` and one converted from the original form
+/// come out identical rather than differing by a label nobody chose.
+const DEFAULT_NAME: &str = "paqetz0";
+
 /// Everything the two configuration files are generated from.
 #[derive(Debug, Clone)]
 pub(crate) struct Plan {
@@ -117,7 +124,12 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         "# paqetz — SERVER. This file belongs on the host with the"
     )?;
     writeln!(s, "# stable address, the one the client connects to.\n")?;
-    writeln!(s, "[interface]")?;
+    // The form that can hold several tunnels, written even for one. A file that
+    // grows a second destination later should not have to change shape first,
+    // and one shape means one thing for everyone to learn.
+    writeln!(s, "[[tunnel]]")?;
+    writeln!(s, "name = {DEFAULT_NAME:?}\n")?;
+    writeln!(s, "[tunnel.interface]")?;
     writeln!(s, "private_key = \"{}\"", server.private.to_base64())?;
     writeln!(s, "address = \"{}/{}\"", plan.server_inner, plan.prefix)?;
     writeln!(s, "listen_port = {}", plan.port)?;
@@ -136,7 +148,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(s, "# Bringing it up is not paqetz's job.")?;
         writeln!(s, "egress = \"{iface}\"")?;
     }
-    writeln!(s, "\n[peer]")?;
+    writeln!(s, "\n[tunnel.peer]")?;
     writeln!(s, "# The client's public key.")?;
     writeln!(s, "public_key = \"{}\"", client.public.to_base64())?;
     writeln!(s, "tunnel_address = \"{}\"", plan.client_inner)?;
@@ -144,7 +156,9 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     let mut c = String::new();
     writeln!(c, "# paqetz — CLIENT. This file belongs on the host that")?;
     writeln!(c, "# connects out.\n")?;
-    writeln!(c, "[interface]")?;
+    writeln!(c, "[[tunnel]]")?;
+    writeln!(c, "name = {DEFAULT_NAME:?}\n")?;
+    writeln!(c, "[tunnel.interface]")?;
     writeln!(c, "private_key = \"{}\"", client.private.to_base64())?;
     writeln!(c, "address = \"{}/{}\"", plan.client_inner, plan.prefix)?;
     if plan.route_all {
@@ -153,7 +167,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(c, "# turning this on does not cut the connection.")?;
         writeln!(c, "route_all = true")?;
     }
-    writeln!(c, "\n[peer]")?;
+    writeln!(c, "\n[tunnel.peer]")?;
     writeln!(c, "# The server's public key.")?;
     writeln!(c, "public_key = \"{}\"", server.public.to_base64())?;
     writeln!(c, "endpoint = \"{}\"", plan.endpoint)?;
@@ -181,7 +195,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     if let Some(listen) = plan.socks5.as_ref() {
         writeln!(c, "\n# A SOCKS5 listener, for pointing one program at the")?;
         writeln!(c, "# tunnel without routing the whole host through it.")?;
-        writeln!(c, "[socks5]")?;
+        writeln!(c, "[tunnel.socks5]")?;
         writeln!(c, "listen = \"{listen}\"")?;
         writeln!(
             c,
@@ -995,6 +1009,44 @@ mod tests {
             .into_only()
             .expect("one tunnel");
         assert_eq!(client.socks5.expect("socks5").listen.port(), 1080);
+    }
+
+    #[test]
+    fn what_is_generated_is_the_form_we_keep() {
+        // One shape for everyone to learn, and a file that grows a second
+        // destination later does not have to change shape first.
+        let pair = render(&plan()).expect("render");
+        for (which, text) in [("server", &pair.server), ("client", &pair.client)] {
+            assert!(text.contains("[[tunnel]]"), "{which}: {text}");
+            assert!(text.contains("[tunnel.interface]"), "{which}: {text}");
+            assert!(text.contains("[tunnel.peer]"), "{which}: {text}");
+            assert!(!text.contains("\n[interface]"), "{which}: {text}");
+            assert!(!text.contains("\n[peer]"), "{which}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_generated_file_and_a_migrated_one_agree() {
+        // `config migrate` names a converted tunnel after its device, and this
+        // names a generated one the same, so the two routes to a file do not
+        // differ by a label nobody chose.
+        let pair = render(&plan()).expect("render");
+        let c = crate::config::Config::parse(&pair.client).expect("parse");
+        let t = c.tunnels.first().expect("one tunnel");
+        assert_eq!(c.tunnels.len(), 1);
+        assert_eq!(t.name, DEFAULT_NAME);
+        assert_eq!(t.interface.device, DEFAULT_NAME);
+    }
+
+    #[test]
+    fn a_socks5_listener_lands_inside_the_tunnel() {
+        let pair = render(&Plan {
+            socks5: Some("127.0.0.1:1080".to_owned()),
+            ..plan()
+        })
+        .expect("render");
+        assert!(pair.client.contains("[tunnel.socks5]"), "{}", pair.client);
+        assert!(!pair.client.contains("\n[socks5]"), "{}", pair.client);
     }
 
     #[test]

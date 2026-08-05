@@ -106,7 +106,7 @@ connections keep the host's ordinary route, which is what `route_all` cannot
 express: that would capture the replies to Xray's own users and break them.
 
 ```toml
-# client, under [interface]
+# client, under [tunnel.interface]
 route_marked = 81
 route_table  = 81
 ```
@@ -120,7 +120,7 @@ Self-contained: the listener installs its own policy route when it starts.
 
 ```toml
 # client
-[socks5]
+[tunnel.socks5]
 listen = "127.0.0.1:1080"
 ```
 
@@ -430,6 +430,10 @@ at "a socket marked 82 leaves through the Netherlands".
 One `[interface]` and one `[peer]` describes a single tunnel and parses exactly
 as it always has, including the process settings written inside `[interface]`.
 No existing configuration needs touching.
+
+`setup` and `init` write the `[[tunnel]]` form, even for a single tunnel: one
+shape for everyone to learn, and a file that grows a second destination later
+does not have to change shape first.
 
 The two forms are the same file at different depths — `[interface]` becomes
 `[tunnel.interface]`, every key unchanged — so converting is mechanical:
