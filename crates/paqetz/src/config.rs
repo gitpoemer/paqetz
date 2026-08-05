@@ -462,6 +462,45 @@ pub(crate) enum Error {
 /// Result alias for this module.
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
+/// The longest name Linux accepts for an interface, `IFNAMSIZ` less its NUL.
+const IFNAME_MAX: usize = 15;
+
+/// Checks that a name is one Linux would accept, and one that is safe to
+/// interpolate.
+///
+/// Interface names reach `nft` inside a generated script, where a quote or a
+/// newline would end the token early and let whatever follows be read as more
+/// ruleset. Nothing but root can write this file, so this is not a privilege
+/// boundary -- but the kernel would refuse most of these names anyway, and
+/// refusing them here turns a strange firewall failure into a clear message
+/// about the field that caused it.
+fn interface_name(field: &'static str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(invalid(field, "an interface name cannot be empty"));
+    }
+    if name.len() > IFNAME_MAX {
+        return Err(invalid(
+            field,
+            format!("`{name}` is longer than the {IFNAME_MAX} characters Linux allows"),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(invalid(field, format!("`{name}` is not a usable name")));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    {
+        return Err(invalid(
+            field,
+            format!(
+                "`{name}` contains {bad:?}; interface names are letters, digits,                  and `_`, `-` or `.`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn invalid(field: &'static str, problem: impl Into<String>) -> Error {
     Error::Invalid {
         field,
@@ -779,7 +818,11 @@ impl Config {
                 netmask,
                 mtu,
                 listen_port,
-                device: iface.device.unwrap_or_else(|| "paqetz0".to_owned()),
+                device: {
+                    let name = iface.device.unwrap_or_else(|| "paqetz0".to_owned());
+                    interface_name("interface.device", &name)?;
+                    name
+                },
                 profile,
                 carrier,
                 sequencing,
@@ -803,7 +846,13 @@ impl Config {
                     other => other,
                 },
                 route_table: iface.route_table.unwrap_or(51),
-                egress: iface.egress,
+                egress: match iface.egress {
+                    Some(name) => {
+                        interface_name("interface.egress", &name)?;
+                        Some(name)
+                    }
+                    None => None,
+                },
                 // wg-quick's own default when `Table` is set to a number for a
                 // WARP profile, which is the usual reason to want this.
                 egress_table: iface.egress_table.unwrap_or(51_820),
@@ -1369,6 +1418,31 @@ tunnel_address = "10.7.0.2"
         let msg = err.to_string();
         assert!(msg.contains("linux-6"), "should list what is valid: {msg}");
         assert!(msg.contains("windows-11"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_interface_name_must_be_one_linux_would_accept() {
+        // These reach `nft` inside a generated script, where a quote or a
+        // newline ends the token early and what follows is read as ruleset.
+        for bad in [
+            "paqetz0\" ; drop",
+            "paqetz0\nadd rule",
+            "",
+            "0123456789abcdef",
+            "..",
+            "eth0/1",
+        ] {
+            assert!(
+                super::interface_name("interface.device", bad).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+        for good in ["paqetz0", "wg-1", "tun.0", "a", "0123456789abcde"] {
+            assert!(
+                super::interface_name("interface.device", good).is_ok(),
+                "{good:?} was refused"
+            );
+        }
     }
 
     #[test]
