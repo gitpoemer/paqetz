@@ -365,15 +365,16 @@ The tunnel has to be up, and the probes need a raw socket, so run it as root.
   idle, again      0.0%    92.9ms   93.2ms   96.2ms   0.57ms
   under load       0.0%    92.9ms   93.2ms   96.7ms   0.60ms
 
-  94 Mbit/s offered during the loaded run.
+  25 of 25 Mbit/s offered during the loaded run.
 ```
 
-That last line is there so the loaded row can be trusted. A path that stayed
-flat under real pressure and one that was never put under any look identical
-otherwise — which is exactly how the first version of this command was wrong:
-it loaded the tunnel with a flood ping, and a flood ping sends one packet per
-reply, so on a 90ms path it offered a tenth of a megabit and measured idle three
-times over.
+The load is **paced** — 25 Mbit/s by default, `--rate` to change it. That is
+deliberate. The question is what a busy tunnel feels like, not what an overrun
+one does: a sender with no pacing fills a local queue at memory speed, offers
+two gigabits on a one-core VPS, and then drops the probe packets itself, which
+reports as packet loss on a path that never saw the traffic. Raise `--rate`
+until something moves; the achieved rate is reported either way, and a figure
+below what was asked for means this host, not the link, ran out.
 
 Two failures hide from every throughput test, and each has its own line here.
 

@@ -72,6 +72,14 @@ enum Command {
         /// Which tunnel to probe, when more than one is configured.
         #[arg(long, requires = "under_load")]
         tunnel: Option<String>,
+
+        /// Megabits per second to offer during the loaded run.
+        ///
+        /// Paced, because an unpaced sender fills a local queue faster than any
+        /// link drains it and then drops the probes itself. Raise it to press
+        /// harder; the achieved rate is reported either way.
+        #[arg(long, requires = "under_load", default_value_t = probe::DEFAULT_RATE)]
+        rate: f64,
     },
 
     /// Generate a matched pair of configuration files.
@@ -299,7 +307,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Doctor {
             under_load: true,
             tunnel,
-        } => probe::run(&cli.config, tunnel.as_deref()),
+            rate,
+        } => {
+            if rate <= 0.0 {
+                return Err("--rate must be greater than zero".into());
+            }
+            probe::run(&cli.config, tunnel.as_deref(), rate)
+        }
         Command::Doctor { .. } => {
             if doctor::run(&cli.config) {
                 Ok(())

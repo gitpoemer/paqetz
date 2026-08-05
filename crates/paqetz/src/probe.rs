@@ -117,14 +117,26 @@ struct Load {
 /// How many senders. One socket cannot always fill a link on its own, and a
 /// handful costs nothing on a host that is otherwise waiting.
 const SENDERS: usize = 4;
+/// Megabits per second offered when nothing else is asked for.
+///
+/// Paced, and deliberately well under what any real link gives, because the
+/// question is what a *busy* tunnel feels like and not what an overrun one
+/// does. An unpaced sender fills a local queue at memory speed -- two gigabits
+/// on a one-core VPS -- and everything after that, the probe packets included,
+/// is dropped by the sender's own overflow. That measures the flood, not the
+/// path.
+pub(crate) const DEFAULT_RATE: f64 = 25.0;
 /// Datagram size, under any sane tunnel MTU so nothing fragments.
 const PAYLOAD: usize = 1200;
 /// The discard port, which is refused rather than answered. RFC 863.
 const DISCARD: u16 = 9;
 
 impl Load {
-    /// Starts sending. Stops when the returned value is dropped or finished.
-    fn start(target: Ipv4Addr) -> std::io::Result<Self> {
+    /// Starts sending at `rate` megabits per second, shared across the senders.
+    fn start(target: Ipv4Addr, rate: f64) -> std::io::Result<Self> {
+        // Each sender gets an equal share, spent one datagram at a time.
+        let per_thread = rate * 1_000_000.0 / 8.0 / SENDERS as f64;
+        let gap = Duration::from_secs_f64(PAYLOAD as f64 / per_thread);
         let stop = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(AtomicU64::new(0));
         let mut threads = Vec::with_capacity(SENDERS);
@@ -135,12 +147,24 @@ impl Load {
             let (stop, sent) = (Arc::clone(&stop), Arc::clone(&sent));
             threads.push(std::thread::spawn(move || {
                 let buf = [0u8; PAYLOAD];
+                let mut due = Instant::now();
                 while !stop.load(Ordering::Relaxed) {
                     // An error here is the link pushing back -- a full queue, a
                     // transient unreachable -- which is the condition being
                     // measured rather than a reason to stop.
                     if let Ok(n) = socket.send(&buf) {
                         sent.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    // Paced against a running deadline rather than by sleeping
+                    // for `gap` each time, so the send's own cost does not
+                    // silently drag the rate below what was asked for.
+                    due += gap;
+                    if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    } else {
+                        // Behind, and catching up would burst. Give up the lost
+                        // ground instead, and let the achieved rate show it.
+                        due = Instant::now();
                     }
                 }
             }));
@@ -171,6 +195,7 @@ impl Load {
 pub(crate) fn run(
     path: &std::path::Path,
     name: Option<&str>,
+    rate: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = crate::config::Config::load(path)?;
     let tunnel = match name {
@@ -200,18 +225,26 @@ pub(crate) fn run(
     let cold = probe(&target, IDLE_COUNT)?;
     let warm = probe(&target, IDLE_COUNT)?;
 
-    let load = Load::start(tunnel.peer.tunnel_address)?;
+    println!("Offering {rate:.0} Mbit/s during the loaded run.\n");
+    let load = Load::start(tunnel.peer.tunnel_address, rate)?;
     let started = Instant::now();
     let loaded = probe(&target, LOADED_COUNT);
     let offered = load.finish(started.elapsed());
     let loaded = loaded?;
 
-    report(cold, warm, loaded, offered);
+    report(
+        cold,
+        warm,
+        loaded,
+        offered,
+        rate,
+        tunnel.interface.keepalive,
+    );
     Ok(())
 }
 
 /// Prints the three measurements and what they mean together.
-fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64) {
+fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64, asked: f64, keepalive: bool) {
     println!("                 loss     min      avg      max     mdev");
     for (what, s) in [
         ("idle, first", cold),
@@ -226,8 +259,16 @@ fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64) {
     // What the loaded row was actually loaded with. Without this the reader
     // cannot tell a path that stayed flat under pressure from one that was
     // never put under any.
-    println!("\n  {offered:.0} Mbit/s offered during the loaded run.");
+    println!("\n  {offered:.0} of {asked:.0} Mbit/s offered during the loaded run.");
     println!();
+
+    // Offering less than was asked for is the host failing to keep up, not the
+    // path -- and it makes the loaded row a measurement of a lighter load.
+    if offered < asked * 0.8 {
+        println!("This host could not send what was asked for, so the loaded row is a");
+        println!("measurement of {offered:.0} Mbit/s rather than {asked:.0}.");
+        println!();
+    }
 
     // The queue question. A few milliseconds is a clean path; hundreds means
     // something is holding packets rather than dropping them, which a
@@ -258,8 +299,18 @@ fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64) {
             cold.loss, warm.loss
         );
         println!("trip times. Nothing is congested — the path had gone cold and the first");
-        println!("packets paid to wake it. Set `keepalive = true` under [tunnel.interface]");
-        println!("to hold it open.");
+        println!("packets paid to wake it.");
+        if keepalive {
+            // Saying "turn on the thing that is already on" is how a diagnostic
+            // sends someone to edit a file that is already correct.
+            println!();
+            println!("The keepalive is already on in this configuration, so either the");
+            println!("running service predates it — check `paqetz --version` against the");
+            println!("service and restart it — or something on the path forgets a mapping");
+            println!("in under ten seconds, which no keepalive interval will outrun.");
+        } else {
+            println!("Set `keepalive = true` under [tunnel.interface] to hold it open.");
+        }
     }
 
     if loaded.loss > 1.0 {
