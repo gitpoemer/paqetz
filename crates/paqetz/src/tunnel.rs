@@ -819,6 +819,24 @@ impl Tunnel {
             return Ok(None);
         };
         let n = session.seal(packet, sealed, now)?;
+
+        // Nothing is counted, and nothing is claimed about liveness, until there
+        // is a frame to send. Counting first made the transmit figures a measure
+        // of what was encrypted rather than what left the host -- so a carrier
+        // that was briefly absent showed megabytes going out while the wire was
+        // silent -- and armed the liveness timer for a packet nobody could
+        // possibly answer, which then reported the peer as gone.
+        let Some(carrier) = state.carrier.as_mut() else {
+            Stats::bump(&self.stats.tx_dropped);
+            return Ok(None);
+        };
+        let Some(payload) = sealed.get(..n) else {
+            Stats::bump(&self.stats.tx_dropped);
+            return Ok(None);
+        };
+        let written = carrier.data(payload, frame, now)?;
+        let dst = carrier.remote().0;
+
         // Half of the liveness question -- but only for a packet carrying data.
         //
         // A keepalive is empty, and the far end answers an empty packet with
@@ -831,15 +849,6 @@ impl Tunnel {
         }
         Stats::bump(&self.stats.tx_packets);
         Stats::add(&self.stats.tx_bytes, packet.len() as u64);
-
-        let Some(carrier) = state.carrier.as_mut() else {
-            return Ok(None);
-        };
-        let Some(payload) = sealed.get(..n) else {
-            return Ok(None);
-        };
-        let written = carrier.data(payload, frame, now)?;
-        let dst = carrier.remote().0;
         Ok(Some((written, dst)))
     }
 
@@ -1240,12 +1249,37 @@ impl Tunnel {
             return;
         }
 
+        // Rebuilt here rather than left absent for something else to notice.
+        // Dropping it and waiting meant every packet in between was encrypted,
+        // counted, and thrown away -- and the liveness timer then reported a
+        // peer that had answered nothing, because nothing had been asked.
+        let Some(peer) = state.endpoint else {
+            return;
+        };
+        let (ip, _) = self.local();
+        let epoch = match random_u32() {
+            Ok(e) => e,
+            Err(e) => {
+                warn_!("could not start a new carrier: {e}");
+                return;
+            }
+        };
+        let (isn, peer_isn, ts_base) =
+            noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
+        state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
+            local: (ip, next),
+            remote: (*peer.ip(), peer.port()),
+            profile: self.cfg.interface.profile,
+            role: Role::Initiator,
+            carrier: self.cfg.interface.carrier,
+            isn,
+            peer_isn,
+            ts_base,
+            sequencing: self.cfg.interface.sequencing,
+        }));
         if let Ok(mut local) = self.local.lock() {
             local.1 = next;
         }
-        // Dropping the carrier is what starts the new conversation: the next
-        // packet builds one from the new port with a sequence base of its own.
-        state.carrier = None;
         drop(state);
         info!("{}carrier moved from port {current} to {next}", self.tag());
     }
@@ -1510,6 +1544,23 @@ mod tests {
             last_data_receive: heard,
             ..PeerState::new(None)
         }
+    }
+
+    #[test]
+    fn nothing_is_counted_as_sent_while_there_is_no_carrier() {
+        // Counting before the carrier check made the transmit figures a measure
+        // of what was encrypted rather than what left the host: observed as
+        // 64 MB "sent" against 5 MB received while the wire was silent, with the
+        // liveness timer then reporting a peer that had answered nothing because
+        // nothing had been asked. `tx_dropped` is the honest counter for this.
+        let stats = Stats::default();
+        Stats::bump(&stats.tx_dropped);
+        assert_eq!(
+            stats.tx_packets.load(Ordering::Relaxed),
+            0,
+            "a packet with nowhere to go is not a packet that was sent"
+        );
+        assert_eq!(stats.tx_dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]
