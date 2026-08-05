@@ -36,6 +36,9 @@ use crate::stats::Stats;
 /// How often the timer thread wakes.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How long to wait before repeating an unanswered confirmation.
+const CONFIRM_RETRY: Millis = 1_000;
+
 /// How long to wait before repeating an unanswered handshake.
 ///
 /// WireGuard's interval. Long enough not to flood a peer that is down, short
@@ -182,13 +185,17 @@ struct PeerState {
     /// stops firing, but it must not count for the *liveness* timer, or an idle
     /// tunnel asks a question nobody can answer and reads the silence as death.
     last_keepalive: Option<Millis>,
-    /// Whether a handshake has completed with nothing sent under it yet.
+    /// Whether the peer has yet been seen using the session in use here.
     ///
     /// The responder will not seal under a session until it has seen the peer
-    /// use it, so the initiator owes it one packet. Without that, an idle
-    /// tunnel leaves the responder on the old session until that session
-    /// expires, and a responder that then needs to speak first has nothing to
-    /// speak with.
+    /// use it, so the initiator owes it a packet. Without that, an idle tunnel
+    /// leaves the responder on the old session until that session expires, and
+    /// a responder that then needs to speak first has nothing to speak with.
+    ///
+    /// Cleared by hearing from the peer under that session, not by sending --
+    /// the confirmation is one small packet, and one small packet is exactly
+    /// the thing a lossy path drops. Sent once and assumed delivered, a single
+    /// loss would strand the responder until the next rekey.
     confirm_owed: bool,
     /// When the carrier should move to the next port.
     rotate_at: Millis,
@@ -268,14 +275,33 @@ impl PeerState {
         let mut tried = None;
         if let Some(current) = self.session.as_mut() {
             match current.open(packet, out, now) {
-                // Not ours: try the others before calling it noise.
-                Err(paqetz_core::Error::Rejected) => tried = Some(paqetz_core::Error::Rejected),
-                result => return Some(result),
+                // Not this one: try the others before calling it noise. An
+                // expired session has to fall through exactly as a mismatched
+                // one does -- `open` tests expiry before it looks at the index,
+                // so a session old enough to refuse everything would otherwise
+                // answer for packets addressed to a different session entirely,
+                // and the one waiting to be confirmed would never be reached.
+                // That deadlocks the tunnel permanently rather than for a
+                // moment: the session that could have replaced it is sitting
+                // right there, unreachable.
+                Err(e @ (paqetz_core::Error::Rejected | paqetz_core::Error::Expired)) => {
+                    tried = Some(e);
+                }
+                result => {
+                    // Traffic under the session we are sealing under is proof
+                    // the peer has it, so nothing more needs confirming.
+                    if result.is_ok() {
+                        self.confirm_owed = false;
+                    }
+                    return Some(result);
+                }
             }
         }
         if let Some(previous) = self.previous.as_mut() {
             match previous.open(packet, out, now) {
-                Err(paqetz_core::Error::Rejected) => tried = Some(paqetz_core::Error::Rejected),
+                Err(e @ (paqetz_core::Error::Rejected | paqetz_core::Error::Expired)) => {
+                    tried = Some(e);
+                }
                 result => return Some(result),
             }
         }
@@ -951,6 +977,14 @@ impl Tunnel {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Holding a session back is worth doing while there is a working one to
+        // hold it back *for*. Once there is not, refusing to use it stops the
+        // tunnel outright -- and a peer that can no longer be sent to is not
+        // protected by anything. So an expired or absent session yields to the
+        // one waiting, which is no worse than the behaviour this replaced.
+        if state.session.as_ref().is_none_or(|s| s.is_expired(now)) {
+            state.confirm();
+        }
         let Some(session) = state.session.as_mut() else {
             return Ok(None);
         };
@@ -1446,8 +1480,15 @@ impl Tunnel {
             // is one packet per handshake, and without it a tunnel that turned
             // keepalives off can leave the responder holding a session it is
             // not allowed to use and an old one it can no longer use.
-            let owed =
-                state.confirm_owed || (self.cfg.interface.keepalive && state.owes_keepalive(now));
+            let owed = if state.confirm_owed {
+                // Repeated until the peer answers, but not on every tick: this
+                // is a packet whose whole purpose is to be unremarkable.
+                state
+                    .last_keepalive
+                    .is_none_or(|sent| now.saturating_sub(sent) >= CONFIRM_RETRY)
+            } else {
+                self.cfg.interface.keepalive && state.owes_keepalive(now)
+            };
             if !owed {
                 return Ok(());
             }
@@ -1456,7 +1497,6 @@ impl Tunnel {
         self.send_inner(&[], sealed, frame)?;
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.confirm_owed = false;
         state.last_keepalive = Some(now);
         Ok(())
     }
@@ -1805,6 +1845,16 @@ mod tests {
         server: &paqetz_core::KeyPair,
         index: u32,
     ) -> (Session, Session) {
+        session_pair_at(client, server, index, 0)
+    }
+
+    /// As above, but established at `at` -- which decides when it expires.
+    fn session_pair_at(
+        client: &paqetz_core::KeyPair,
+        server: &paqetz_core::KeyPair,
+        index: u32,
+        at: Millis,
+    ) -> (Session, Session) {
         let (initiator, msg1) = Initiator::start(
             &client.private,
             &client.public,
@@ -1814,8 +1864,8 @@ mod tests {
         )
         .expect("start");
         let pending = PendingResponder::read(&server.private, &server.public, &msg1).expect("read");
-        let (server_side, msg2) = pending.accept(index + 1, 0).expect("accept");
-        let client_side = initiator.finish(&msg2, 0).expect("finish");
+        let (server_side, msg2) = pending.accept(index + 1, at).expect("accept");
+        let client_side = initiator.finish(&msg2, at).expect("finish");
         (client_side, server_side)
     }
 
@@ -1948,6 +1998,68 @@ mod tests {
             "the peer used it, so it is now the one to seal under"
         );
         assert!(state.next.is_none(), "and nothing is left waiting");
+    }
+
+    #[test]
+    fn an_expired_session_does_not_shadow_the_one_waiting_behind_it() {
+        // This is the regression that took a live tunnel down. `Session::open`
+        // tests expiry before it looks at the index, so an expired session
+        // answers for packets addressed to a *different* session -- and it
+        // answers with an error that is not `Rejected`, which stopped the
+        // search. The session that could have replaced it sat one slot away,
+        // unreachable, and the tunnel stayed down for good rather than for a
+        // moment.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+
+        // The old one is established at zero; the one replacing it a rekey
+        // later, so there is a moment when the first has expired and the second
+        // has not. That moment is the whole failure.
+        let (_, old) = session_pair_at(&client, &server, 110, 0);
+        let rekeyed = paqetz_core::noise::REKEY_AFTER_TIME;
+        let (mut peer, fresh) = session_pair_at(&client, &server, 120, rekeyed);
+
+        let mut state = PeerState::new(None);
+        state.install(old);
+        state.accept(fresh);
+
+        let later = paqetz_core::noise::REJECT_AFTER_TIME + 1;
+        let mut wire = [0u8; 256];
+        let mut inner = [0u8; 256];
+        let n = peer.seal(b"after expiry", &mut wire, later).expect("seal");
+        assert_eq!(
+            state
+                .open(wire.get(..n).expect("sealed"), &mut inner, later)
+                .expect("a session")
+                .expect("the waiting session is reachable"),
+            b"after expiry".len()
+        );
+    }
+
+    #[test]
+    fn hearing_from_the_peer_is_what_settles_the_confirmation() {
+        // Not sending it. The confirmation is one small packet, and a path that
+        // drops one would stall the responder until the next rekey if sending
+        // were taken as proof of arrival.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (mut peer, session) = session_pair(&client, &server, 130);
+
+        let mut state = PeerState::new(None);
+        state.install(session);
+        assert!(state.confirm_owed);
+
+        let mut wire = [0u8; 256];
+        let mut inner = [0u8; 256];
+        let n = peer.seal(b"heard", &mut wire, 0).expect("seal");
+        state
+            .open(wire.get(..n).expect("sealed"), &mut inner, 0)
+            .expect("a session")
+            .expect("heard");
+        assert!(
+            !state.confirm_owed,
+            "the peer used this session, so it plainly has it"
+        );
     }
 
     #[test]
