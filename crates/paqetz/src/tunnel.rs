@@ -29,7 +29,7 @@ use paqetz_dp::{AfPacketTx, MAX_FRAME, PacketRx, RawTx, Transmit, Tun, sys};
 use paqetz_tcpwire::segment::{self, MAX_OVERHEAD};
 use paqetz_tcpwire::{Endpoint as Carrier, Role};
 
-use crate::config::{Config, Datapath};
+use crate::config::{Config, Datapath, TunnelConfig};
 use crate::log::{debug, error, info, warn_};
 use crate::stats::Stats;
 
@@ -124,11 +124,6 @@ impl PeerState {
         }
     }
 
-    /// Whether the peer has stopped answering a session we are still using.
-    ///
-    /// Only asked of a session we have actually sent under: a tunnel that has
-    /// been idle since it came up has heard nothing back because it has said
-    /// nothing, which is not the same as being ignored.
     /// Records that a handshake just completed.
     ///
     /// The peer answered, which is the freshest evidence available that it holds
@@ -157,6 +152,11 @@ impl PeerState {
         self.last_send.unwrap_or(0) < heard && now.saturating_sub(heard) >= KEEPALIVE_TIMEOUT
     }
 
+    /// Whether the peer has stopped answering a session we are still using.
+    ///
+    /// Only asked of a session we have actually sent under: a tunnel that has
+    /// been idle since it came up has heard nothing back because it has said
+    /// nothing, which is not the same as being ignored.
     fn presumed_dead(&self, now: Millis) -> bool {
         let Some(sent) = self.last_send else {
             return false;
@@ -168,7 +168,9 @@ impl PeerState {
 
 /// A running tunnel.
 pub(crate) struct Tunnel {
-    cfg: Config,
+    cfg: TunnelConfig,
+    /// Seconds between status lines, which belongs to the process.
+    health_interval: u64,
     tun: Arc<Tun>,
     rx: Arc<PacketRx>,
     tx: Arc<Transmit>,
@@ -224,7 +226,7 @@ impl Tunnel {
     ///
     /// # Errors
     /// Returns the first failure, with context describing what was attempted.
-    pub(crate) fn start(cfg: Config) -> Result<Self> {
+    pub(crate) fn start(cfg: TunnelConfig, health_interval: u64) -> Result<Self> {
         if matches!(cfg.interface.carrier, paqetz_tcpwire::Carrier::Handshake) {
             // The carrier can emit SYN/SYN+ACK/ACK, but nothing here drives that
             // exchange or retries a lost SYN yet. Refusing is better than
@@ -312,6 +314,7 @@ impl Tunnel {
         Ok(Self {
             state: Arc::new(Mutex::new(PeerState::new(cfg.peer.endpoint))),
             cfg,
+            health_interval,
             tun: Arc::new(tun),
             rx: Arc::new(rx),
             tx: Arc::new(tx),
@@ -420,7 +423,7 @@ impl Tunnel {
 
     /// Prints the health line every `health_interval` seconds.
     fn health(&self) {
-        let interval = self.cfg.interface.health_interval;
+        let interval = self.health_interval;
         if interval == 0 {
             return;
         }
@@ -461,11 +464,25 @@ impl Tunnel {
             }
         };
 
-        if fresh.interface.log != crate::log::level() {
-            crate::log::set_level(fresh.interface.log);
+        if fresh.log != crate::log::level() {
+            crate::log::set_level(fresh.log);
             // Emitted after the change so raising the level shows this line.
-            info!("reload: log level is now {}", fresh.interface.log.name());
+            info!("reload: log level is now {}", fresh.log.name());
         }
+
+        // The file describes every tunnel in the process, so find this one.
+        // A tunnel that has been renamed or removed is left running on what it
+        // has: stopping it because its name moved would be a worse answer than
+        // saying so.
+        let Some(fresh_tunnel) = fresh.named(&self.cfg.name) else {
+            warn_!(
+                "reload: no tunnel named {:?} in the file any more; keeping the \
+                 running configuration",
+                self.cfg.name
+            );
+            return;
+        };
+        let fresh = fresh_tunnel;
 
         let old = &self.cfg;
         let mut needs_restart = Vec::new();
@@ -495,9 +512,6 @@ impl Tunnel {
         }
         if fresh.interface.transmit != old.interface.transmit {
             needs_restart.push("interface.transmit");
-        }
-        if fresh.interface.health_interval != old.interface.health_interval {
-            needs_restart.push("interface.health_interval");
         }
 
         if needs_restart.is_empty() {

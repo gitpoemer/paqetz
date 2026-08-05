@@ -305,7 +305,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
     // new keypair and overwrite the copy, leaving the two ends with keys that
     // do not match.
     let egress = match adopt(dir, role)? {
-        Some(cfg) => cfg.interface.egress.clone(),
+        Some(t) => t.interface.egress.clone(),
         None => generate(dir, role)?,
     };
 
@@ -398,7 +398,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
     let forwards = role
         .and_then(|r| std::fs::read_to_string(dir.join(r.file())).ok())
         .and_then(|t| crate::config::Config::parse(&t).ok())
-        .is_some_and(|c| c.interface.gateway);
+        .is_some_and(|c| c.tunnels.iter().any(|t| t.interface.gateway));
     let pending = paqetz_fw::tune::pending(forwards);
     if pending.is_empty() {
         println!("This host's kernel settings already suit a tunnel.");
@@ -451,7 +451,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
 /// contacted. That is the structural difference between the two files, and it
 /// is enough to catch one being pasted onto the wrong host — which leaves both
 /// ends believing they are the same one, and no tunnel.
-fn is_for(cfg: &crate::config::Config, role: Role) -> bool {
+fn is_for(cfg: &crate::config::TunnelConfig, role: Role) -> bool {
     cfg.peer.endpoint.is_some() == matches!(role, Role::Client)
 }
 
@@ -484,14 +484,16 @@ fn read_pasted() -> io::Result<String> {
 fn adopt(
     dir: &Path,
     role: Option<Role>,
-) -> Result<Option<crate::config::Config>, Box<dyn std::error::Error>> {
+) -> Result<Option<crate::config::TunnelConfig>, Box<dyn std::error::Error>> {
     // `neither` is generating files for other hosts, so there is nothing here
     // to adopt and nothing this host would run.
     let Some(role) = role else { return Ok(None) };
     let path = dir.join(role.file());
 
     let found = match std::fs::read_to_string(&path) {
-        Ok(text) => crate::config::Config::parse(&text).ok(),
+        Ok(text) => crate::config::Config::parse(&text)
+            .ok()
+            .and_then(crate::config::Config::into_only),
         Err(_) => None,
     };
 
@@ -526,8 +528,11 @@ fn adopt(
     loop {
         println!("\n   Paste it, then a line holding only a full stop.");
         let text = read_pasted()?;
-        match crate::config::Config::parse(&text) {
-            Ok(cfg) => {
+        match crate::config::Config::parse(&text).map(crate::config::Config::into_only) {
+            // A file describing several tunnels is not an answer to "is this
+            // this host's configuration", so it is treated as unusable here
+            // rather than having one of them picked out of it.
+            Ok(Some(cfg)) => {
                 if !is_for(&cfg, role)
                     && !yes_no(
                         "\n   That looks like the OTHER end's file. Use it anyway?",
@@ -539,6 +544,13 @@ fn adopt(
                 write_private(&path, &text)?;
                 println!("   Wrote {}", path.display());
                 return Ok(Some(cfg));
+            }
+            Ok(None) => {
+                println!("\n   That describes more than one tunnel, so it is not");
+                println!("   this host's own configuration.");
+                if !yes_no("   Paste it again?", true)? {
+                    return Ok(None);
+                }
             }
             Err(e) => {
                 println!("\n   That does not parse: {e}");
@@ -830,16 +842,28 @@ mod tests {
     #[test]
     fn both_generated_files_parse() {
         let pair = render(&plan()).expect("render");
-        crate::config::Config::parse(&pair.server).expect("server config should parse");
-        crate::config::Config::parse(&pair.client).expect("client config should parse");
+        crate::config::Config::parse(&pair.server)
+            .expect("server config should parse")
+            .into_only()
+            .expect("one tunnel");
+        crate::config::Config::parse(&pair.client)
+            .expect("client config should parse")
+            .into_only()
+            .expect("one tunnel");
     }
 
     #[test]
     fn each_end_holds_its_own_private_key_and_the_others_public() {
         // The mistake this whole module exists to prevent.
         let pair = render(&plan()).expect("render");
-        let server = crate::config::Config::parse(&pair.server).expect("parse");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
 
         let server_public =
             paqetz_core::keys::public_from_private(server.interface.private_key.as_bytes());
@@ -859,8 +883,14 @@ mod tests {
     #[test]
     fn the_inner_addresses_mirror_each_other() {
         let pair = render(&plan()).expect("render");
-        let server = crate::config::Config::parse(&pair.server).expect("parse");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
 
         assert_eq!(server.interface.address, client.peer.tunnel_address);
         assert_eq!(client.interface.address, server.peer.tunnel_address);
@@ -871,8 +901,14 @@ mod tests {
     fn only_the_client_has_an_endpoint() {
         // Which is what decides who initiates.
         let pair = render(&plan()).expect("render");
-        let server = crate::config::Config::parse(&pair.server).expect("parse");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(client.peer.is_initiator());
         assert!(!server.peer.is_initiator());
         assert_eq!(server.interface.listen_port, 9999);
@@ -897,12 +933,16 @@ mod tests {
         assert!(
             crate::config::Config::parse(&pair.server)
                 .expect("parse")
+                .into_only()
+                .expect("one tunnel")
                 .interface
                 .gateway
         );
         assert!(
             crate::config::Config::parse(&pair.client)
                 .expect("parse")
+                .into_only()
+                .expect("one tunnel")
                 .interface
                 .route_all
         );
@@ -916,6 +956,8 @@ mod tests {
         assert!(
             !crate::config::Config::parse(&neither.server)
                 .expect("parse")
+                .into_only()
+                .expect("one tunnel")
                 .interface
                 .gateway
         );
@@ -928,10 +970,16 @@ mod tests {
             ..plan()
         })
         .expect("render");
-        let server = crate::config::Config::parse(&pair.server).expect("parse");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(server.interface.egress.as_deref(), Some("warp"));
         // And never the client's, which has nothing to forward.
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(client.interface.egress.is_none());
     }
 
@@ -942,7 +990,10 @@ mod tests {
             ..plan()
         })
         .expect("render");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(client.socks5.expect("socks5").listen.port(), 1080);
     }
 
@@ -956,7 +1007,10 @@ mod tests {
             ..plan()
         })
         .expect("render");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(client.peer.permits(Ipv4Addr::new(149, 154, 167, 91)));
         assert!(client.peer.permits(Ipv4Addr::new(1, 1, 1, 1)));
     }
@@ -968,7 +1022,10 @@ mod tests {
             ..plan()
         })
         .expect("render");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(client.peer.permits(Ipv4Addr::new(10, 7, 0, 1)));
         assert!(
             !client.peer.permits(Ipv4Addr::new(1, 1, 1, 1)),
@@ -985,7 +1042,10 @@ mod tests {
             ..plan()
         })
         .expect("render");
-        let server = crate::config::Config::parse(&pair.server).expect("parse");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(server.peer.permits(Ipv4Addr::new(10, 7, 0, 2)));
         assert!(!server.peer.permits(Ipv4Addr::new(1, 1, 1, 1)));
     }
@@ -993,8 +1053,14 @@ mod tests {
     #[test]
     fn each_file_is_recognised_by_the_end_it_belongs_to() {
         let pair = render(&plan()).expect("render");
-        let server = crate::config::Config::parse(&pair.server).expect("parse");
-        let client = crate::config::Config::parse(&pair.client).expect("parse");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
 
         assert!(is_for(&client, Role::Client));
         assert!(is_for(&server, Role::Server));

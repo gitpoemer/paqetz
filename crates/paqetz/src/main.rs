@@ -304,14 +304,19 @@ fn pubkey() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = Config::load(path)?;
-    let manage_firewall = cfg.interface.manage_firewall;
+    let process = Config::load(path)?;
+    let manage_firewall = process.manage_firewall;
+    let health_interval = process.health_interval;
+    // Stage one carries a single tunnel per process, exactly as before. A file
+    // describing several parses, and is refused here rather than silently
+    // running one of them, until the orchestration that starts them all lands.
+    let cfg = process.only()?.clone();
     // `PAQETZ_LOG` overrides the file, so a level can be raised for one run
     // without editing anything.
     let level = std::env::var("PAQETZ_LOG")
         .ok()
         .and_then(|v| log::Level::parse(&v))
-        .unwrap_or(cfg.interface.log);
+        .unwrap_or(process.log);
     log::set_level(level);
 
     tunnel::install_signal_handlers();
@@ -379,7 +384,7 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         });
     let peer_endpoint = cfg.peer.endpoint;
 
-    let mut tunnel = Tunnel::start(cfg)?;
+    let mut tunnel = Tunnel::start(cfg, health_interval)?;
     tunnel.watch_config(path.to_path_buf());
     let port = tunnel.local_port();
     log::info!("outer port {port}, log level {}", level.name());
@@ -848,7 +853,8 @@ fn tune(apply: bool, config: &std::path::Path) -> Result<(), Box<dyn std::error:
     // -- offering a client the settings a gateway needs is worse than offering
     // a gateway too few, since the first leaves settings behind that nobody can
     // explain and the second prints one more line.
-    let gateway = config::Config::load(config).is_ok_and(|c| c.interface.gateway);
+    let gateway =
+        config::Config::load(config).is_ok_and(|c| c.tunnels.iter().any(|t| t.interface.gateway));
 
     let pending = paqetz_fw::tune::pending(gateway);
     if pending.is_empty() {
@@ -916,12 +922,13 @@ fn firewall(
 /// The rules have to name the port *this* kernel would send resets from, which
 /// is the port we receive on — not the peer's. An end that takes an ephemeral
 /// port does not know it until start-up, so there is nothing to return.
-const fn effective_port(cfg: &Config) -> Option<u16> {
-    if cfg.interface.listen_port == 0 {
-        None
-    } else {
-        Some(cfg.interface.listen_port)
-    }
+fn effective_port(cfg: &Config) -> Option<u16> {
+    // The first tunnel with a fixed port. A process whose tunnels all take
+    // ephemeral ones has nothing to report until they are bound.
+    cfg.tunnels
+        .iter()
+        .map(|t| t.interface.listen_port)
+        .find(|p| *p != 0)
 }
 
 #[cfg(test)]

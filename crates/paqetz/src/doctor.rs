@@ -13,7 +13,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, TunnelConfig};
 
 /// How a check turned out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,13 +107,15 @@ pub(crate) fn run(path: &Path) -> bool {
     findings.push(check_service());
     findings.push(check_networkd(cfg.as_ref()));
 
-    if let Some(cfg) = cfg.as_ref() {
-        findings.push(check_device_free(&cfg.interface.device));
-        findings.push(check_port_free(cfg.interface.listen_port));
-        findings.push(check_standard_port(cfg.interface.listen_port));
-        findings.push(check_mtu(cfg.interface.mtu));
-        findings.push(check_peer_route(cfg));
-        findings.push(check_inner_addresses(cfg));
+    // Every tunnel is checked, because a process may carry several and the one
+    // that is wrong is not necessarily the first.
+    for t in cfg.iter().flat_map(|c| c.tunnels.iter()) {
+        findings.push(check_device_free(&t.interface.device));
+        findings.push(check_port_free(t.interface.listen_port));
+        findings.push(check_standard_port(t.interface.listen_port));
+        findings.push(check_mtu(t.interface.mtu));
+        findings.push(check_peer_route(t));
+        findings.push(check_inner_addresses(t));
     }
 
     print(&findings)
@@ -258,11 +260,15 @@ fn check_service() -> Finding {
 /// Only a plain point-to-point tunnel, with no proxy in front and no way out
 /// behind, has nothing of ours for it to remove.
 fn check_networkd(cfg: Option<&Config>) -> Finding {
+    // Any tunnel needing routing of its own is enough: networkd removes rules
+    // by mark, and does not care which tunnel put them there.
     let needs_rule = cfg.is_some_and(|c| {
-        c.interface.route_marked.is_some()
-            || c.socks5.is_some()
-            || c.interface.route_all
-            || c.interface.egress.is_some()
+        c.tunnels.iter().any(|t| {
+            t.interface.route_marked.is_some()
+                || t.socks5.is_some()
+                || t.interface.route_all
+                || t.interface.egress.is_some()
+        })
     });
     if !needs_rule {
         return Finding::pass("networkd", "this host installs no rule or route of its own");
@@ -386,7 +392,7 @@ fn check_mtu(inner: u32) -> Finding {
 }
 
 /// Whether there is a route to the peer.
-fn check_peer_route(cfg: &Config) -> Finding {
+fn check_peer_route(cfg: &TunnelConfig) -> Finding {
     let Some(endpoint) = cfg.peer.endpoint else {
         return Finding::pass(
             "peer endpoint",
@@ -412,7 +418,7 @@ fn check_peer_route(cfg: &Config) -> Finding {
 }
 
 /// Whether the inner addresses make sense together.
-fn check_inner_addresses(cfg: &Config) -> Finding {
+fn check_inner_addresses(cfg: &TunnelConfig) -> Finding {
     let ours = cfg.interface.address;
     let theirs = cfg.peer.tunnel_address;
 

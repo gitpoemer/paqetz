@@ -13,16 +13,37 @@ use std::path::Path;
 use paqetz_core::{PrivateKey, PublicKey};
 use serde::Deserialize;
 
-/// A parsed and validated configuration.
+/// Everything one process runs.
+///
+/// A client may carry several tunnels at once — one per destination, chosen by
+/// firewall mark — so a configuration is a list of tunnels plus the few settings
+/// that belong to the process rather than to any one of them.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
+    /// How much to say.
+    pub(crate) log: crate::log::Level,
+    /// Seconds between status lines; zero disables them.
+    pub(crate) health_interval: u64,
+    /// Whether to install the firewall rules the carrier needs (D9).
+    ///
+    /// One table covers every tunnel in the process, so this belongs to the
+    /// process rather than to a tunnel.
+    pub(crate) manage_firewall: bool,
+    /// The tunnels, in the order they were written.
+    pub(crate) tunnels: Vec<TunnelConfig>,
+}
+
+/// One tunnel: an identity, a device, and the peer at the far end.
+#[derive(Debug, Clone)]
+pub(crate) struct TunnelConfig {
+    /// What to call it in logs and on the command line.
+    pub(crate) name: String,
     /// This end's settings.
     pub(crate) interface: Interface,
     /// An optional SOCKS5 front end, for debugging (phase 4).
     pub(crate) socks5: Option<Socks5>,
-    /// The peer. Exactly one, for now — the peer *table* exists so that
-    /// supporting more is a configuration change rather than a rewrite, but a
-    /// second entry is rejected until the routing work in phase 2 lands.
+    /// The peer at the far end. Exactly one per tunnel; several destinations
+    /// means several tunnels, which is what `[[tunnel]]` is for.
     pub(crate) peer: Peer,
 }
 
@@ -55,12 +76,6 @@ pub(crate) struct Interface {
     /// therefore checkable by anything modelling the flow — including after a
     /// loss this carrier cannot repair, which it then never recovers from.
     pub(crate) sequencing: paqetz_tcpwire::Sequencing,
-    /// Whether to manage firewall rules automatically.
-    pub(crate) manage_firewall: bool,
-    /// How much to say on stdout.
-    pub(crate) log: crate::log::Level,
-    /// Seconds between health lines; zero disables them.
-    pub(crate) health_interval: u64,
     /// Whether to forward and translate the peer's traffic to the internet.
     ///
     /// The server side of a tunnel that is meant to be a way out. Without it
@@ -186,6 +201,49 @@ pub(crate) struct Peer {
 }
 
 impl Config {
+    /// The only tunnel, when there is exactly one.
+    ///
+    /// Commands that act on a single tunnel use this, so a file describing
+    /// several is a refusal rather than a silent choice of the first.
+    ///
+    /// # Errors
+    /// Returns [`Error::Invalid`] when the count is not one.
+    pub(crate) fn only(&self) -> Result<&TunnelConfig> {
+        match self.tunnels.as_slice() {
+            [one] => Ok(one),
+            many => Err(invalid(
+                "tunnel",
+                format!(
+                    "this works on one tunnel, but {} are configured; name one \
+                     with --tunnel",
+                    many.len()
+                ),
+            )),
+        }
+    }
+
+    /// The single tunnel this describes, taken by value.
+    ///
+    /// `None` when there are several, because the places that want this are
+    /// asking "is this file the one for this host", and a file describing three
+    /// hosts is not an answer to that.
+    #[must_use]
+    pub(crate) fn into_only(self) -> Option<TunnelConfig> {
+        let mut it = self.tunnels.into_iter();
+        match (it.next(), it.next()) {
+            (Some(one), None) => Some(one),
+            _ => None,
+        }
+    }
+
+    /// A tunnel by name.
+    #[must_use]
+    pub(crate) fn named(&self, name: &str) -> Option<&TunnelConfig> {
+        self.tunnels.iter().find(|t| t.name == name)
+    }
+}
+
+impl TunnelConfig {
     /// The tunnel's inner subnet, from this end's address and prefix.
     ///
     /// The gateway translates traffic from this range, so it has to be the
@@ -262,6 +320,41 @@ impl Bits for u32 {
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
+    // Process settings. Written at the top level in the `[[tunnel]]` form and
+    // under `[interface]` in the original one, so both places are read.
+    #[serde(default)]
+    log: Option<String>,
+    #[serde(default)]
+    health_interval: Option<u64>,
+    #[serde(default)]
+    manage_firewall: Option<bool>,
+
+    // The original form: one tunnel, spelled without saying so.
+    #[serde(default)]
+    interface: Option<RawInterface>,
+    #[serde(default)]
+    peer: Option<RawPeer>,
+    #[serde(default)]
+    socks5: Option<RawSocks5>,
+
+    // The form that can name more than one.
+    #[serde(default)]
+    tunnel: Option<Vec<RawTunnel>>,
+}
+
+/// One `[[tunnel]]` section.
+///
+/// `interface` and `peer` are nested rather than flattened. Serde cannot do
+/// both `flatten` and `deny_unknown_fields`, and the flag is what turns a
+/// mistyped key into an error instead of a line that is silently ignored — a
+/// trade this tunnel has lost too often to make again. Nesting also makes the
+/// two forms the same file at different depths: `[interface]` becomes
+/// `[tunnel.interface]`, every key unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTunnel {
+    #[serde(default)]
+    name: Option<String>,
     interface: RawInterface,
     peer: RawPeer,
     #[serde(default)]
@@ -406,14 +499,124 @@ impl Config {
             source,
         })?;
 
-        let private_key = PrivateKey::from_base64(&raw.interface.private_key)
+        // Process settings sit at the top level in the new form and under
+        // `[interface]` in the old one, so a converted file behaves the same
+        // before and after conversion.
+        let inherited = raw.interface.as_ref();
+        let level = raw
+            .log
+            .clone()
+            .or_else(|| inherited.and_then(|i| i.log.clone()))
+            .unwrap_or_else(|| "info".to_owned());
+        let log = crate::log::Level::parse(&level).ok_or_else(|| {
+            invalid(
+                "log",
+                format!(
+                    "unknown level {level:?}; known levels are {:?}",
+                    crate::log::Level::ALL
+                ),
+            )
+        })?;
+        let health_interval = raw
+            .health_interval
+            .or_else(|| inherited.and_then(|i| i.health_interval))
+            .unwrap_or(60);
+        let manage_firewall = raw
+            .manage_firewall
+            .or_else(|| inherited.and_then(|i| i.manage_firewall))
+            .unwrap_or(true);
+
+        let tunnels = match (raw.interface, raw.peer, raw.tunnel) {
+            (Some(iface), Some(peer), None) => {
+                // Named for its device, which is what a log line would have to
+                // call it otherwise.
+                let name = iface.device.clone().unwrap_or_else(|| "paqetz0".to_owned());
+                vec![Self::one(name, iface, peer, raw.socks5)?]
+            }
+            (None, None, Some(list)) if !list.is_empty() => {
+                let mut out = Vec::with_capacity(list.len());
+                for (i, t) in list.into_iter().enumerate() {
+                    let name = t.name.unwrap_or_else(|| format!("tunnel{i}"));
+                    out.push(Self::one(name, t.interface, t.peer, t.socks5)?);
+                }
+                out
+            }
+            (None, None, _) => {
+                return Err(invalid(
+                    "tunnel",
+                    "nothing to run: write an [interface] and a [peer], or one or \
+                     more [[tunnel]] sections",
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    "tunnel",
+                    "a top-level [interface] or [peer] alongside [[tunnel]] is \
+                     ambiguous; use one form or the other",
+                ));
+            }
+        };
+
+        Self::distinct(&tunnels)?;
+        Ok(Self {
+            log,
+            health_interval,
+            manage_firewall,
+            tunnels,
+        })
+    }
+
+    /// Refuses tunnels that would fight each other.
+    ///
+    /// Two sharing a device, an inner address or a mark each undo the other's
+    /// routing, and the symptom is whichever one lost — which looks nothing like
+    /// a configuration mistake from the outside.
+    fn distinct(tunnels: &[TunnelConfig]) -> Result<()> {
+        for (i, a) in tunnels.iter().enumerate() {
+            for b in tunnels.iter().skip(i + 1) {
+                if a.name == b.name {
+                    return Err(invalid(
+                        "tunnel.name",
+                        format!("{:?} appears twice", a.name),
+                    ));
+                }
+                let clash = |what: &str, value: String| {
+                    invalid(
+                        "tunnel",
+                        format!("{:?} and {:?} both use {what} {value}", a.name, b.name),
+                    )
+                };
+                if a.interface.device == b.interface.device {
+                    return Err(clash("device", a.interface.device.clone()));
+                }
+                if a.interface.address == b.interface.address {
+                    return Err(clash("inner address", a.interface.address.to_string()));
+                }
+                if let (Some(x), Some(y)) = (a.interface.route_marked, b.interface.route_marked)
+                    && x == y
+                {
+                    return Err(clash("mark", x.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds one tunnel from its sections.
+    fn one(
+        name: String,
+        iface: RawInterface,
+        peer_raw: RawPeer,
+        socks5_raw: Option<RawSocks5>,
+    ) -> Result<TunnelConfig> {
+        let private_key = PrivateKey::from_base64(&iface.private_key)
             .map_err(|e| invalid("interface.private_key", e.to_string()))?;
 
         let (address, prefix) =
-            parse_cidr(&raw.interface.address).map_err(|p| invalid("interface.address", p))?;
+            parse_cidr(&iface.address).map_err(|p| invalid("interface.address", p))?;
         let netmask = mask_from_prefix(prefix);
 
-        let mtu = raw.interface.mtu.unwrap_or(paqetz_dp::tun::DEFAULT_MTU);
+        let mtu = iface.mtu.unwrap_or(paqetz_dp::tun::DEFAULT_MTU);
         if !(576..=9000).contains(&mtu) {
             return Err(invalid(
                 "interface.mtu",
@@ -421,7 +624,7 @@ impl Config {
             ));
         }
 
-        let profile_name = raw.interface.profile.as_deref().unwrap_or("linux-6");
+        let profile_name = iface.profile.as_deref().unwrap_or("linux-6");
         let profile = paqetz_tcpwire::profile::by_name(profile_name).ok_or_else(|| {
             let known: Vec<&str> = paqetz_tcpwire::profile::ALL
                 .iter()
@@ -433,7 +636,7 @@ impl Config {
             )
         })?;
 
-        let carrier = match raw.interface.carrier.as_deref().unwrap_or("midstream") {
+        let carrier = match iface.carrier.as_deref().unwrap_or("midstream") {
             "midstream" => paqetz_tcpwire::Carrier::Midstream,
             "handshake" => paqetz_tcpwire::Carrier::Handshake,
             other => {
@@ -444,7 +647,7 @@ impl Config {
             }
         };
 
-        let sequencing = match raw.interface.sequencing.as_deref().unwrap_or("opaque") {
+        let sequencing = match iface.sequencing.as_deref().unwrap_or("opaque") {
             "opaque" => paqetz_tcpwire::Sequencing::Opaque,
             "stream" => paqetz_tcpwire::Sequencing::Stream,
             other => {
@@ -455,7 +658,7 @@ impl Config {
             }
         };
 
-        let datapath = match raw.interface.datapath.as_deref().unwrap_or("simple") {
+        let datapath = match iface.datapath.as_deref().unwrap_or("simple") {
             "batched" => Datapath::Batched,
             "simple" => Datapath::Simple,
             other => {
@@ -466,7 +669,7 @@ impl Config {
             }
         };
 
-        let transmit = match raw.interface.transmit.as_deref().unwrap_or("raw") {
+        let transmit = match iface.transmit.as_deref().unwrap_or("raw") {
             "raw" => TransmitPath::Raw,
             "afpacket" => TransmitPath::AfPacket,
             other => {
@@ -477,21 +680,10 @@ impl Config {
             }
         };
 
-        let log_name = raw.interface.log.as_deref().unwrap_or("info");
-        let log = crate::log::Level::parse(log_name).ok_or_else(|| {
-            invalid(
-                "interface.log",
-                format!(
-                    "unknown level {log_name:?}; known levels are {:?}",
-                    crate::log::Level::ALL
-                ),
-            )
-        })?;
-
-        let public_key = PublicKey::from_base64(&raw.peer.public_key)
+        let public_key = PublicKey::from_base64(&peer_raw.public_key)
             .map_err(|e| invalid("peer.public_key", e.to_string()))?;
 
-        let endpoint = match raw.peer.endpoint.as_deref() {
+        let endpoint = match peer_raw.endpoint.as_deref() {
             None => None,
             Some(s) => Some(
                 s.parse::<SocketAddrV4>()
@@ -499,15 +691,14 @@ impl Config {
             ),
         };
 
-        let tunnel_address: Ipv4Addr = raw
-            .peer
+        let tunnel_address: Ipv4Addr = peer_raw
             .tunnel_address
             .parse()
             .map_err(|e| invalid("peer.tunnel_address", format!("{e}")))?;
 
         // Derived rather than configured (D12): the inner address is one we
         // assign, so its /32 is implied and there is nothing to write down.
-        let allowed_ips = match raw.peer.allowed_ips {
+        let allowed_ips = match peer_raw.allowed_ips {
             None => vec![(tunnel_address, 32u8)],
             Some(entries) => {
                 let mut out = Vec::with_capacity(entries.len());
@@ -522,7 +713,7 @@ impl Config {
             }
         };
 
-        let socks5 = match raw.socks5 {
+        let socks5 = match socks5_raw {
             None => None,
             Some(r) => {
                 let listen: SocketAddr = r
@@ -571,7 +762,7 @@ impl Config {
             }
         };
 
-        let listen_port = raw.interface.listen_port.unwrap_or(0);
+        let listen_port = iface.listen_port.unwrap_or(0);
         if endpoint.is_none() && listen_port == 0 {
             return Err(invalid(
                 "interface.listen_port",
@@ -580,7 +771,8 @@ impl Config {
             ));
         }
 
-        Ok(Self {
+        Ok(TunnelConfig {
+            name,
             socks5,
             interface: Interface {
                 private_key,
@@ -588,18 +780,15 @@ impl Config {
                 netmask,
                 mtu,
                 listen_port,
-                device: raw.interface.device.unwrap_or_else(|| "paqetz0".to_owned()),
+                device: iface.device.unwrap_or_else(|| "paqetz0".to_owned()),
                 profile,
                 carrier,
                 sequencing,
-                manage_firewall: raw.interface.manage_firewall.unwrap_or(true),
                 datapath,
                 transmit,
-                log,
-                health_interval: raw.interface.health_interval.unwrap_or(60),
-                gateway: raw.interface.gateway.unwrap_or(false),
-                route_all: raw.interface.route_all.unwrap_or(false),
-                route_marked: match raw.interface.route_marked {
+                gateway: iface.gateway.unwrap_or(false),
+                route_all: iface.route_all.unwrap_or(false),
+                route_marked: match iface.route_marked {
                     Some(0) => {
                         return Err(invalid(
                             "interface.route_marked",
@@ -609,11 +798,11 @@ impl Config {
                     }
                     other => other,
                 },
-                route_table: raw.interface.route_table.unwrap_or(51),
-                egress: raw.interface.egress,
+                route_table: iface.route_table.unwrap_or(51),
+                egress: iface.egress,
                 // wg-quick's own default when `Table` is set to a number for a
                 // WARP profile, which is the usual reason to want this.
-                egress_table: raw.interface.egress_table.unwrap_or(51_820),
+                egress_table: iface.egress_table.unwrap_or(51_820),
             },
             peer: Peer {
                 public_key,
@@ -658,6 +847,48 @@ mod tests {
 
     use super::*;
 
+    /// Three tunnels in one file, in the form that can say so.
+    const THREE: &str = r#"
+log = "debug"
+
+[[tunnel]]
+name = "de"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.7.0.2/24"
+device = "paqetz0"
+route_marked = 81
+[tunnel.peer]
+public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+endpoint = "203.0.113.5:8443"
+tunnel_address = "10.7.0.1"
+
+[[tunnel]]
+name = "nl"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.8.0.2/24"
+device = "paqetz1"
+mtu = 1280
+route_marked = 82
+[tunnel.peer]
+public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+endpoint = "198.51.100.7:8443"
+tunnel_address = "10.8.0.1"
+
+[[tunnel]]
+name = "us"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.9.0.2/24"
+device = "paqetz2"
+route_marked = 83
+[tunnel.peer]
+public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+endpoint = "192.0.2.9:8443"
+tunnel_address = "10.9.0.1"
+"#;
+
     const CLIENT: &str = r#"
 [interface]
 private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
@@ -681,8 +912,109 @@ tunnel_address = "10.7.0.2"
 "#;
 
     #[test]
-    fn a_minimal_client_configuration_parses() {
+    fn several_tunnels_are_read_in_order() {
+        let c = Config::parse(THREE).expect("parse");
+        assert_eq!(
+            c.tunnels
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["de", "nl", "us"]
+        );
+        assert_eq!(c.log, crate::log::Level::Debug, "read from the top level");
+    }
+
+    #[test]
+    fn each_tunnel_keeps_its_own_settings() {
+        // The point of the whole exercise: one client, several destinations,
+        // chosen by mark. Sharing any of these would make two tunnels one.
+        let c = Config::parse(THREE).expect("parse");
+        let nl = c.named("nl").expect("nl");
+        assert_eq!(nl.interface.device, "paqetz1");
+        assert_eq!(nl.interface.mtu, 1280, "mtu is per tunnel");
+        assert_eq!(nl.interface.route_marked, Some(82));
+        assert_eq!(nl.peer.endpoint.expect("endpoint").port(), 8443);
+
+        let de = c.named("de").expect("de");
+        assert_eq!(
+            de.interface.mtu,
+            paqetz_dp::tun::DEFAULT_MTU,
+            "and defaults per tunnel"
+        );
+        assert_ne!(de.interface.address, nl.interface.address);
+    }
+
+    #[test]
+    fn the_old_form_is_still_one_tunnel_named_for_its_device() {
         let c = Config::parse(CLIENT).expect("parse");
+        assert_eq!(c.tunnels.len(), 1);
+        assert_eq!(c.tunnels[0].name, "paqetz0");
+    }
+
+    #[test]
+    fn tunnels_that_would_fight_each_other_are_refused() {
+        // Each of these leaves two tunnels undoing each other's routing, and the
+        // symptom is whichever one lost -- which looks nothing like a
+        // configuration mistake from the outside.
+        for (what, from, to) in [
+            ("device", "device = \"paqetz1\"", "device = \"paqetz0\""),
+            ("mark", "route_marked = 82", "route_marked = 81"),
+            (
+                "address",
+                "address = \"10.8.0.2/24\"",
+                "address = \"10.7.0.2/24\"",
+            ),
+            ("name", "name = \"nl\"", "name = \"de\""),
+        ] {
+            let text = THREE.replace(from, to);
+            let err = Config::parse(&text).expect_err(&format!("{what} clash must be refused"));
+            assert!(
+                err.to_string().contains("both use") || err.to_string().contains("appears twice"),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_forms_cannot_be_mixed() {
+        // The tunnel sections only; a stray top-level key appended after
+        // `[peer]` would belong to the peer table and fail for another reason.
+        let text = format!("{CLIENT}\n{}", THREE.replace("log = \"debug\"\n", ""));
+        let err = Config::parse(&text).expect_err("ambiguous");
+        assert!(err.to_string().contains("ambiguous"), "got: {err}");
+    }
+
+    #[test]
+    fn a_file_describing_nothing_says_so() {
+        let err = Config::parse("log = \"info\"\n").expect_err("nothing to run");
+        assert!(err.to_string().contains("nothing to run"), "got: {err}");
+    }
+
+    #[test]
+    fn a_mistyped_key_inside_a_tunnel_is_still_caught() {
+        // What nesting bought instead of flattening: serde cannot do both
+        // `flatten` and `deny_unknown_fields`, and this is the property that
+        // turns a typo into an error rather than a line quietly ignored.
+        let text = THREE.replace("route_marked = 81", "route_marekd = 81");
+        assert!(Config::parse(&text).is_err(), "a typo must not be ignored");
+    }
+
+    #[test]
+    fn only_refuses_to_choose_among_several() {
+        let c = Config::parse(THREE).expect("parse");
+        assert!(
+            c.only().is_err(),
+            "picking the first silently would be worse"
+        );
+        assert!(Config::parse(CLIENT).expect("parse").only().is_ok());
+    }
+
+    #[test]
+    fn a_minimal_client_configuration_parses() {
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.interface.address, Ipv4Addr::new(10, 7, 0, 2));
         assert_eq!(c.interface.netmask, Ipv4Addr::new(255, 255, 255, 0));
         assert!(c.peer.is_initiator(), "an endpoint means we initiate");
@@ -691,7 +1023,10 @@ tunnel_address = "10.7.0.2"
 
     #[test]
     fn a_minimal_server_configuration_parses() {
-        let c = Config::parse(SERVER).expect("parse");
+        let c = Config::parse(SERVER)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(!c.peer.is_initiator(), "no endpoint means we wait");
         assert_eq!(c.interface.listen_port, 9999);
     }
@@ -707,33 +1042,44 @@ tunnel_address = "10.7.0.2"
 
     #[test]
     fn defaults_are_applied() {
-        let c = Config::parse(CLIENT).expect("parse");
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.interface.mtu, paqetz_dp::tun::DEFAULT_MTU);
         assert_eq!(c.interface.device, "paqetz0");
         assert_eq!(c.interface.profile.name, "linux-6");
         assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Midstream);
-        assert!(c.interface.manage_firewall);
     }
 
     #[test]
     fn forwarding_and_routing_are_off_unless_asked_for() {
         // Both change the host's networking beyond the tunnel itself, so
         // neither happens because a config file was merely present.
-        let c = Config::parse(CLIENT).expect("parse");
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(!c.interface.gateway);
         assert!(!c.interface.route_all);
     }
 
     #[test]
     fn an_egress_interface_is_off_unless_named() {
-        let c = Config::parse(CLIENT).expect("parse");
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(c.interface.egress.is_none());
     }
 
     #[test]
     fn an_egress_interface_can_be_named() {
         let text = CLIENT.replace("[peer]", "egress = \"warp\"\n\n[peer]");
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.interface.egress.as_deref(), Some("warp"));
         assert_eq!(c.interface.egress_table, 51_820);
     }
@@ -743,7 +1089,10 @@ tunnel_address = "10.7.0.2"
         // The arrangement a proxy in front of the tunnel needs: only what it
         // marks goes through, so its own inbound connections are unaffected.
         let text = CLIENT.replace("[peer]", "route_marked = 81\n\n[peer]");
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.interface.route_marked, Some(81));
         assert_eq!(c.interface.route_table, 51);
         assert!(c.socks5.is_none(), "no listener is needed for this");
@@ -762,7 +1111,10 @@ tunnel_address = "10.7.0.2"
     #[test]
     fn forwarding_and_routing_can_be_switched_on() {
         let text = CLIENT.replace("[peer]", "gateway = true\nroute_all = true\n\n[peer]");
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(c.interface.gateway);
         assert!(c.interface.route_all);
     }
@@ -770,7 +1122,10 @@ tunnel_address = "10.7.0.2"
     #[test]
     fn the_tunnel_subnet_is_derived_from_the_address() {
         // What the gateway's translation rule is scoped to.
-        let c = Config::parse(CLIENT).expect("parse");
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(
             c.tunnel_subnet(),
             (Ipv4Addr::new(10, 7, 0, 0), 24),
@@ -780,9 +1135,12 @@ tunnel_address = "10.7.0.2"
 
     #[test]
     fn logging_defaults_to_info_with_a_health_line_every_minute() {
+        // Process settings now, read from `[interface]` for a file written the
+        // old way -- which is the whole of the compatibility promise.
         let c = Config::parse(CLIENT).expect("parse");
-        assert_eq!(c.interface.log, crate::log::Level::Info);
-        assert_eq!(c.interface.health_interval, 60);
+        assert_eq!(c.log, crate::log::Level::Info);
+        assert_eq!(c.health_interval, 60);
+        assert!(c.manage_firewall);
     }
 
     #[test]
@@ -790,7 +1148,7 @@ tunnel_address = "10.7.0.2"
         for name in crate::log::Level::ALL {
             let text = CLIENT.replace("[peer]", &format!("log = \"{name}\"\n\n[peer]"));
             let c = Config::parse(&text).expect("parse");
-            assert_eq!(c.interface.log.name(), *name);
+            assert_eq!(c.log.name(), *name);
         }
     }
 
@@ -804,24 +1162,30 @@ tunnel_address = "10.7.0.2"
     #[test]
     fn the_health_line_can_be_disabled() {
         let text = CLIENT.replace("[peer]", "health_interval = 0\n\n[peer]");
-        assert_eq!(
-            Config::parse(&text)
-                .expect("parse")
-                .interface
-                .health_interval,
-            0
-        );
+        assert_eq!(Config::parse(&text).expect("parse").health_interval, 0);
     }
 
     #[test]
     fn socks5_is_off_unless_configured() {
-        assert!(Config::parse(CLIENT).expect("parse").socks5.is_none());
+        assert!(
+            Config::parse(CLIENT)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel")
+                .socks5
+                .is_none()
+        );
     }
 
     #[test]
     fn a_socks5_section_is_read_with_sensible_defaults() {
         let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\n");
-        let s = Config::parse(&text).expect("parse").socks5.expect("socks5");
+        let s = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel")
+            .socks5
+            .expect("socks5");
         assert_eq!(s.listen.port(), 1080);
         assert!(s.listen.ip().is_loopback());
         assert_ne!(s.mark, 0, "a zero mark would steer nothing");
@@ -834,6 +1198,8 @@ tunnel_address = "10.7.0.2"
             let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\n{line}\n");
             Config::parse(&text)
                 .expect("parse")
+                .into_only()
+                .expect("one tunnel")
                 .socks5
                 .expect("socks5")
                 .dns
@@ -890,13 +1256,21 @@ tunnel_address = "10.7.0.2"
         let both = format!(
             "{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\nusername = \"a\"\npassword = \"b\"\n"
         );
-        let s = Config::parse(&both).expect("parse").socks5.expect("socks5");
+        let s = Config::parse(&both)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel")
+            .socks5
+            .expect("socks5");
         assert_eq!(s.credentials, Some(("a".to_owned(), "b".to_owned())));
     }
 
     #[test]
     fn the_datapath_and_transmit_defaults_are_the_recommended_ones() {
-        let c = Config::parse(CLIENT).expect("parse");
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(
             c.interface.datapath,
             Datapath::Simple,
@@ -915,7 +1289,10 @@ tunnel_address = "10.7.0.2"
             "[peer]",
             "datapath = \"simple\"\ntransmit = \"afpacket\"\n\n[peer]",
         );
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.interface.datapath, Datapath::Simple);
         assert_eq!(c.interface.transmit, TransmitPath::AfPacket);
     }
@@ -932,7 +1309,10 @@ tunnel_address = "10.7.0.2"
     #[test]
     fn allowed_ips_defaults_to_the_peers_own_address() {
         // D12: derived, not configured. There should be nothing to write.
-        let c = Config::parse(CLIENT).expect("parse");
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.peer.allowed_ips, vec![(Ipv4Addr::new(10, 7, 0, 1), 32)]);
         assert!(c.peer.permits(Ipv4Addr::new(10, 7, 0, 1)));
         assert!(!c.peer.permits(Ipv4Addr::new(10, 7, 0, 9)));
@@ -945,7 +1325,10 @@ tunnel_address = "10.7.0.2"
             "tunnel_address = \"10.7.0.1\"",
             "tunnel_address = \"10.7.0.1\"\nallowed_ips = [\"10.7.0.0/24\", \"192.168.9.0/24\"]",
         );
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(c.peer.permits(Ipv4Addr::new(10, 7, 0, 200)));
         assert!(c.peer.permits(Ipv4Addr::new(192, 168, 9, 1)));
         assert!(!c.peer.permits(Ipv4Addr::new(192, 168, 10, 1)));
@@ -957,7 +1340,10 @@ tunnel_address = "10.7.0.2"
             "tunnel_address = \"10.7.0.1\"",
             "tunnel_address = \"10.7.0.1\"\nallowed_ips = [\"any\"]",
         );
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert!(c.peer.permits(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(c.peer.permits(Ipv4Addr::LOCALHOST));
     }
@@ -994,14 +1380,24 @@ tunnel_address = "10.7.0.2"
     #[test]
     fn segments_are_numbered_opaquely_unless_asked_otherwise() {
         assert_eq!(
-            Config::parse(CLIENT).expect("parse").interface.sequencing,
+            Config::parse(CLIENT)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel")
+                .interface
+                .sequencing,
             paqetz_tcpwire::Sequencing::Opaque,
             "byte-accurate numbering is checkable, and this carrier cannot keep \
              the promise it makes once a packet is lost"
         );
         let text = CLIENT.replace("[peer]", "sequencing = \"stream\"\n\n[peer]");
         assert_eq!(
-            Config::parse(&text).expect("parse").interface.sequencing,
+            Config::parse(&text)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel")
+                .interface
+                .sequencing,
             paqetz_tcpwire::Sequencing::Stream
         );
     }
@@ -1022,7 +1418,10 @@ tunnel_address = "10.7.0.2"
     #[test]
     fn the_carrier_mode_can_be_switched() {
         let text = CLIENT.replace("[peer]", "carrier = \"handshake\"\n\n[peer]");
-        let c = Config::parse(&text).expect("parse");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
         assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Handshake);
     }
 
