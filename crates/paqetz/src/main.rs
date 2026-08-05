@@ -305,12 +305,6 @@ fn pubkey() -> Result<(), Box<dyn std::error::Error>> {
 
 fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let process = Config::load(path)?;
-    let manage_firewall = process.manage_firewall;
-    let health_interval = process.health_interval;
-    // Stage one carries a single tunnel per process, exactly as before. A file
-    // describing several parses, and is refused here rather than silently
-    // running one of them, until the orchestration that starts them all lands.
-    let cfg = process.only()?.clone();
     // `PAQETZ_LOG` overrides the file, so a level can be raised for one run
     // without editing anything.
     let level = std::env::var("PAQETZ_LOG")
@@ -321,18 +315,141 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
     tunnel::install_signal_handlers();
 
-    log::info!(
-        "{} at {} (mtu {}), peer {} {}",
-        cfg.interface.device,
-        cfg.interface.address,
-        cfg.interface.mtu,
-        cfg.peer.tunnel_address,
-        cfg.peer.endpoint.map_or_else(
-            || "waiting for connection".to_owned(),
-            |e| format!("via {e}")
-        ),
-    );
+    // Named in the log only when there is more than one, so a single tunnel
+    // reads exactly as it always has.
+    let labelled = process.tunnels.len() > 1;
 
+    // Every tunnel starts before anything is installed around them: the ports
+    // the firewall rules must name are settled by binding, and one table covers
+    // them all. Scoping a rule to anything else -- the peer's port, say -- would
+    // leave the kernel free to reset the very traffic it exists to protect.
+    let mut tunnels = Vec::with_capacity(process.tunnels.len());
+    for cfg in &process.tunnels {
+        log::info!(
+            "{} at {} (mtu {}), peer {} {}",
+            cfg.interface.device,
+            cfg.interface.address,
+            cfg.interface.mtu,
+            cfg.peer.tunnel_address,
+            cfg.peer.endpoint.map_or_else(
+                || "waiting for connection".to_owned(),
+                |e| format!("via {e}")
+            ),
+        );
+        let mut tunnel = Tunnel::start(cfg.clone(), process.health_interval)?;
+        if labelled {
+            tunnel.set_label(cfg.name.clone());
+        }
+        tunnel.watch_config(path.to_path_buf());
+        log::info!(
+            "{}: outer port {}, log level {}",
+            cfg.name,
+            tunnel.local_port(),
+            level.name()
+        );
+        tunnels.push(tunnel);
+    }
+
+    let ports: Vec<u16> = tunnels.iter().map(Tunnel::local_port).collect();
+
+    // The rules are load-bearing, not advisory (D9): without them the kernel
+    // resets the flow. One table names every port, in one transaction.
+    let fw = if process.manage_firewall {
+        match Firewall::detect(&ports) {
+            Ok(fw) => {
+                fw.apply()?;
+                Some(fw)
+            }
+            Err(e) => {
+                log::warn_!("{e}");
+                log::warn_!("the tunnel will run, but the kernel may reset it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut attached = Vec::with_capacity(tunnels.len());
+    for (cfg, tunnel) in process.tunnels.iter().zip(&tunnels) {
+        attached.push(attach(cfg, tunnel)?);
+    }
+
+    // Each tunnel blocks in its own loop until shutdown, so they run in
+    // parallel and are waited on together. A signal stops all of them, because
+    // the flag they watch is the process's.
+    let mut running = Vec::with_capacity(tunnels.len());
+    for (cfg, tunnel) in process.tunnels.iter().zip(tunnels) {
+        let name = cfg.name.clone();
+        running.push(
+            std::thread::Builder::new()
+                .name(format!("{name}/run"))
+                .spawn(move || tunnel.run())?,
+        );
+    }
+
+    let mut result = Ok(());
+    for handle in running {
+        match handle.join() {
+            Ok(Err(e)) => {
+                log::error!("tunnel stopped: {e}");
+                result = Err(e);
+            }
+            Ok(Ok(())) => {}
+            Err(_) => log::error!("a tunnel thread panicked"),
+        }
+    }
+
+    for a in attached {
+        a.revert();
+    }
+
+    // Leave the host as we found it, whether or not the tunnels ended cleanly.
+    if let Some(fw) = fw
+        && let Err(e) = fw.revert()
+    {
+        log::warn_!("could not remove firewall rules: {e}");
+    }
+
+    result.map_err(Into::into)
+}
+
+/// The host-level state one tunnel installs, so it can be undone.
+struct Attached {
+    device: String,
+    marked: Option<paqetz_net4::route::Policy>,
+    listener: Option<paqetz_net4::route::Policy>,
+    gateway: Option<(paqetz_fw::gateway::Gateway, bool)>,
+    routes: Option<paqetz_fw::gateway::TunnelRoutes>,
+}
+
+impl Attached {
+    /// Leaves the host as it was found.
+    fn revert(self) {
+        if let Some(routes) = self.routes {
+            routes.revert();
+        }
+        if let Some((gw, turned_on)) = self.gateway {
+            gw.revert(turned_on);
+        }
+        if let Some(policy) = self.listener {
+            policy.revert(&self.device);
+        }
+        if let Some(policy) = self.marked {
+            policy.revert(&self.device);
+        }
+    }
+}
+
+/// Installs the routing, forwarding and front end one tunnel asks for.
+///
+/// Separate from starting the tunnel because the two happen at different times:
+/// every tunnel binds its socket first, so the one firewall table can name every
+/// port at once, and only then does each one arrange the host around itself.
+fn attach(
+    cfg: &config::TunnelConfig,
+    tunnel: &Tunnel,
+) -> Result<Attached, Box<dyn std::error::Error>> {
     // Sockets and the device come up first, because the port the rules must
     // name is only settled here: the initiating side takes an ephemeral one.
     // Scoping the rules to anything else — the peer's port, say — would leave
@@ -383,30 +500,6 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             table: cfg.interface.egress_table,
         });
     let peer_endpoint = cfg.peer.endpoint;
-
-    let mut tunnel = Tunnel::start(cfg, health_interval)?;
-    tunnel.watch_config(path.to_path_buf());
-    let port = tunnel.local_port();
-    log::info!("outer port {port}, log level {}", level.name());
-
-    // The rules are load-bearing, not advisory (D9): without them the kernel
-    // resets the flow. Installing them here means one less way for a setup to
-    // fail silently.
-    let fw = if manage_firewall {
-        match Firewall::detect(&[port]) {
-            Ok(fw) => {
-                fw.apply()?;
-                Some(fw)
-            }
-            Err(e) => {
-                log::warn_!("{e}");
-                log::warn_!("the tunnel will run, but the kernel may reset it");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // A policy route for marked sockets, if asked for. This is the L3 way to
     // send *some* of a host's traffic through the tunnel: whatever sets the
@@ -547,29 +640,13 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         (false, _) => None,
     };
 
-    let result = tunnel.run();
-
-    if let Some(routes) = routes {
-        routes.revert();
-    }
-    if let Some((gw, turned_on)) = gateway {
-        gw.revert(turned_on);
-    }
-    if let Some(policy) = policy {
-        policy.revert(&device);
-    }
-    if let Some(policy) = marked {
-        policy.revert(&device);
-    }
-
-    // Leave the host as we found it, whether or not the tunnel ended cleanly.
-    if let Some(fw) = fw
-        && let Err(e) = fw.revert()
-    {
-        log::warn_!("could not remove firewall rules: {e}");
-    }
-
-    result.map_err(Into::into)
+    Ok(Attached {
+        device,
+        marked,
+        listener: policy,
+        gateway,
+        routes,
+    })
 }
 
 /// The gateway and interface of the host's default route.

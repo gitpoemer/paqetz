@@ -184,6 +184,8 @@ pub(crate) struct Tunnel {
     stats: Arc<Stats>,
     /// Where the configuration was read from, so `SIGHUP` can re-read it.
     config_path: Option<std::path::PathBuf>,
+    /// What to call this tunnel in the log, when the process has several.
+    label: Option<String>,
 }
 
 /// Anything that can stop the tunnel starting.
@@ -315,6 +317,7 @@ impl Tunnel {
             state: Arc::new(Mutex::new(PeerState::new(cfg.peer.endpoint))),
             cfg,
             health_interval,
+            label: None,
             tun: Arc::new(tun),
             rx: Arc::new(rx),
             tx: Arc::new(tx),
@@ -410,6 +413,25 @@ impl Tunnel {
         Ok(())
     }
 
+    /// Names this tunnel in its own log lines.
+    ///
+    /// Set only when a process carries more than one, so a single tunnel reads
+    /// exactly as it always has and three do not interleave into noise.
+    pub(crate) fn set_label(&mut self, name: String) {
+        self.label = Some(name);
+    }
+
+    /// What to put in front of this tunnel's log lines.
+    ///
+    /// Empty for a lone tunnel, so its output is unchanged, and `"name: "` when
+    /// a process carries several and three status lines a minute would otherwise
+    /// interleave into something nobody can read.
+    fn tag(&self) -> String {
+        self.label
+            .as_ref()
+            .map_or_else(String::new, |n| format!("{n}: "))
+    }
+
     /// Remembers where the configuration came from, enabling `SIGHUP`.
     pub(crate) fn watch_config(&mut self, path: std::path::PathBuf) {
         self.config_path = Some(path);
@@ -440,7 +462,7 @@ impl Tunnel {
                 let drops = self.rx.drops().ok();
                 crate::log::emit(
                     crate::log::Level::Info,
-                    format_args!("{}", self.stats.line(self.now(), drops)),
+                    format_args!("{}{}", self.tag(), self.stats.line(self.now(), drops)),
                 );
             }
         }
@@ -936,8 +958,11 @@ impl Tunnel {
 
         self.stats.note_handshake(now);
         info!(
-            "handshake completed with {} at {}:{}",
-            self.cfg.peer.public_key, seg.src.0, seg.src.1
+            "{}handshake completed with {} at {}:{}",
+            self.tag(),
+            self.cfg.peer.public_key,
+            seg.src.0,
+            seg.src.1
         );
 
         let Some(out) = reply.get(..written) else {
@@ -962,7 +987,11 @@ impl Tunnel {
                 state.established(now);
                 drop(state);
                 self.stats.note_handshake(now);
-                info!("handshake completed with {}", self.cfg.peer.public_key);
+                info!(
+                    "{}handshake completed with {}",
+                    self.tag(),
+                    self.cfg.peer.public_key
+                );
                 Ok(())
             }
             Err(e) => Err(e.into()),

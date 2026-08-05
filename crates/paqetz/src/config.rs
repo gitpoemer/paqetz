@@ -201,27 +201,6 @@ pub(crate) struct Peer {
 }
 
 impl Config {
-    /// The only tunnel, when there is exactly one.
-    ///
-    /// Commands that act on a single tunnel use this, so a file describing
-    /// several is a refusal rather than a silent choice of the first.
-    ///
-    /// # Errors
-    /// Returns [`Error::Invalid`] when the count is not one.
-    pub(crate) fn only(&self) -> Result<&TunnelConfig> {
-        match self.tunnels.as_slice() {
-            [one] => Ok(one),
-            many => Err(invalid(
-                "tunnel",
-                format!(
-                    "this works on one tunnel, but {} are configured; name one \
-                     with --tunnel",
-                    many.len()
-                ),
-            )),
-        }
-    }
-
     /// The single tunnel this describes, taken by value.
     ///
     /// `None` when there are several, because the places that want this are
@@ -997,16 +976,6 @@ tunnel_address = "10.7.0.2"
         // turns a typo into an error rather than a line quietly ignored.
         let text = THREE.replace("route_marked = 81", "route_marekd = 81");
         assert!(Config::parse(&text).is_err(), "a typo must not be ignored");
-    }
-
-    #[test]
-    fn only_refuses_to_choose_among_several() {
-        let c = Config::parse(THREE).expect("parse");
-        assert!(
-            c.only().is_err(),
-            "picking the first silently would be worse"
-        );
-        assert!(Config::parse(CLIENT).expect("parse").only().is_ok());
     }
 
     #[test]
