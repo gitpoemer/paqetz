@@ -1740,7 +1740,7 @@ mod tests {
         let n = old_server.seal(b"before", &mut wire, 0).expect("seal");
         assert_eq!(
             state
-                .open(&wire[..n], &mut inner, 0)
+                .open(wire.get(..n).expect("sealed"), &mut inner, 0)
                 .expect("a session")
                 .expect("the current session reads its own traffic"),
             b"before".len(),
@@ -1753,18 +1753,18 @@ mod tests {
         let n = old_server.seal(b"in flight", &mut wire, 0).expect("seal");
         assert_eq!(
             state
-                .open(&wire[..n], &mut inner, 0)
+                .open(wire.get(..n).expect("sealed"), &mut inner, 0)
                 .expect("a session")
                 .expect("a packet sealed under the session just replaced is still readable"),
             b"in flight".len(),
             "a packet sealed under the session just replaced is still readable"
         );
-        assert_eq!(&inner[..b"in flight".len()], b"in flight");
+        assert_eq!(inner.get(..b"in flight".len()), Some(&b"in flight"[..]));
 
         let n = new_server.seal(b"after", &mut wire, 0).expect("seal");
         assert_eq!(
             state
-                .open(&wire[..n], &mut inner, 0)
+                .open(wire.get(..n).expect("sealed"), &mut inner, 0)
                 .expect("a session")
                 .expect("and the new session still reads its own"),
             b"after".len(),
@@ -1794,7 +1794,7 @@ mod tests {
         let n = first_server.seal(b"stale", &mut wire, 0).expect("seal");
         assert!(
             matches!(
-                state.open(&wire[..n], &mut inner, 0),
+                state.open(wire.get(..n).expect("sealed"), &mut inner, 0),
                 Some(Err(paqetz_core::Error::Rejected))
             ),
             "two rekeys back is not kept"
