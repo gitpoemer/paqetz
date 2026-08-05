@@ -46,10 +46,18 @@ const FRAGMENT_OFFSET_MASK: u32 = 0x1FFF;
 /// Snapshot length returned for an accepted packet: the whole frame.
 const ACCEPT: u32 = 262_144;
 
-/// Number of instructions in the program.
-pub const PROGRAM_LEN: usize = 11;
+/// Instructions before and after the port comparisons.
+///
+/// Eight of preamble, then one comparison per port, then accept and drop.
+const FIXED_LEN: usize = 10;
 
-/// Builds the filter program for one local port.
+/// How many instructions the program for `ports` will be.
+#[must_use]
+pub const fn program_len(ports: usize) -> usize {
+    FIXED_LEN + ports
+}
+
+/// Builds the filter program for this end's local ports.
 ///
 /// The program is:
 ///
@@ -62,32 +70,54 @@ pub const PROGRAM_LEN: usize = 11;
 ///   jset #0x1fff      jt fail ; must not be a later fragment
 ///   ldxb 4*([14]&0xf)         ; X := IP header length
 ///   ldh  [x + 16]             ; TCP destination port
-///   jeq  #port        jf fail
+///   jeq  #port0       jt accept
+///   jeq  #port1       jt accept
+///   ...                       ; the last one falls through to `fail`
+/// accept:
 ///   ret  #262144              ; accept the whole frame
 /// fail:
 ///   ret  #0                   ; drop
 /// ```
 ///
+/// Several ports because the carrier moves between them while it runs: a flow
+/// that lives for hours accumulates attention somewhere on the path, and
+/// changing the source port is what a restart was doing by accident. Filtering
+/// on the whole set means rotation needs no new socket and no new filter, which
+/// is what makes it possible at all — the capture thread is blocked in `recv`
+/// and cannot be interrupted to be handed a new one.
+///
 /// The fragment check matters for more than tidiness: a later fragment has no
 /// TCP header, so without it the port comparison would read whatever payload
 /// bytes happened to sit at that offset.
 #[must_use]
-pub fn program(port: u16) -> [Insn; PROGRAM_LEN] {
-    // Jump offsets are relative to the instruction *after* the jump, so each is
-    // (index of `fail`) - (index of this instruction) - 1.
-    [
-        insn(LD_H_ABS, 0, 0, 12),
-        insn(JEQ_K, 0, 8, ETHERTYPE_IPV4),
-        insn(LD_B_ABS, 0, 0, 23),
-        insn(JEQ_K, 0, 6, PROTO_TCP),
-        insn(LD_H_ABS, 0, 0, 20),
-        insn(JSET_K, 4, 0, FRAGMENT_OFFSET_MASK),
-        insn(LDX_B_MSH, 0, 0, 14),
-        insn(LD_H_IND, 0, 0, 16),
-        insn(JEQ_K, 0, 1, u32::from(port)),
-        insn(RET_K, 0, 0, ACCEPT),
-        insn(RET_K, 0, 0, 0),
-    ]
+pub fn program(ports: &[u16]) -> Vec<Insn> {
+    let n = ports.len();
+    // Jump offsets are relative to the instruction *after* the jump. `accept`
+    // sits at index 8 + n and `fail` at 9 + n, so a jump to `fail` from index i
+    // is 9 + n - i - 1.
+    let to_fail = |i: usize| u8::try_from(9 + n - i - 1).unwrap_or(u8::MAX);
+
+    let mut prog = Vec::with_capacity(program_len(n));
+    prog.push(insn(LD_H_ABS, 0, 0, 12));
+    prog.push(insn(JEQ_K, 0, to_fail(1), ETHERTYPE_IPV4));
+    prog.push(insn(LD_B_ABS, 0, 0, 23));
+    prog.push(insn(JEQ_K, 0, to_fail(3), PROTO_TCP));
+    prog.push(insn(LD_H_ABS, 0, 0, 20));
+    prog.push(insn(JSET_K, to_fail(5), 0, FRAGMENT_OFFSET_MASK));
+    prog.push(insn(LDX_B_MSH, 0, 0, 14));
+    prog.push(insn(LD_H_IND, 0, 0, 16));
+
+    for (i, port) in ports.iter().enumerate() {
+        // Match: jump forward to `accept`. Miss: try the next port, except the
+        // last, which falls to `fail`.
+        let jt = u8::try_from(n - 1 - i).unwrap_or(u8::MAX);
+        let jf = u8::from(i + 1 == n);
+        prog.push(insn(JEQ_K, jt, jf, u32::from(*port)));
+    }
+
+    prog.push(insn(RET_K, 0, 0, ACCEPT));
+    prog.push(insn(RET_K, 0, 0, 0));
+    prog
 }
 
 #[cfg(test)]
@@ -160,13 +190,13 @@ mod tests {
 
     #[test]
     fn accepts_our_traffic() {
-        let prog = program(9999);
+        let prog = program(&[9999]);
         assert_eq!(run(&prog, &good(9999)), ACCEPT);
     }
 
     #[test]
     fn rejects_another_port() {
-        let prog = program(9999);
+        let prog = program(&[9999]);
         assert_eq!(run(&prog, &good(9998)), 0);
         assert_eq!(run(&prog, &good(443)), 0);
         assert_eq!(run(&prog, &good(0)), 0);
@@ -174,7 +204,7 @@ mod tests {
 
     #[test]
     fn rejects_non_ipv4() {
-        let prog = program(9999);
+        let prog = program(&[9999]);
         assert_eq!(run(&prog, &frame(0x86DD, 6, 0, 9999, 5)), 0, "IPv6");
         assert_eq!(run(&prog, &frame(0x0806, 6, 0, 9999, 5)), 0, "ARP");
         assert_eq!(run(&prog, &frame(0x8100, 6, 0, 9999, 5)), 0, "VLAN");
@@ -182,14 +212,14 @@ mod tests {
 
     #[test]
     fn rejects_non_tcp() {
-        let prog = program(9999);
+        let prog = program(&[9999]);
         assert_eq!(run(&prog, &frame(0x0800, 17, 0, 9999, 5)), 0, "UDP");
         assert_eq!(run(&prog, &frame(0x0800, 1, 0, 9999, 5)), 0, "ICMP");
     }
 
     #[test]
     fn rejects_later_fragments() {
-        let prog = program(9999);
+        let prog = program(&[9999]);
         // A non-zero fragment offset means there is no TCP header here at all;
         // without this check the port comparison would read payload bytes.
         for frag in [0x0001u16, 0x00FF, 0x1FFF, 0x2001] {
@@ -209,7 +239,7 @@ mod tests {
     fn finds_the_port_past_ipv4_options() {
         // The port offset is computed from IHL rather than assumed, so a header
         // carrying options still parses.
-        let prog = program(9999);
+        let prog = program(&[9999]);
         for ihl in [5u8, 6, 8, 15] {
             assert_eq!(
                 run(&prog, &frame(0x0800, 6, 0, 9999, ihl)),
@@ -226,7 +256,7 @@ mod tests {
         // dropped rather than read past.
         const LAST_BYTE_EXAMINED: usize = 14 + 20 + 4;
 
-        let prog = program(9999);
+        let prog = program(&[9999]);
         let full = good(9999);
         for len in 0..LAST_BYTE_EXAMINED {
             assert_eq!(run(&prog, &full[..len]), 0, "truncated to {len}");
@@ -240,13 +270,73 @@ mod tests {
     }
 
     #[test]
+    fn every_port_in_the_set_is_accepted_and_nothing_else_is() {
+        // The carrier rotates between these while it runs, so a frame for any of
+        // them has to reach us -- including the one we are about to move to, and
+        // the one we have just left, which is still carrying replies.
+        let ports = [61001u16, 61002, 61003, 61004];
+        let prog = program(&ports);
+        for p in ports {
+            assert_eq!(
+                run(&prog, &frame(0x0800, 6, 0, p, 5)),
+                ACCEPT,
+                "port {p} should be accepted"
+            );
+        }
+        for p in [61000u16, 61005, 443, 0] {
+            assert_eq!(
+                run(&prog, &frame(0x0800, 6, 0, p, 5)),
+                0,
+                "port {p} should be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn one_port_still_produces_what_it_always_did() {
+        let prog = program(&[9999]);
+        assert_eq!(prog.len(), program_len(1));
+        assert_eq!(
+            prog.len(),
+            11,
+            "the original program was eleven instructions"
+        );
+    }
+
+    #[test]
+    fn the_program_grows_by_one_instruction_per_port() {
+        for n in 1..=8 {
+            let ports: Vec<u16> = (0..n)
+                .map(|i| 61_000 + u16::try_from(i).expect("small"))
+                .collect();
+            assert_eq!(program(&ports).len(), program_len(n));
+        }
+    }
+
+    #[test]
     fn every_jump_lands_inside_the_program() {
-        let prog = program(9999);
+        // Checked for each width, because the offsets to `fail` are computed
+        // from the number of ports and an off-by-one there is a filter that
+        // silently drops everything.
+        for n in 1..=8usize {
+            let ports: Vec<u16> = (0..n)
+                .map(|i| 61_000 + u16::try_from(i).expect("small"))
+                .collect();
+            let prog = program(&ports);
+            for (i, ins) in prog.iter().enumerate() {
+                for off in [ins.jt, ins.jf] {
+                    let dest = i + 1 + usize::from(off);
+                    assert!(dest <= prog.len(), "n={n}: instruction {i} jumps out");
+                }
+            }
+        }
+
+        let prog = program(&[9999]);
         for (i, insn) in prog.iter().enumerate() {
             if insn.code == JEQ_K || insn.code == JSET_K {
                 for target in [insn.jt, insn.jf] {
                     let dest = i + 1 + usize::from(target);
-                    assert!(dest < PROGRAM_LEN, "instruction {i} jumps out of bounds");
+                    assert!(dest < prog.len(), "instruction {i} jumps out of bounds");
                 }
             }
         }
@@ -256,8 +346,8 @@ mod tests {
     fn the_program_terminates_on_every_path() {
         // Both terminal instructions must be returns, or a frame could run off
         // the end of the program.
-        let prog = program(1);
-        assert_eq!(prog[PROGRAM_LEN - 1].code, RET_K);
-        assert_eq!(prog[PROGRAM_LEN - 2].code, RET_K);
+        let prog = program(&[1]);
+        assert_eq!(prog[prog.len() - 1].code, RET_K);
+        assert_eq!(prog[prog.len() - 2].code, RET_K);
     }
 }

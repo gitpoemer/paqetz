@@ -78,6 +78,43 @@ const PRESUMED_DEAD: Millis = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
 /// Largest inner packet we will handle.
 const MAX_INNER: usize = 9000;
 
+/// How many outer ports the carrier moves between.
+///
+/// The filter covers all of them from the start, so moving costs nothing at
+/// run time. Four is enough for a day at the interval below, and each one is a
+/// single extra instruction in the capture filter.
+const PORT_POOL: usize = 4;
+
+/// How long a carrier keeps one five-tuple before moving to the next.
+///
+/// A flow that lives for hours and carries gigabytes accumulates attention
+/// somewhere on the path: throughput collapses, a restart cures it, and the only
+/// thing a restart changes is the source port. Real hosts open connections and
+/// close them; one that never does is unusual whatever its packets look like.
+///
+/// Jittered, because a fixed period is itself a pattern.
+const ROTATE_AFTER: Millis = 30 * 60 * 1_000;
+
+/// Random spread applied to each rotation, either side of the interval.
+const ROTATE_JITTER: Millis = 10 * 60 * 1_000;
+
+/// The port after `current`, wrapping.
+///
+/// Returns `current` when there is nowhere to go, so the caller can tell that
+/// nothing changed rather than tearing down a carrier and rebuilding an
+/// identical one.
+fn next_port(ports: &[u16], current: u16) -> u16 {
+    let Some(at) = ports.iter().position(|p| *p == current) else {
+        // Not in the pool at all, which means the port was configured rather
+        // than chosen. Staying put is right: the far end has to find us.
+        return current;
+    };
+    ports
+        .get((at + 1) % ports.len())
+        .copied()
+        .unwrap_or(current)
+}
+
 /// The shared, mutable state of the tunnel.
 struct PeerState {
     /// The established session, once there is one.
@@ -101,6 +138,8 @@ struct PeerState {
     last_receive: Option<Millis>,
     /// When we last sent something under the current session.
     last_send: Option<Millis>,
+    /// When the carrier should move to the next port.
+    rotate_at: Millis,
     /// When a packet carrying actual data last arrived.
     ///
     /// Separate from `last_receive` so a keepalive cannot arm another one. Both
@@ -121,6 +160,7 @@ impl PeerState {
             last_receive: None,
             last_send: None,
             last_data_receive: None,
+            rotate_at: Millis::MAX,
         }
     }
 
@@ -175,8 +215,10 @@ pub(crate) struct Tunnel {
     rx: Arc<PacketRx>,
     tx: Arc<Transmit>,
     state: Arc<Mutex<PeerState>>,
-    /// Our own outer address and port.
-    local: (Ipv4Addr, u16),
+    /// Our own outer address and the port currently in use.
+    local: Mutex<(Ipv4Addr, u16)>,
+    /// Every port the capture filter accepts, in rotation order.
+    ports: Vec<u16>,
     /// Our static public key, needed to verify `mac1` on inbound handshakes.
     local_public: PublicKey,
     started: Instant,
@@ -246,12 +288,24 @@ impl Tunnel {
         // Choosing our own outer port above the kernel's ephemeral range keeps
         // it from colliding with a port the kernel hands to some other socket.
         // paqet picked from 32768-65535, which overlaps that range exactly.
-        let local_port = if cfg.interface.listen_port == 0 {
-            let r = os("choosing an outer port", random_u32())?;
-            61_000 + u16::try_from(r % 4_000).unwrap_or(0)
+        // A pool rather than one port. The side that waits has to be findable,
+        // so it keeps the port it was configured with; the side that initiates
+        // takes several and moves between them, which is what stops a single
+        // five-tuple living for hours.
+        let ports: Vec<u16> = if cfg.interface.listen_port == 0 {
+            let mut v = Vec::with_capacity(PORT_POOL);
+            while v.len() < PORT_POOL {
+                let r = os("choosing an outer port", random_u32())?;
+                let port = 61_000 + u16::try_from(r % 4_000).unwrap_or(0);
+                if !v.contains(&port) {
+                    v.push(port);
+                }
+            }
+            v
         } else {
-            cfg.interface.listen_port
+            vec![cfg.interface.listen_port]
         };
+        let local_port = *ports.first().unwrap_or(&0);
 
         // Our own outer address is whichever one the kernel would route from.
         // Asking it directly avoids putting an address in the configuration
@@ -286,7 +340,7 @@ impl Tunnel {
 
         let rx = os(
             format!("opening a capture socket on {interface}"),
-            PacketRx::open(&interface, local_port),
+            PacketRx::open(&interface, &ports),
         )?;
         let _ = rx.set_recv_buffer(8 * 1024 * 1024);
 
@@ -321,7 +375,8 @@ impl Tunnel {
             tun: Arc::new(tun),
             rx: Arc::new(rx),
             tx: Arc::new(tx),
-            local: (local_ip, local_port),
+            local: Mutex::new((local_ip, local_port)),
+            ports,
             local_public,
             started: Instant::now(),
             running: Arc::new(AtomicBool::new(true)),
@@ -336,8 +391,22 @@ impl Tunnel {
     /// ephemeral port at start-up, and the firewall rules have to name the port
     /// the kernel would otherwise send resets from — which is this one, not the
     /// peer's.
-    pub(crate) const fn local_port(&self) -> u16 {
-        self.local.1
+    pub(crate) fn local_port(&self) -> u16 {
+        self.local().1
+    }
+
+    /// Our outer address and the port currently in use.
+    fn local(&self) -> (Ipv4Addr, u16) {
+        *self.local.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Every port the capture filter accepts.
+    ///
+    /// The firewall names all of them, because a rotation moves to one of these
+    /// and the rules have to already cover it -- and because replies to the port
+    /// just left are still arriving for a while afterwards.
+    pub(crate) fn ports(&self) -> &[u16] {
+        &self.ports
     }
 
     /// Milliseconds since the tunnel started.
@@ -1126,8 +1195,65 @@ impl Tunnel {
             if let Err(e) = self.maybe_keepalive(&mut sealed, &mut keepalive_frame) {
                 debug!("keepalive failed: {e}");
             }
+            if initiator {
+                self.maybe_rotate();
+            }
             std::thread::sleep(TICK);
         }
+    }
+
+    /// Moves the carrier to the next port when this one has been used long
+    /// enough.
+    ///
+    /// The initiating side only. The other end has to be findable, so its port
+    /// is fixed; and it follows this one automatically, because roaming already
+    /// updates a peer's address from the first packet that authenticates.
+    ///
+    /// A fresh carrier means a fresh sequence base as well as a fresh port,
+    /// which is what a new connection looks like. Nothing is torn down: the
+    /// capture filter already accepts every port in the pool, so replies still
+    /// arriving for the one just left are received as normal.
+    fn maybe_rotate(&self) {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.session.is_none() {
+            return;
+        }
+        // Armed once, when there is first a session to carry -- not in
+        // `established`, which runs on every rekey and would push the deadline
+        // out every two minutes so it never arrived.
+        if state.rotate_at == Millis::MAX {
+            state.rotate_at = now.saturating_add(self.rotation_interval());
+            return;
+        }
+        if now < state.rotate_at {
+            return;
+        }
+        state.rotate_at = now.saturating_add(self.rotation_interval());
+
+        if self.ports.len() < 2 {
+            return;
+        }
+        let (_, current) = self.local();
+        let next = next_port(&self.ports, current);
+        if next == current {
+            return;
+        }
+
+        if let Ok(mut local) = self.local.lock() {
+            local.1 = next;
+        }
+        // Dropping the carrier is what starts the new conversation: the next
+        // packet builds one from the new port with a sequence base of its own.
+        state.carrier = None;
+        drop(state);
+        info!("{}carrier moved from port {current} to {next}", self.tag());
+    }
+
+    /// How long the next five-tuple should last.
+    fn rotation_interval(&self) -> Millis {
+        let spread = random_u32().map_or(0, |r| Millis::from(r) % (2 * ROTATE_JITTER + 1));
+        ROTATE_AFTER + spread - ROTATE_JITTER
     }
 
     /// Sends an empty packet when the peer has spoken and we have not answered.
@@ -1223,7 +1349,7 @@ impl Tunnel {
             let (isn_i, isn_r, ts_base) =
                 noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
             state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
-                local: self.local,
+                local: self.local(),
                 remote: (*peer.ip(), peer.port()),
                 profile: self.cfg.interface.profile,
                 role: Role::Initiator,
@@ -1384,6 +1510,31 @@ mod tests {
             last_data_receive: heard,
             ..PeerState::new(None)
         }
+    }
+
+    #[test]
+    fn rotation_walks_the_pool_and_comes_back() {
+        let pool = [61001u16, 61002, 61003, 61004];
+        let mut seen = vec![pool[0]];
+        let mut at = pool[0];
+        for _ in 0..4 {
+            at = next_port(&pool, at);
+            seen.push(at);
+        }
+        assert_eq!(seen, [61001, 61002, 61003, 61004, 61001], "wraps around");
+    }
+
+    #[test]
+    fn a_configured_port_never_rotates() {
+        // The side that waits has to be findable, so it keeps the port it was
+        // given -- and its pool is that one port alone.
+        assert_eq!(next_port(&[8443], 8443), 8443);
+        assert_eq!(
+            next_port(&[61001, 61002], 9999),
+            9999,
+            "a port outside the pool means it was configured, so stay put"
+        );
+        assert_eq!(next_port(&[], 8443), 8443, "and an empty pool goes nowhere");
     }
 
     #[test]

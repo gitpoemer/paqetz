@@ -360,7 +360,11 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         tunnels.push(tunnel);
     }
 
-    let ports: Vec<u16> = tunnels.iter().map(Tunnel::local_port).collect();
+    // Every port in every pool, not just the one in use. The carrier moves
+    // between them while it runs, and a rule that named only the current one
+    // would stop covering the flow the moment it moved -- leaving the kernel
+    // free to reset the very traffic the rules exist to protect.
+    let ports: Vec<u16> = tunnels.iter().flat_map(Tunnel::ports).copied().collect();
 
     // The rules are load-bearing, not advisory (D9): without them the kernel
     // resets the flow. One table names every port, in one transaction.
