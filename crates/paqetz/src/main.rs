@@ -8,6 +8,7 @@ mod doctor;
 mod log;
 mod migrate;
 mod networkd;
+mod probe;
 mod service;
 mod setup;
 mod stats;
@@ -58,7 +59,20 @@ enum Command {
     /// Check the host for the things that stop a tunnel working.
     ///
     /// Read-only: creates, changes, and removes nothing.
-    Doctor,
+    Doctor {
+        /// Measure how the tunnel behaves while it is busy, rather than
+        /// whether the host is ready for one.
+        ///
+        /// Times the round trip to the peer's inner address idle and again
+        /// while saturating the tunnel, and reports both. Sends traffic;
+        /// changes nothing. Requires a tunnel that is already running.
+        #[arg(long)]
+        under_load: bool,
+
+        /// Which tunnel to probe, when more than one is configured.
+        #[arg(long, requires = "under_load")]
+        tunnel: Option<String>,
+    },
 
     /// Generate a matched pair of configuration files.
     ///
@@ -282,7 +296,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Restart => unit_command("restart"),
         Command::Networkd { action } => networkd_command(action),
         Command::Tune { apply } => tune(apply, &cli.config),
-        Command::Doctor => {
+        Command::Doctor {
+            under_load: true,
+            tunnel,
+        } => probe::run(&cli.config, tunnel.as_deref()),
+        Command::Doctor { .. } => {
             if doctor::run(&cli.config) {
                 Ok(())
             } else {

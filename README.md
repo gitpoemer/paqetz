@@ -346,6 +346,43 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+### When it works but feels slow
+
+`paqetz doctor` answers *will this work*. `paqetz doctor --under-load` answers
+*how well*, which is the question once a tunnel is already running.
+
+```bash
+paqetz doctor --under-load -c paqetz.toml     # add --tunnel <name> if several
+```
+
+It times the round trip to the peer's inner address three times: idle, idle
+again, and while saturating the tunnel. It sends traffic and changes nothing,
+and it needs the tunnel to be up and a flood ping, so run it as root.
+
+```
+                 loss     min      avg      max     mdev
+  idle, first     30.0%    92.9ms   94.2ms   96.8ms   1.18ms
+  idle, again      0.0%    92.9ms   93.2ms   96.2ms   0.57ms
+  under load       0.0%    92.9ms   93.2ms   96.7ms   0.60ms
+```
+
+Two failures hide from every throughput test, and each has its own line here.
+
+**A path gone cold** is the gap between the two idle runs: identical round trip
+times, but the first run lost packets and the second lost none. Nothing is
+congested — a mapping had lapsed, and the first packets paid to wake it. That is
+the first click after leaving a browser alone, and `keepalive` is the fix.
+
+**A queue rather than a drop** is the gap between idle and loaded. A tunnel can
+move thirty megabits while adding a second of delay: the transfer finishes, so a
+speed test calls it healthy, and everything interactive is miserable. If the
+average climbs by hundreds of milliseconds with no loss at all, something on the
+path is buffering. If it climbs and the loss stays at zero *and* a restart cures
+it, that is classification rather than congestion, and `rotate` is the fix.
+
+If the loaded run stays flat, as above, the tunnel is not what is slow — look at
+whatever sits between you and it.
+
 ### Two things you can turn off
 
 Both are on by default, and both were measured on a live path before being made
