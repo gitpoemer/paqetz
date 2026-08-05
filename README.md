@@ -353,6 +353,95 @@ rather than sent around the tunnel — which is what would otherwise happen, sin
 the policy route is a v4 rule and a marked v6 socket matches nothing and leaves
 by the ordinary route. Dual-stack destinations are unaffected.
 
+## Several servers from one client
+
+One client host can carry several tunnels at once, each to a different server,
+with the firewall mark choosing between them. Three countries, one VPS, three
+Xray outbounds:
+
+```toml
+# Settings for the process rather than for any one tunnel.
+log = "info"
+
+[[tunnel]]
+name = "de"
+[tunnel.interface]
+private_key  = "..."
+address      = "10.7.0.2/24"
+device       = "paqetz-de"
+route_marked = 81
+[tunnel.peer]
+public_key     = "..."
+endpoint       = "203.0.113.5:8443"
+tunnel_address = "10.7.0.1"
+allowed_ips    = ["0.0.0.0/0"]
+
+[[tunnel]]
+name = "nl"
+[tunnel.interface]
+private_key  = "..."
+address      = "10.8.0.2/24"
+device       = "paqetz-nl"
+mtu          = 1280
+route_marked = 82
+[tunnel.peer]
+public_key     = "..."
+endpoint       = "198.51.100.7:8443"
+tunnel_address = "10.8.0.1"
+allowed_ips    = ["0.0.0.0/0"]
+```
+
+Each tunnel needs its **own device, inner subnet and mark** — sharing any of
+them would have two tunnels undoing each other's routing, so the configuration
+is refused rather than run. Each also has its own key, which is what you want
+when three different people run those servers: a compromise of one teaches
+nothing about the others. Everything else is per-tunnel too, including `mtu`,
+`profile` and `sequencing`, so a path that needs a smaller MTU gets one without
+touching the rest.
+
+One process runs them all. Their status lines are prefixed with the tunnel name,
+and one `nft` table carries the rules for every outer port:
+
+```
+[  1.024] info  de: up 1s | handshake 3s ago | tx 41 pkt/12.9 kB | rx 38 pkt/44.1 kB
+[  1.025] info  nl: up 1s | handshake 4s ago | tx 12 pkt/3.1 kB  | rx 11 pkt/9.8 kB
+```
+
+On the Xray side, one outbound per mark, and a routing rule choosing between
+them:
+
+```json
+"outbounds": [
+  { "tag": "de", "protocol": "freedom",
+    "settings": { "domainStrategy": "UseIPv4" },
+    "streamSettings": { "sockopt": { "mark": 81 } } },
+  { "tag": "nl", "protocol": "freedom",
+    "settings": { "domainStrategy": "UseIPv4" },
+    "streamSettings": { "sockopt": { "mark": 82 } } }
+]
+```
+
+How users are assigned to countries is Xray's business rather than paqetz's —
+by inbound tag, by user, or by destination, whichever suits. paqetz's part ends
+at "a socket marked 82 leaves through the Netherlands".
+
+### The original form still works
+
+One `[interface]` and one `[peer]` describes a single tunnel and parses exactly
+as it always has, including the process settings written inside `[interface]`.
+No existing configuration needs touching.
+
+The two forms are the same file at different depths — `[interface]` becomes
+`[tunnel.interface]`, every key unchanged — so converting is mechanical:
+
+```bash
+sudo paqetz config migrate -c /etc/paqetz/paqetz.toml
+```
+
+It shows what the file would become, keeps the original as `.toml.bak`, and
+refuses to write unless the result parses to the same configuration. Comments
+survive. Mixing the two forms in one file is refused rather than guessed at.
+
 ## Testing
 
 `cargo test` is safe on a workstation: it creates no device, opens no socket,
