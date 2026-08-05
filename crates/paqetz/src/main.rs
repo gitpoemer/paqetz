@@ -6,6 +6,7 @@
 mod config;
 mod doctor;
 mod log;
+mod migrate;
 mod networkd;
 mod service;
 mod setup;
@@ -99,6 +100,12 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceAction,
+    },
+
+    /// Work on the configuration file itself.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
 
     /// Download the latest release and replace this binary.
@@ -266,6 +273,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action),
+        Command::Config { action } => match action {
+            ConfigAction::Migrate { yes } => migrate::run(&cli.config, yes),
+        },
         Command::Update { yes } => update::run(yes),
         Command::Start => unit_command("start"),
         Command::Stop => unit_command("stop"),
@@ -799,7 +809,7 @@ fn at_a_terminal() -> bool {
 }
 
 /// Asks a yes-or-no question, defaulting to no.
-fn confirm(prompt: &str) -> bool {
+pub(crate) fn confirm(prompt: &str) -> bool {
     use std::io::{BufRead as _, Write as _};
     print!("{prompt} [y/N] > ");
     if std::io::stdout().flush().is_err() {
@@ -810,6 +820,26 @@ fn confirm(prompt: &str) -> bool {
         return false;
     }
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// What `paqetz config` can do.
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Convert a single-tunnel file to the form that can hold several.
+    ///
+    /// The two forms are the same file at different depths, so this moves
+    /// `[interface]` and `[peer]` under a `[[tunnel]]` section and lifts the
+    /// process-level settings to the top. Comments are kept, and nothing is
+    /// written unless the result parses to the same configuration as the
+    /// original.
+    ///
+    /// The old form keeps working indefinitely, so this is a convenience rather
+    /// than something that has to be done.
+    Migrate {
+        /// Write it without asking.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 /// What `paqetz networkd` can do.
