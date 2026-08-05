@@ -22,7 +22,11 @@
 //! there is nothing to install and every command it runs can be read before it
 //! runs.
 
-use std::process::{Child, Command, Stdio};
+use std::net::{Ipv4Addr, UdpSocket};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// How many probes each measurement sends.
 const IDLE_COUNT: u32 = 30;
@@ -93,38 +97,70 @@ fn probe(target: &str, count: u32) -> Result<Sample, Box<dyn std::error::Error>>
     parse(&text).ok_or_else(|| format!("could not read ping's summary:\n{text}").into())
 }
 
-/// Starts something to fill the tunnel with, and hands back the handle.
+/// Traffic sent to fill the tunnel while the loaded measurement runs.
 ///
-/// A flood of large packets to the same address the probes go to, so the load
-/// takes exactly the path being measured. It needs no server at the far end and
-/// nothing installed at this one.
+/// Written here rather than shelled out to, because the obvious external tool
+/// does not work: flood ping is self-clocked — it sends one packet per reply,
+/// with a floor of a hundred a second — so on a ninety-millisecond path it
+/// offers about a tenth of a megabit. That is idle. A measurement taken beside
+/// it reads as a clean result, which is worse than no measurement at all.
 ///
-/// Flood ping is root-only. If it will not start, that is reported rather than
-/// worked around, because a "loaded" measurement taken on an idle path reads as
-/// a clean result and would be worse than no measurement at all.
-fn load(target: &str) -> Result<Child, Box<dyn std::error::Error>> {
-    let mut child = Command::new("ping")
-        .args(["-f", "-s", "1200", target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
+/// So: datagrams to the discard port at the same address the probes go to, from
+/// as many threads as it takes, as fast as the socket will accept them. It
+/// needs no server at the far end, and the far end's refusals cost it nothing.
+struct Load {
+    stop: Arc<AtomicBool>,
+    sent: Arc<AtomicU64>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
 
-    // It fails immediately when it fails at all -- unknown host, no permission
-    // for a flood -- so a short look is enough to tell running from refused.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    if let Some(status) = child.try_wait()? {
-        let mut why = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            use std::io::Read as _;
-            let _ = err.read_to_string(&mut why);
+/// How many senders. One socket cannot always fill a link on its own, and a
+/// handful costs nothing on a host that is otherwise waiting.
+const SENDERS: usize = 4;
+/// Datagram size, under any sane tunnel MTU so nothing fragments.
+const PAYLOAD: usize = 1200;
+/// The discard port, which is refused rather than answered. RFC 863.
+const DISCARD: u16 = 9;
+
+impl Load {
+    /// Starts sending. Stops when the returned value is dropped or finished.
+    fn start(target: Ipv4Addr) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicU64::new(0));
+        let mut threads = Vec::with_capacity(SENDERS);
+
+        for _ in 0..SENDERS {
+            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            socket.connect((target, DISCARD))?;
+            let (stop, sent) = (Arc::clone(&stop), Arc::clone(&sent));
+            threads.push(std::thread::spawn(move || {
+                let buf = [0u8; PAYLOAD];
+                while !stop.load(Ordering::Relaxed) {
+                    // An error here is the link pushing back -- a full queue, a
+                    // transient unreachable -- which is the condition being
+                    // measured rather than a reason to stop.
+                    if let Ok(n) = socket.send(&buf) {
+                        sent.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+            }));
         }
-        return Err(format!(
-            "could not put the tunnel under load ({status}): {}",
-            why.trim()
-        )
-        .into());
+        Ok(Self {
+            stop,
+            sent,
+            threads,
+        })
     }
-    Ok(child)
+
+    /// Stops sending and reports what was offered, in megabits per second.
+    fn finish(self, over: Duration) -> f64 {
+        self.stop.store(true, Ordering::Relaxed);
+        for t in self.threads {
+            let _ = t.join();
+        }
+        let bits = self.sent.load(Ordering::Relaxed) as f64 * 8.0;
+        bits / over.as_secs_f64() / 1_000_000.0
+    }
 }
 
 /// `paqetz doctor --under-load`.
@@ -164,23 +200,18 @@ pub(crate) fn run(
     let cold = probe(&target, IDLE_COUNT)?;
     let warm = probe(&target, IDLE_COUNT)?;
 
-    let child = load(&target)?;
+    let load = Load::start(tunnel.peer.tunnel_address)?;
+    let started = Instant::now();
     let loaded = probe(&target, LOADED_COUNT);
-    let _ = kill(child);
+    let offered = load.finish(started.elapsed());
     let loaded = loaded?;
 
-    report(cold, warm, loaded);
+    report(cold, warm, loaded, offered);
     Ok(())
 }
 
-/// Stops the load, however it went.
-fn kill(mut child: Child) -> std::io::Result<()> {
-    child.kill()?;
-    child.wait().map(|_| ())
-}
-
 /// Prints the three measurements and what they mean together.
-fn report(cold: Sample, warm: Sample, loaded: Sample) {
+fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64) {
     println!("                 loss     min      avg      max     mdev");
     for (what, s) in [
         ("idle, first", cold),
@@ -192,20 +223,31 @@ fn report(cold: Sample, warm: Sample, loaded: Sample) {
             s.loss, s.min, s.avg, s.max, s.mdev
         );
     }
+    // What the loaded row was actually loaded with. Without this the reader
+    // cannot tell a path that stayed flat under pressure from one that was
+    // never put under any.
+    println!("\n  {offered:.0} Mbit/s offered during the loaded run.");
     println!();
 
     // The queue question. A few milliseconds is a clean path; hundreds means
     // something is holding packets rather than dropping them, which a
     // throughput test would have reported as success.
     let added = loaded.avg - warm.avg;
-    if added > 100.0 {
+    if offered < 1.0 {
+        println!("Almost nothing went out during the loaded run, so that row means");
+        println!("nothing. The tunnel is probably down, or its address is unreachable.");
+    } else if added > 100.0 {
         println!("Latency rose {added:.0}ms under load.");
         println!("Something on this path buffers rather than drops: a transfer will");
         println!("still complete, and everything interactive will suffer while it does.");
     } else if added > 20.0 {
         println!("Latency rose {added:.0}ms under load, which is mild but real.");
-    } else {
+    } else if added > 1.0 {
         println!("Latency rose {added:.0}ms under load. The path stays responsive when busy.");
+    } else {
+        // A negative delta is ordinary measurement noise, and printing it as a
+        // rise of "-0ms" reads as a bug in the tool rather than a clean result.
+        println!("Latency did not rise under load. The path stays responsive when busy.");
     }
 
     // The cold-path question, which is what the doubled idle run is for.

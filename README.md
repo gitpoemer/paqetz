@@ -356,15 +356,24 @@ paqetz doctor --under-load -c paqetz.toml     # add --tunnel <name> if several
 ```
 
 It times the round trip to the peer's inner address three times: idle, idle
-again, and while saturating the tunnel. It sends traffic and changes nothing,
-and it needs the tunnel to be up and a flood ping, so run it as root.
+again, and while saturating the tunnel. It sends traffic and changes nothing.
+The tunnel has to be up, and the probes need a raw socket, so run it as root.
 
 ```
                  loss     min      avg      max     mdev
   idle, first     30.0%    92.9ms   94.2ms   96.8ms   1.18ms
   idle, again      0.0%    92.9ms   93.2ms   96.2ms   0.57ms
   under load       0.0%    92.9ms   93.2ms   96.7ms   0.60ms
+
+  94 Mbit/s offered during the loaded run.
 ```
+
+That last line is there so the loaded row can be trusted. A path that stayed
+flat under real pressure and one that was never put under any look identical
+otherwise — which is exactly how the first version of this command was wrong:
+it loaded the tunnel with a flood ping, and a flood ping sends one packet per
+reply, so on a 90ms path it offered a tenth of a megabit and measured idle three
+times over.
 
 Two failures hide from every throughput test, and each has its own line here.
 
