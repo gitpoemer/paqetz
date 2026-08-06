@@ -396,19 +396,23 @@ retransmission timer, which starts around two hundred milliseconds and grows
 with every loss, so a quarter-lossy link is unusable however correct the tunnel
 is.
 
+**Off unless you turn it on.** Omit `retransmit` entirely, or set it `false`,
+and none of this runs. To enable it:
+
 ```toml
 # under [tunnel.interface]
-retransmit          = true   # off unless the path's loss has been measured
+retransmit          = true   # the switch. Absent or false: nothing below runs
 retransmit_buffer   = 1200   # packets to hold, in case the peer asks again
 retransmit_deadline = 400    # ms a packet stays worth repeating
 retransmit_asks     = 2      # times one packet may be asked for
 retransmit_reorder  = 3      # later packets that must arrive before asking
 ```
 
-`retransmit` is the switch; the rest keep their values while it is off, so a
-path's settings survive being turned off and on again. `retransmit = 1200` — the
-spelling from before there was a switch, when the buffer size doubled as the way
-to disable it — still loads and means "on, holding 1200".
+The four below the switch keep their values while it is off, so a path's
+settings survive being turned off and on again rather than having to be measured
+twice. `retransmit = 1200` — the spelling from before there was a switch, when
+the buffer size doubled as the way to disable it — still loads, and means "on,
+holding 1200".
 
 Off by default. On an ordinary link a second recovery mechanism is waste, and
 worse than waste — it hides loss from the congestion control that is supposed to
