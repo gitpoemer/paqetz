@@ -381,6 +381,28 @@ impl PeerState {
         tried.map(Err)
     }
 
+    /// Whether the current run of handshake attempts has gone on long enough.
+    fn exhausted(&self, now: Millis) -> bool {
+        self.attempt_started
+            .is_some_and(|began| now.saturating_sub(began) >= REKEY_ATTEMPT_TIME)
+    }
+
+    /// Records that there is something to send and nothing to send it under.
+    ///
+    /// Attempts stop after [`REKEY_ATTEMPT_TIME`] because a peer that has not
+    /// answered in ninety seconds is not briefly unreachable, it is gone, and a
+    /// tunnel nobody is using should not handshake at it for ever.
+    ///
+    /// They have to start again when someone *is* using it, and this is the
+    /// only signal that says so. It used to be read from `last_send`, which
+    /// only moves once a packet has been sealed -- so it could not move until a
+    /// handshake succeeded, and no handshake would be attempted until it moved.
+    /// A server unreachable for ninety seconds left a client that never tried
+    /// again, with a tunnel that stayed down until someone restarted it.
+    fn wants_to_send(&mut self) {
+        self.attempt_started = None;
+    }
+
     /// Records that a handshake just completed.
     ///
     /// The peer answered, which is the freshest evidence available that it holds
@@ -1078,6 +1100,10 @@ impl Tunnel {
             state.confirm();
         }
         let Some(session) = state.session.as_mut() else {
+            // Traffic with nothing to carry it: the one thing that says this
+            // tunnel is wanted, and so the one thing that restarts a run of
+            // handshake attempts that has given up.
+            state.wants_to_send();
             return Ok(None);
         };
         // The counter this packet will carry, read before sealing spends it.
@@ -1755,9 +1781,7 @@ impl Tunnel {
         // Giving up is measured from when trying started. Past that the peer is
         // not briefly unreachable, it is gone, and the attempt stops until there
         // is traffic again -- which `last_send` moving will show.
-        let exhausted = state
-            .attempt_started
-            .is_some_and(|began| now.saturating_sub(began) >= REKEY_ATTEMPT_TIME);
+        let exhausted = state.exhausted(now);
 
         let due = match state.session.as_ref() {
             None if exhausted => false,
@@ -2023,6 +2047,39 @@ mod tests {
             "a port outside the pool means it was configured, so stay put"
         );
         assert_eq!(next_port(&[], 8443), 8443, "and an empty pool goes nowhere");
+    }
+
+    #[test]
+    fn traffic_restarts_a_run_of_attempts_that_gave_up() {
+        // The failure this closes: a server unreachable for ninety seconds left
+        // the client having stopped trying, with no path back. The signal that
+        // used to be relied on -- `last_send` -- cannot move without a session,
+        // and no session would be attempted until it moved.
+        let mut s = PeerState::new(None, 0);
+        s.attempt_started = Some(0);
+        assert!(!s.exhausted(REKEY_ATTEMPT_TIME - 1), "still trying");
+        assert!(s.exhausted(REKEY_ATTEMPT_TIME), "long enough to stop");
+        assert!(
+            s.exhausted(REKEY_ATTEMPT_TIME * 100),
+            "and it stays stopped on its own"
+        );
+
+        // Someone tries to use the tunnel.
+        s.wants_to_send();
+        assert!(
+            !s.exhausted(REKEY_ATTEMPT_TIME * 100),
+            "traffic is what says the tunnel is wanted"
+        );
+    }
+
+    #[test]
+    fn an_idle_tunnel_with_nothing_to_send_still_gives_up() {
+        // The other half: attempts stop for a tunnel nobody is using, or an
+        // unreachable peer is handshaked at for ever.
+        let mut s = PeerState::new(None, 0);
+        assert!(!s.exhausted(0), "nothing attempted yet");
+        s.attempt_started = Some(1_000);
+        assert!(s.exhausted(1_000 + REKEY_ATTEMPT_TIME));
     }
 
     #[test]
