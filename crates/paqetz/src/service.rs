@@ -272,6 +272,15 @@ pub(crate) fn unit_exists(name: &str) -> bool {
     Path::new(&unit_path(name)).exists()
 }
 
+/// Whether a unit is running right now.
+#[must_use]
+pub(crate) fn unit_active(name: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", name])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Whether a unit exists and is enabled.
 #[must_use]
 pub(crate) fn unit_enabled(name: &str) -> bool {

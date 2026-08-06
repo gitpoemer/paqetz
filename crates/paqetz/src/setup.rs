@@ -777,16 +777,12 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
             // and keep it running — whether it was installed just now or was
             // already here.
             if crate::xray::installed_version(crate::xray::DEFAULT_PREFIX).is_some() {
-                let cfg = "/etc/xray/config.json";
-                crate::service::write_file(std::path::Path::new(cfg), &generated.config, 0o600)?;
-                println!("   wrote {cfg}");
-
-                if crate::service::has_systemd() && yes_no("   Keep Xray running at boot?", true)? {
-                    crate::service::install_unit(
-                        "xray",
-                        &crate::xray::service_unit(crate::xray::DEFAULT_PREFIX, cfg),
-                        true,
-                    )?;
+                if yes_no("   Put this in place and start Xray with it?", true)? {
+                    // Shared with `paqetz xray setup`, so a configuration is
+                    // applied the same way whichever route got here -- and an
+                    // Xray that is already running is restarted rather than
+                    // left on the settings it started with.
+                    crate::xray::apply(&generated.config, crate::xray::DEFAULT_PREFIX)?;
                 }
             } else {
                 println!(
@@ -818,7 +814,7 @@ fn read_answer() -> io::Result<String> {
 }
 
 /// Asks a question, returning the default when the answer is empty.
-fn ask(prompt: &str, default: &str) -> io::Result<String> {
+pub(crate) fn ask(prompt: &str, default: &str) -> io::Result<String> {
     if default.is_empty() {
         print!("{prompt}\n   > ");
     } else {
@@ -835,7 +831,7 @@ fn ask(prompt: &str, default: &str) -> io::Result<String> {
 }
 
 /// Asks a yes-or-no question.
-fn yes_no(prompt: &str, default: bool) -> io::Result<bool> {
+pub(crate) fn yes_no(prompt: &str, default: bool) -> io::Result<bool> {
     let hint = if default { "Y/n" } else { "y/N" };
     loop {
         print!("{prompt}\n   [{hint}] > ");

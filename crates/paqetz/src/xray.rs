@@ -531,6 +531,37 @@ mod tests {
 /// Where the binary is placed by default.
 pub(crate) const DEFAULT_PREFIX: &str = "/usr/local/bin";
 
+/// Where a running Xray reads its configuration.
+pub(crate) const CONFIG_PATH: &str = "/etc/xray/config.json";
+
+/// Puts a generated configuration where Xray reads it, and makes Xray use it.
+///
+/// Writing the file is not applying it. A configuration that a running Xray has
+/// not re-read is a configuration that is not in force, and the gap between
+/// those two states is the kind that costs an hour to notice -- everything on
+/// disk looks right and the behaviour is the old one.
+///
+/// # Errors
+/// Returns an error if the file cannot be written or the unit cannot be
+/// installed.
+pub(crate) fn apply(config: &str, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // The REALITY private key lives in here.
+    crate::service::write_file(std::path::Path::new(CONFIG_PATH), config, 0o600)?;
+    println!("  wrote {CONFIG_PATH} (mode 0600)");
+
+    if !crate::service::has_systemd() {
+        println!("  no systemd here; start Xray however this host does it.");
+        return Ok(());
+    }
+    if crate::service::unit_active("xray") {
+        crate::service::run_elevated("systemctl", &["restart", "xray"])?;
+        println!("  restarted xray, so the new configuration is the one in force");
+    } else {
+        crate::service::install_unit("xray", &service_unit(prefix, CONFIG_PATH), true)?;
+    }
+    Ok(())
+}
+
 /// Why this installs Xray rather than leaving it to a shell script.
 ///
 /// The first instinct was that a tunnel which installs proxies has two jobs.

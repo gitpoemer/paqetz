@@ -112,8 +112,7 @@ enum Command {
         out: PathBuf,
     },
 
-    /// Generate an Xray REALITY inbound that feeds the tunnel, and optionally
-    /// install Xray itself.
+    /// Set up Xray in front of the tunnel: install it, configure it, run it.
     Xray {
         #[command(subcommand)]
         action: XrayAction,
@@ -206,7 +205,11 @@ enum ServiceAction {
 
 #[derive(Subcommand)]
 enum XrayAction {
-    /// Write a REALITY inbound configuration and print the client URI.
+    /// Write a REALITY inbound configuration to a file and print the client URI.
+    ///
+    /// Writes and stops. Nothing is installed, nothing is placed where a
+    /// running Xray would read it, and nothing is restarted — use `setup` for
+    /// that.
     Config {
         /// The address users will reach this host at.
         public_address: String,
@@ -225,6 +228,24 @@ enum XrayAction {
         /// Where to write the configuration.
         #[arg(short, long, default_value = "xray-config.json")]
         out: PathBuf,
+    },
+    /// Install Xray, configure it, and start it — all of it, on this host.
+    ///
+    /// `config` writes a file and stops there. This installs the binary if it
+    /// is missing, puts the configuration where a running Xray reads it, and
+    /// restarts the service so what is on disk is what is in force.
+    Setup {
+        /// The address users will reach this host at. Asked for if omitted.
+        public_address: Option<String>,
+        /// The real site REALITY borrows a certificate from.
+        #[arg(long)]
+        dest: Option<String>,
+        /// The port users connect to.
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// Where the binary lives.
+        #[arg(long, default_value = xray::DEFAULT_PREFIX)]
+        prefix: String,
     },
     /// Download and install Xray, verifying the published checksum.
     Install {
@@ -295,7 +316,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5),
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
-        Command::Xray { action } => xray_command(action),
+        Command::Xray { action } => xray_command(action, &cli.config),
         Command::Config { action } => match action {
             ConfigAction::Migrate { yes } => migrate::run(&cli.config, yes),
         },
@@ -764,7 +785,104 @@ fn service_command(
     }
 }
 
-fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
+/// `paqetz xray setup` — install, configure, and start Xray on this host.
+///
+/// The upstream is read from the tunnel's own configuration rather than asked
+/// for again: whether Xray should hand traffic to a SOCKS5 listener or mark its
+/// sockets is already decided by how the tunnel was set up, and asking the same
+/// question twice in different words is how the two answers end up disagreeing.
+fn xray_setup(
+    public_address: Option<String>,
+    dest: Option<String>,
+    port: u16,
+    prefix: &str,
+    config: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tunnel = config::Config::load(config).ok().and_then(|c| {
+        c.tunnels.first().map(|t| {
+            (
+                t.socks5.as_ref().map(|s| s.listen.to_string()),
+                t.interface.route_marked,
+            )
+        })
+    });
+    let upstream = match &tunnel {
+        Some((Some(listen), _)) => xray::Upstream::Socks5(listen.clone()),
+        Some((None, Some(mark))) => xray::Upstream::Marked(*mark),
+        _ => {
+            return Err(format!(
+                "read {} but found neither a socks5 listener nor route_marked, so there \
+                 is nowhere for Xray to send what it receives. Configure one first.",
+                config.display()
+            )
+            .into());
+        }
+    };
+    match &upstream {
+        xray::Upstream::Socks5(a) => {
+            println!("Xray will forward through the SOCKS5 listener at {a}.")
+        }
+        xray::Upstream::Marked(m) => println!("Xray will mark its outbound sockets {m}."),
+    }
+
+    let public = match public_address {
+        Some(a) => a,
+        None => setup::ask("What address will users reach this host at?", "")?,
+    };
+    if public.trim().is_empty() {
+        return Err("an address users can reach is needed for the client URI".into());
+    }
+    let dest = match dest {
+        Some(d) => d,
+        None => {
+            println!(
+                "\nREALITY impersonates a real site. It must speak TLS 1.3, sit on a\n\
+                 large network, and not itself be blocked where this runs.\n\
+                 Suggestions: {}",
+                xray::SUGGESTED_DESTINATIONS.join(", ")
+            );
+            setup::ask("Which site?", "www.microsoft.com")?
+        }
+    };
+
+    let generated = xray::generate(&xray::Plan {
+        listen_port: port,
+        dest,
+        upstream,
+        public_address: public,
+    })?;
+
+    // Install before applying, so the configuration is never written for
+    // software that is not here to read it.
+    match xray::installed_version(prefix) {
+        None => {
+            println!("\nXray is not installed here.");
+            if setup::yes_no(
+                "Install it? The download is checked against the published digest.",
+                true,
+            )? {
+                let v = xray::install(None, prefix)?;
+                println!("  installed {v}");
+            } else {
+                return Err("Xray is needed for this to do anything".into());
+            }
+        }
+        Some(v) => println!("\nXray {v} is installed."),
+    }
+
+    xray::apply(&generated.config, prefix)?;
+
+    println!("\nGive this to a user:\n");
+    println!("{}\n", generated.uri);
+    println!("The private key is in the configuration, not in that URI.");
+    println!("Its public half is {}.", generated.public_key);
+    Ok(())
+}
+
+fn xray_command(
+    action: XrayAction,
+    config: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         XrayAction::Config {
             public_address,
@@ -793,6 +911,12 @@ fn xray_command(action: XrayAction) -> Result<(), Box<dyn std::error::Error>> {
             println!("The private key is in the configuration and not in that URI.");
             Ok(())
         }
+        XrayAction::Setup {
+            public_address,
+            dest,
+            port,
+            prefix,
+        } => xray_setup(public_address, dest, port, &prefix, config),
         XrayAction::Install { version, prefix } => {
             let v = xray::install(version.as_deref(), &prefix)?;
             println!("\nInstalled {v}.");

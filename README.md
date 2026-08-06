@@ -346,6 +346,27 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+### Putting Xray in front of it
+
+On the client host, one command installs Xray, configures it, and starts it:
+
+```bash
+sudo paqetz xray setup vpn.example.com
+```
+
+It reads the tunnel's own configuration to decide where Xray should send what it
+receives — the SOCKS5 listener if one is configured, otherwise the firewall mark
+— rather than asking a question whose answer is already written down. It offers
+to install Xray if it is missing, writes the configuration to
+`/etc/xray/config.json` at mode 0600 because it holds a REALITY private key,
+installs the service, and **restarts Xray if it was already running**. Then it
+prints the URI to give a user.
+
+That last part is the difference from `paqetz xray config`, which writes a file
+and stops. A configuration a running Xray has not re-read is not in force, and
+the gap between those two states costs an hour to notice: everything on disk
+looks right and the behaviour is the old one.
+
 ### When the link itself is losing packets
 
 The tunnel carries no reliability layer, because everything inside it already
