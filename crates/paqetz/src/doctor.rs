@@ -116,6 +116,9 @@ pub(crate) fn run(path: &Path) -> bool {
         findings.push(check_mtu(t.interface.mtu));
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));
+        if t.interface.gateway {
+            findings.push(check_forwarding_allowed(&t.interface.device));
+        }
     }
 
     print(&findings)
@@ -228,6 +231,86 @@ fn check_firewall_backend() -> Finding {
         "install one; without the NOTRACK and RST-drop rules the kernel will \
          reset the tunnel. `paqetz firewall plan` prints what to apply by hand.",
     )
+}
+
+/// Whether anything is going to drop the traffic this gateway forwards.
+///
+/// The failure this catches costs an afternoon to find by hand, because every
+/// visible sign says the tunnel is healthy: the handshake completes, the peer
+/// answers a ping to its inner address, `ip_forward` is on, the masquerade rule
+/// is there, and both ends' counters are clean. What is happening is that the
+/// packets are forwarded into a `FORWARD` chain whose policy is `DROP`, so they
+/// die between the tunnel and the world, and the only trace is that the far
+/// side has nothing to send back.
+///
+/// paqetz cannot fix this itself. Every chain registered on a hook runs, so an
+/// `accept` in our own table does not stop a `DROP` in another one -- the rule
+/// has to go in the chain that owns the policy, which on these hosts is managed
+/// by `iptables` and is not ours to edit.
+fn check_forwarding_allowed(device: &str) -> Finding {
+    let Some(rules) = capture("iptables", &["-S", "FORWARD"]) else {
+        return Finding::pass(
+            "forwarding",
+            "no iptables FORWARD chain to inspect".to_owned(),
+        );
+    };
+    match forward_verdict(&rules, device) {
+        Forwarding::Allowed => Finding::pass("forwarding", "the FORWARD chain permits it"),
+        Forwarding::PolicyAccept => Finding::pass("forwarding", "FORWARD policy is ACCEPT"),
+        Forwarding::Blocked => Finding::fail(
+            "forwarding",
+            "FORWARD policy is DROP and no rule mentions {device}".replace("{device}", device),
+            format!(
+                "traffic will reach this host and go no further, while every other sign \
+                 says the tunnel is fine. Allow just this tunnel:\n       \
+                 sudo iptables -I FORWARD -i {device} -j ACCEPT\n       \
+                 sudo iptables -I FORWARD -o {device} -m conntrack \
+                 --ctstate RELATED,ESTABLISHED -j ACCEPT\n       \
+                 then persist it, or it is gone at the next reboot."
+            ),
+        ),
+    }
+}
+
+/// What the `FORWARD` chain will do with this device's traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Forwarding {
+    /// The policy is `ACCEPT`; nothing here will drop it.
+    PolicyAccept,
+    /// The policy drops, but a rule names this device.
+    Allowed,
+    /// The policy drops and nothing names this device.
+    Blocked,
+}
+
+/// Reads `iptables -S FORWARD` output.
+///
+/// Split from the command so the parsing is testable without a firewall, and so
+/// what counts as "allowed" is written down rather than implied.
+pub(crate) fn forward_verdict(rules: &str, device: &str) -> Forwarding {
+    let policy_drops = rules
+        .lines()
+        .any(|l| matches!(l.trim(), "-P FORWARD DROP" | "-P FORWARD REJECT"));
+    if !policy_drops {
+        return Forwarding::PolicyAccept;
+    }
+    // Any rule naming the device is taken as deliberate. A narrower reading --
+    // insisting on a matching -j ACCEPT -- would misjudge the many shapes an
+    // operator's rules can take, and a false alarm on a working host is worse
+    // than staying quiet about one that an operator has clearly considered.
+    let mentions_device = rules
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("-P "))
+        .any(|l| {
+            l.split_whitespace()
+                .zip(l.split_whitespace().skip(1))
+                .any(|(flag, value)| matches!(flag, "-i" | "-o") && value == device)
+        });
+    if mentions_device {
+        Forwarding::Allowed
+    } else {
+        Forwarding::Blocked
+    }
 }
 
 /// Whether the tunnel is installed as a service.
@@ -504,6 +587,19 @@ fn port_in_use(table: &str, port: u16) -> bool {
     })
 }
 
+/// Runs a read-only command and returns its output, or `None` if it cannot run.
+///
+/// A missing tool is not a failure to report: a host with no `iptables` has no
+/// `iptables` policy to fall foul of.
+fn capture(tool: &str, args: &[&str]) -> Option<String> {
+    which(tool)?;
+    let out = std::process::Command::new(tool).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Finds an executable on `PATH`.
 fn which(tool: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
@@ -519,6 +615,61 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+
+    #[test]
+    fn a_dropping_forward_chain_with_no_rule_for_us_is_a_failure() {
+        // The case that cost an afternoon: everything else says the tunnel is
+        // healthy, and the packets die on the way out of the host.
+        let rules = "\
+-P FORWARD DROP
+-A FORWARD -j DOCKER-USER
+-A FORWARD -o docker0 -j ACCEPT
+";
+        assert_eq!(
+            super::forward_verdict(rules, "paqetz0"),
+            super::Forwarding::Blocked
+        );
+    }
+
+    #[test]
+    fn a_rule_naming_the_device_is_taken_as_deliberate() {
+        let rules = "\
+-P FORWARD DROP
+-A FORWARD -i paqetz0 -j ACCEPT
+-A FORWARD -o paqetz0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+";
+        assert_eq!(
+            super::forward_verdict(rules, "paqetz0"),
+            super::Forwarding::Allowed
+        );
+        // And a rule for a *different* device does not count as one for ours.
+        assert_eq!(
+            super::forward_verdict(rules, "paqetz1"),
+            super::Forwarding::Blocked
+        );
+    }
+
+    #[test]
+    fn an_accepting_policy_needs_no_rule_at_all() {
+        assert_eq!(
+            super::forward_verdict("-P FORWARD ACCEPT\n", "paqetz0"),
+            super::Forwarding::PolicyAccept
+        );
+        // The policy line is the only one that decides this; a device named in
+        // a rule must not be mistaken for the policy itself.
+        assert_eq!(
+            super::forward_verdict("-A FORWARD -i paqetz0 -j DROP\n", "paqetz0"),
+            super::Forwarding::PolicyAccept
+        );
+    }
+
+    #[test]
+    fn a_rejecting_policy_counts_as_dropping() {
+        assert_eq!(
+            super::forward_verdict("-P FORWARD REJECT\n", "paqetz0"),
+            super::Forwarding::Blocked
+        );
+    }
 
     #[test]
     fn effective_capabilities_are_parsed() {

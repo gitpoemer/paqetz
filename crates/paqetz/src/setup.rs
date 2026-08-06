@@ -413,6 +413,14 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         .and_then(|r| std::fs::read_to_string(dir.join(r.file())).ok())
         .and_then(|t| crate::config::Config::parse(&t).ok())
         .is_some_and(|c| c.tunnels.iter().any(|t| t.interface.gateway));
+    // A gateway that cannot forward looks exactly like a healthy tunnel from
+    // both ends -- handshake fine, peer answers a ping, counters clean -- and
+    // the packets die on the way out of this host. Worth saying here, while the
+    // operator is still holding the shell, rather than leaving it to be found.
+    if forwards {
+        warn_forwarding_blocked();
+    }
+
     let pending = paqetz_fw::tune::pending(forwards);
     if pending.is_empty() {
         println!("This host's kernel settings already suit a tunnel.");
@@ -840,6 +848,35 @@ fn yes_no(prompt: &str, default: bool) -> io::Result<bool> {
             _ => println!("   Please answer y or n.\n"),
         }
     }
+}
+
+/// Says so when this host's firewall will drop what the tunnel forwards.
+///
+/// paqetz cannot fix it: every chain on a hook runs, so accepting in our own
+/// table does not stop another one dropping, and the chain that owns the policy
+/// belongs to `iptables`.
+fn warn_forwarding_blocked() {
+    let Some(rules) = std::process::Command::new("iptables")
+        .args(["-S", "FORWARD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    else {
+        return;
+    };
+    if crate::doctor::forward_verdict(&rules, "paqetz0") != crate::doctor::Forwarding::Blocked {
+        return;
+    }
+    println!();
+    println!("!  This host's FORWARD policy is DROP, and nothing permits the tunnel.");
+    println!("   Traffic will arrive here and go no further, while every other sign");
+    println!("   says the tunnel is working. Allow just this tunnel:");
+    println!("     sudo iptables -I FORWARD -i paqetz0 -j ACCEPT");
+    println!("     sudo iptables -I FORWARD -o paqetz0 -m conntrack \\");
+    println!("       --ctstate RELATED,ESTABLISHED -j ACCEPT");
+    println!("   Then persist it, or it is gone at the next reboot.");
+    println!();
 }
 
 #[cfg(test)]

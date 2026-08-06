@@ -346,6 +346,28 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+### When the tunnel is up and nothing gets through
+
+A gateway whose host will not forward is the most convincing broken tunnel there
+is. The handshake completes, the peer answers a ping to its inner address,
+`ip_forward` is 1, the masquerade rule is present, and both ends' counters are
+clean — because every packet really is arriving. They die on the way *out* of the
+server, in a `FORWARD` chain whose policy is `DROP`. Cloud images and anything
+that has ever installed Docker set that policy routinely.
+
+`paqetz doctor` now reports it on any host configured as a gateway, and `setup`
+says so while you still have the shell open. paqetz does not fix it, because it
+cannot: every chain registered on a hook runs, so accepting in our table does not
+stop another one dropping, and the chain that owns the policy belongs to
+`iptables`. The fix is two rules that permit only this tunnel:
+
+```bash
+sudo iptables -I FORWARD -i paqetz0 -j ACCEPT
+sudo iptables -I FORWARD -o paqetz0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+```
+
+Then persist them, or they are gone at the next reboot.
+
 ### The rekey used to be a clock
 
 Noise rekeys every two minutes, and every handshake message used to be one of
