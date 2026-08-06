@@ -46,6 +46,19 @@ pub(crate) struct Stats {
     pub(crate) disallowed: AtomicU64,
     /// Inner packets refused for having an impossible source address.
     pub(crate) martian: AtomicU64,
+    /// Inbound packets discarded because the device would not take them.
+    ///
+    /// Only reachable when the device is non-blocking, which is the batched
+    /// datapath. A full queue there is a real drop and has to be visible: an
+    /// invisible one looks exactly like loss on the wire, and sends whoever is
+    /// chasing it to the wrong end of the link.
+    pub(crate) device_full: AtomicU64,
+    /// Frames that passed the capture filter but could not be parsed.
+    ///
+    /// Should be nothing. Anything else means the filter and the parser
+    /// disagree about what this flow carries, which is worth knowing before it
+    /// is measured as packet loss.
+    pub(crate) unparsed: AtomicU64,
     /// Whether the first refused source has already been explained.
     ///
     /// The counter says how many; it cannot say why, and the why is almost
@@ -71,6 +84,16 @@ impl Stats {
 
     /// Adds `n` to a counter.
     #[inline]
+    /// Takes back a count that turned out not to have happened.
+    ///
+    /// Saturating, so a correction can never wrap a counter into a number that
+    /// reads as an enormous one.
+    pub(crate) fn sub(counter: &AtomicU64, n: u64) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(n))
+        });
+    }
+
     pub(crate) fn add(counter: &AtomicU64, n: u64) {
         counter.fetch_add(n, Ordering::Relaxed);
     }
@@ -111,6 +134,8 @@ impl Stats {
             ("disallowed", get(&self.disallowed)),
             ("martian", get(&self.martian)),
             ("tx-dropped", get(&self.tx_dropped)),
+            ("device-full", get(&self.device_full)),
+            ("unparsed", get(&self.unparsed)),
             ("roams", get(&self.roams)),
         ] {
             if value > 0 {
@@ -169,6 +194,33 @@ fn duration(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_correction_cannot_wrap_a_counter() {
+        // A short batch takes back what was counted when the packets were
+        // sealed. If the correction ever exceeded the count, wrapping would
+        // turn "we dropped three" into eighteen quintillion.
+        let c = super::AtomicU64::new(2);
+        super::Stats::sub(&c, 5);
+        assert_eq!(c.load(super::Ordering::Relaxed), 0);
+        super::Stats::add(&c, 7);
+        super::Stats::sub(&c, 3);
+        assert_eq!(c.load(super::Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn the_new_drop_counters_appear_only_when_they_fire() {
+        let s = super::Stats::default();
+        let clean = s.line(1000, None);
+        assert!(!clean.contains("device-full"), "{clean}");
+        assert!(!clean.contains("unparsed"), "{clean}");
+
+        super::Stats::bump(&s.device_full);
+        super::Stats::add(&s.unparsed, 3);
+        let noisy = s.line(1000, None);
+        assert!(noisy.contains("device-full 1"), "{noisy}");
+        assert!(noisy.contains("unparsed 3"), "{noisy}");
+    }
+
     use super::*;
 
     #[test]

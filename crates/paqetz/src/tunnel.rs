@@ -913,6 +913,7 @@ impl Tunnel {
 
             // Encrypt each into its own frame buffer, then send them together.
             dsts.clear();
+            let mut inner_lens = [0usize; sys::BATCH];
             let mut ready = 0usize;
             for i in 0..count {
                 let Some(packet) = inner
@@ -924,10 +925,14 @@ impl Tunnel {
                 let Some(frame) = frames.get_mut(ready) else {
                     break;
                 };
+                let inner_len = packet.len();
                 match self.seal_into(packet, &mut sealed, frame) {
                     Ok(Some((written, dst))) => {
                         if let Some(slot) = lens.get_mut(ready) {
                             *slot = written;
+                        }
+                        if let Some(slot) = inner_lens.get_mut(ready) {
+                            *slot = inner_len;
                         }
                         dsts.push(dst);
                         ready += 1;
@@ -946,11 +951,31 @@ impl Tunnel {
                 .enumerate()
                 .filter_map(|(i, f)| f.get(..*lens.get(i).unwrap_or(&0)))
                 .collect();
-            if let Err(e) = self.tx.send_batch(&packets, &dsts) {
-                self.note_outbound(&Error::Os {
+            let offered = packets.len();
+            match self.tx.send_batch(&packets, &dsts) {
+                // `sendmmsg` takes a prefix and reports how much. The tail was
+                // never sent, and was previously neither retried nor counted --
+                // so a full ring turned into loss that every counter denied,
+                // which is the hardest kind to find and the easiest to blame on
+                // the network.
+                Ok(sent) if sent < offered => {
+                    let lost = offered - sent;
+                    Stats::add(&self.stats.tx_dropped, lost as u64);
+                    // Those packets were counted as transmitted when they were
+                    // sealed. Take them back rather than leave the figure
+                    // describing what was encrypted instead of what left.
+                    Stats::sub(&self.stats.tx_packets, lost as u64);
+                    let unsent: u64 = inner_lens
+                        .get(sent..offered)
+                        .map(|s| s.iter().map(|n| *n as u64).sum())
+                        .unwrap_or(0);
+                    Stats::sub(&self.stats.tx_bytes, unsent);
+                }
+                Ok(_) => {}
+                Err(e) => self.note_outbound(&Error::Os {
                     context: "transmitting a batch".to_owned(),
                     source: e,
-                });
+                }),
             }
         }
     }
@@ -1148,6 +1173,7 @@ impl Tunnel {
                 continue;
             };
             let Some(seg) = segment::parse_ethernet(bytes) else {
+                Stats::bump(&self.stats.unparsed);
                 continue;
             };
             if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
@@ -1415,8 +1441,12 @@ impl Tunnel {
             Ok(_) => Ok(()),
             // The device is non-blocking in batched mode, so a full queue
             // refuses the write. That is a drop, exactly as a congested link
-            // would be, and inner protocols already cope with it.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            // would be, and inner protocols already cope with it -- but it is
+            // still a drop, and one that used to leave no trace at all.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Stats::bump(&self.stats.device_full);
+                Ok(())
+            }
             Err(source) => Err(Error::Os {
                 context: "writing to the TUN device".to_owned(),
                 source,
