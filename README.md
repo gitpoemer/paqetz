@@ -346,6 +346,33 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+### The rekey used to be a clock
+
+Noise rekeys every two minutes, and every handshake message used to be one of
+exactly two lengths. That put two packets of known size on the wire on a strict
+120-second interval — a periodic signature needing no cryptanalysis to find, and
+one nothing else about the carrier produces. The original Go implementation has
+no equivalent: its key is a static pre-shared secret, so it handshakes once and
+never again.
+
+Both halves are now variable, and neither is configurable:
+
+- The rekey falls anywhere in **100–140 seconds**, drawn per session. The late
+  end still leaves 40 seconds before the session would be refused outright,
+  which is far more than a handshake needs.
+- Each handshake message carries **0–64 bytes of padding**, drawn per message,
+  inside the encrypted payload. Only the length is observable, so the padding
+  itself is zeros — there is nothing for random content to hide from.
+
+Which handshake message a packet is used to be decided by its length. It is now
+decided by role: an initiator is never sent a msg1 and a responder is never sent
+a msg2, which was always true and does not depend on what is on the wire.
+
+**This changes the wire format.** A build from before this refuses a padded
+message outright. Upgrade the **server first**: a current server answers an old
+client's unpadded handshake in kind, so it keeps working while its clients
+follow. An old server and a current client will not connect.
+
 ### When it works but feels slow
 
 `paqetz doctor` answers *will this work*. `paqetz doctor --under-load` answers

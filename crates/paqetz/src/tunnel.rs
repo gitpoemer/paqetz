@@ -36,6 +36,25 @@ use crate::stats::Stats;
 /// How often the timer thread wakes.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How far either side of [`noise::REKEY_AFTER_TIME`] a rekey may fall.
+///
+/// A rekey is two packets, and on a fixed two-minute interval those two packets
+/// are a clock -- the most legible thing this carrier emits, and one nothing
+/// else on the wire explains. Spreading them over forty seconds costs nothing:
+/// the late end still leaves forty seconds before the session would be refused
+/// outright, which is far more than a handshake needs.
+const REKEY_JITTER: Millis = 20_000;
+
+/// How much a handshake message is padded by.
+///
+/// Drawn per message, so the two packets a rekey puts on the wire are not the
+/// same length twice running. Without it every handshake was one of exactly two
+/// sizes, which -- on a strict interval -- is a pattern that needs no
+/// cryptanalysis to find and that nothing else about this carrier produces.
+fn handshake_pad() -> usize {
+    random_u32().map_or(0, |r| r as usize % (noise::MAX_PAD + 1))
+}
+
 /// How long to wait before repeating an unanswered confirmation.
 const CONFIRM_RETRY: Millis = 1_000;
 
@@ -162,6 +181,11 @@ struct PeerState {
     endpoint: Option<SocketAddrV4>,
     /// When the last handshake was sent.
     last_handshake: Millis,
+    /// When this session should be replaced.
+    ///
+    /// Jittered per session and stored, rather than a fixed interval measured
+    /// from establishment.
+    rekey_at: Millis,
     /// When the handshake just sent may be repeated.
     ///
     /// Stored rather than recomputed, because the interval is jittered: drawing
@@ -233,6 +257,7 @@ impl PeerState {
             carrier: None,
             endpoint,
             last_handshake: 0,
+            rekey_at: Millis::MAX,
             retry_at: 0,
             attempt_started: None,
             last_receive: None,
@@ -344,7 +369,8 @@ impl PeerState {
     /// carrying over whatever made the previous session look dead. Without this
     /// the condition that triggered the handshake survives it, and the next tick
     /// triggers another, and the tunnel spends its life handshaking.
-    fn established(&mut self, now: Millis) {
+    fn established(&mut self, now: Millis, rekey_after: Millis) {
+        self.rekey_at = now.saturating_add(rekey_after);
         self.last_receive = Some(now);
         self.last_send = None;
         self.last_keepalive = None;
@@ -1142,15 +1168,22 @@ impl Tunnel {
 
         // A handshake and a transport packet can be the same length, so the
         // keyed mac1 decides which this is rather than the length (D7).
-        if payload.len() == noise::MSG1_LEN
+        //
+        // Which handshake message it could be is decided by role rather than by
+        // length: an initiator is never sent a msg1 and a responder is never
+        // sent a msg2, and both messages now vary in length, so their ranges
+        // overlap and length no longer tells them apart. Role always did, and
+        // does not depend on what is on the wire.
+        if self.is_initiator() {
+            if (noise::MSG2_LEN..=noise::MSG2_MAX).contains(&payload.len())
+                && noise::verify_mac1(&self.local_public, payload).is_ok()
+            {
+                return self.handle_msg2(seg, payload);
+            }
+        } else if (noise::MSG1_LEN..=noise::MSG1_MAX).contains(&payload.len())
             && noise::verify_mac1(&self.local_public, payload).is_ok()
         {
             return self.handle_msg1(seg, payload, reply);
-        }
-        if payload.len() == noise::MSG2_LEN
-            && noise::verify_mac1(&self.local_public, payload).is_ok()
-        {
-            return self.handle_msg2(seg, payload);
         }
 
         self.handle_transport(seg, from, inner)
@@ -1185,7 +1218,20 @@ impl Tunnel {
             context: "generating a session index".to_owned(),
             source,
         })?;
-        let (session, msg2) = pending.accept(index, now)?;
+        // Padded only if the initiator padded. A build that predates the
+        // padding checks msg2's length exactly and would refuse a padded reply,
+        // so answering in kind is what lets a server be upgraded before its
+        // clients rather than in lockstep with them. A current peer pads almost
+        // always, so this costs nothing once both ends have moved.
+        let pad = if payload.len() > noise::MSG1_LEN {
+            handshake_pad()
+        } else {
+            0
+        };
+        let (session, (msg2, msg2_len)) = pending.accept(index, now, pad)?;
+        let Some(msg2) = msg2.get(..msg2_len) else {
+            return Ok(());
+        };
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1214,12 +1260,12 @@ impl Tunnel {
         // the bytes the peer actually sent.
         carrier.on_receive(seg);
 
-        let written = carrier.data(&msg2, reply, now)?;
+        let written = carrier.data(msg2, reply, now)?;
         let dst = seg.src.0;
 
         state.accept(session);
         state.pending = None;
-        state.established(now);
+        state.established(now, Self::rekey_after());
         state.endpoint = Some(SocketAddrV4::new(seg.src.0, seg.src.1));
         drop(state);
 
@@ -1251,7 +1297,7 @@ impl Tunnel {
                     carrier.on_receive(seg);
                 }
                 state.install(session);
-                state.established(now);
+                state.established(now, Self::rekey_after());
                 drop(state);
                 self.stats.note_handshake(now);
                 info!(
@@ -1529,6 +1575,13 @@ impl Tunnel {
         Ok(())
     }
 
+    /// How long this session should last before being replaced.
+    fn rekey_after() -> Millis {
+        let spread =
+            random_u32().map_or(REKEY_JITTER, |r| Millis::from(r) % (2 * REKEY_JITTER + 1));
+        noise::REKEY_AFTER_TIME + spread - REKEY_JITTER
+    }
+
     /// How long to wait before repeating a handshake, jittered.
     ///
     /// Two peers that lost each other at the same instant would otherwise retry
@@ -1562,7 +1615,14 @@ impl Tunnel {
             // on the timer alone left a peer that had forgotten us undetected
             // for two minutes, with everything sent in between encrypted to a
             // key nobody holds.
-            Some(s) => s.needs_rekey(now) || (state.presumed_dead(now) && waited),
+            // The time half of this is the tunnel's, so it can be jittered;
+            // the message-count half stays where the counter lives.
+            Some(s) => {
+                (s.is_initiator()
+                    && (now >= state.rekey_at
+                        || s.sent() >= paqetz_core::noise::REKEY_AFTER_MESSAGES))
+                    || (state.presumed_dead(now) && waited)
+            }
         };
         if !due {
             return Ok(());
@@ -1587,13 +1647,17 @@ impl Tunnel {
             source,
         })?;
 
-        let (initiator, msg1) = Initiator::start(
+        let (initiator, (msg1, msg1_len)) = Initiator::start(
             &self.cfg.interface.private_key,
             &self.local_public,
             &self.cfg.peer.public_key,
             index,
             epoch,
+            handshake_pad(),
         )?;
+        let Some(msg1) = msg1.get(..msg1_len) else {
+            return Ok(());
+        };
 
         // The carrier is per *connection*, not per session. A rekey replaces
         // the keys above it and must leave the conversation underneath
@@ -1619,7 +1683,7 @@ impl Tunnel {
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(());
         };
-        let written = carrier.data(&msg1, frame, now)?;
+        let written = carrier.data(msg1, frame, now)?;
         let dst = *peer.ip();
 
         state.pending = Some(initiator);
@@ -1842,7 +1906,7 @@ mod tests {
             "dead before the handshake"
         );
 
-        s.established(PRESUMED_DEAD + 1);
+        s.established(PRESUMED_DEAD + 1, noise::REKEY_AFTER_TIME);
         assert!(
             !s.presumed_dead(PRESUMED_DEAD + 1),
             "the peer just answered; it cannot be dead in the same instant"
@@ -1858,7 +1922,7 @@ mod tests {
     fn data_after_a_handshake_still_arms_the_liveness_timer() {
         // The fix must not disable the mechanism it is fixing.
         let mut s = spoke(None, None);
-        s.established(0);
+        s.established(0, noise::REKEY_AFTER_TIME);
         s.last_send = Some(1_000);
         assert!(s.presumed_dead(1_000 + PRESUMED_DEAD));
     }
@@ -1883,17 +1947,21 @@ mod tests {
         index: u32,
         at: Millis,
     ) -> (Session, Session) {
-        let (initiator, msg1) = Initiator::start(
+        let (initiator, (msg1, msg1_len)) = Initiator::start(
             &client.private,
             &client.public,
             &server.public,
             index,
             index,
+            // Unpadded, so a test that cares about padding has to ask for it.
+            0,
         )
         .expect("start");
-        let pending = PendingResponder::read(&server.private, &server.public, &msg1).expect("read");
-        let (server_side, msg2) = pending.accept(index + 1, at).expect("accept");
-        let client_side = initiator.finish(&msg2, at).expect("finish");
+        let msg1 = msg1.get(..msg1_len).expect("msg1");
+        let pending = PendingResponder::read(&server.private, &server.public, msg1).expect("read");
+        let (server_side, (msg2, msg2_len)) = pending.accept(index + 1, at, 0).expect("accept");
+        let msg2 = msg2.get(..msg2_len).expect("msg2");
+        let client_side = initiator.finish(msg2, at).expect("finish");
         (client_side, server_side)
     }
 
@@ -2263,6 +2331,42 @@ mod tests {
         let mut s = spoke(Some(100), Some(1_000));
         s.last_data_receive = None;
         assert!(!s.owes_keepalive(1_000 + KEEPALIVE_TIMEOUT * 10));
+    }
+
+    #[test]
+    fn the_rekey_lands_in_a_band_rather_than_on_a_tick() {
+        // A rekey is two packets, and on a fixed interval those two packets are
+        // a clock. Nothing else this carrier emits is periodic, so the clock was
+        // the most legible thing on the wire.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            let v = Tunnel::rekey_after();
+            assert!(
+                (noise::REKEY_AFTER_TIME - REKEY_JITTER..=noise::REKEY_AFTER_TIME + REKEY_JITTER)
+                    .contains(&v),
+                "{v} is outside the band"
+            );
+            seen.insert(v);
+        }
+        assert!(seen.len() > 200, "only {} distinct values", seen.len());
+
+        // The late end must still leave room to rekey before the session would
+        // be refused outright, or jitter would trade a fingerprint for an
+        // outage.
+        const {
+            assert!(noise::REKEY_AFTER_TIME + REKEY_JITTER < noise::REJECT_AFTER_TIME);
+        }
+    }
+
+    #[test]
+    fn the_padding_covers_its_whole_band() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..512 {
+            let pad = handshake_pad();
+            assert!(pad <= noise::MAX_PAD, "{pad} is over the maximum");
+            seen.insert(pad);
+        }
+        assert!(seen.len() > noise::MAX_PAD / 2, "only {} sizes", seen.len());
     }
 
     #[test]

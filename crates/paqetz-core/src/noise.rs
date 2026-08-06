@@ -100,21 +100,46 @@ const PAYLOAD_LEN: usize = 8;
 /// `e (32) || encrypted static (32+16) || encrypted payload (8+16) || mac1 (16)`.
 pub const MSG1_LEN: usize = 32 + 48 + (PAYLOAD_LEN + 16) + MAC1_LEN;
 
+/// The longest msg1, with the payload fully padded.
+pub const MSG1_MAX: usize = MSG1_LEN + MAX_PAD;
+
 /// `e (32) || encrypted payload (8+16) || mac1 (16)`.
 pub const MSG2_LEN: usize = 32 + (PAYLOAD_LEN + 16) + MAC1_LEN;
 
+/// The longest msg2, with the payload fully padded.
+pub const MSG2_MAX: usize = MSG2_LEN + MAX_PAD;
+
 /// Packs a handshake payload.
-fn pack_payload(index: u32, epoch: u32) -> [u8; PAYLOAD_LEN] {
-    let mut out = [0u8; PAYLOAD_LEN];
-    let (i, e) = out.split_at_mut(4);
+/// The most padding a handshake payload may carry.
+///
+/// Every handshake message was a fixed length, so a rekey put two packets of
+/// exactly known size on the wire on a fixed interval -- a pattern that needs
+/// no cryptanalysis to spot and that nothing else about the carrier produces.
+/// The padding is inside the Noise payload, so its *content* is ciphertext and
+/// need not be random; only its length is visible, and only its length has to
+/// vary.
+pub const MAX_PAD: usize = 64;
+
+/// Builds the handshake payload, padded by `pad` bytes.
+///
+/// `pad` is clamped rather than rejected: a caller that asks for too much gets
+/// the most that fits, which is never a reason to fail a handshake.
+fn pack_payload(index: u32, epoch: u32, pad: usize) -> ([u8; PAYLOAD_LEN + MAX_PAD], usize) {
+    let mut out = [0u8; PAYLOAD_LEN + MAX_PAD];
+    let (i, rest) = out.split_at_mut(4);
     i.copy_from_slice(&index.to_le_bytes());
+    let (e, _) = rest.split_at_mut(4);
     e.copy_from_slice(&epoch.to_le_bytes());
-    out
+    (out, PAYLOAD_LEN + pad.min(MAX_PAD))
 }
 
 /// Unpacks a handshake payload into `(index, epoch)`.
-fn unpack_payload(raw: &[u8; PAYLOAD_LEN]) -> (u32, u32) {
-    let (i, e) = raw.split_at(4);
+fn unpack_payload(raw: &[u8]) -> (u32, u32) {
+    // Anything past the first eight bytes is padding, and is ignored rather
+    // than checked: it is authenticated by the AEAD that carried it, so there
+    // is nothing an attacker could put there that would arrive.
+    let (head, _) = raw.split_at(PAYLOAD_LEN.min(raw.len()));
+    let (i, e) = head.split_at(4.min(head.len()));
     (
         u32::from_le_bytes(i.try_into().unwrap_or([0; 4])),
         u32::from_le_bytes(e.try_into().unwrap_or([0; 4])),
@@ -239,19 +264,28 @@ impl Initiator {
         responder_static: &PublicKey,
         local_index: u32,
         epoch: u32,
-    ) -> Result<(Self, [u8; MSG1_LEN])> {
+        pad: usize,
+    ) -> Result<(Self, ([u8; MSG1_MAX], usize))> {
         let mut state = snow::Builder::new(pattern())
             .local_private_key(local.as_bytes())?
             .remote_public_key(responder_static.as_bytes())?
             .build_initiator()?;
 
-        let mut msg = [0u8; MSG1_LEN];
+        let (payload, len) = pack_payload(local_index, epoch, pad);
+        let mut msg = [0u8; MSG1_MAX];
+        let total = MSG1_LEN + (len - PAYLOAD_LEN);
         let body_len = {
-            let (body, _) = msg.split_at_mut(MSG1_LEN - MAC1_LEN);
-            state.write_message(&pack_payload(local_index, epoch), body)?
+            let (body, _) = msg.split_at_mut(total - MAC1_LEN);
+            let Some(payload) = payload.get(..len) else {
+                return Err(Error::Rejected);
+            };
+            state.write_message(payload, body)?
         };
-        debug_assert_eq!(body_len, MSG1_LEN - MAC1_LEN);
-        seal_mac1(responder_static, &mut msg)?;
+        debug_assert_eq!(body_len, total - MAC1_LEN);
+        let Some(msg1) = msg.get_mut(..total) else {
+            return Err(Error::Rejected);
+        };
+        seal_mac1(responder_static, msg1)?;
 
         Ok((
             Self {
@@ -261,7 +295,7 @@ impl Initiator {
                 local_index,
                 epoch,
             },
-            msg,
+            (msg, total),
         ))
     }
 
@@ -271,21 +305,24 @@ impl Initiator {
     /// Returns [`Error::Rejected`] if `mac1` or the AEAD fails, which is what a
     /// forged or mis-sized reply produces.
     pub fn finish(mut self, msg2: &[u8], now: Millis) -> Result<Session> {
-        if msg2.len() != MSG2_LEN {
+        if !(MSG2_LEN..=MSG2_MAX).contains(&msg2.len()) {
             return Err(Error::Rejected);
         }
         // msg2's mac1 is keyed on *our* static key: we are its recipient.
         let body = verify_mac1(&self.local_static, msg2)?;
 
-        let mut payload = [0u8; PAYLOAD_LEN];
+        let mut payload = [0u8; PAYLOAD_LEN + MAX_PAD];
         let n = self
             .state
             .read_message(body, &mut payload)
             .map_err(|_| Error::Rejected)?;
-        if n != PAYLOAD_LEN {
+        if n < PAYLOAD_LEN {
             return Err(Error::Rejected);
         }
-        let (remote_index, echoed_epoch) = unpack_payload(&payload);
+        let Some(payload) = payload.get(..n) else {
+            return Err(Error::Rejected);
+        };
+        let (remote_index, echoed_epoch) = unpack_payload(payload);
         // The responder echoes the epoch it will use. A mismatch would mean the
         // two ends disagree about the carrier's sequence numbering, which would
         // surface as a flow that contradicts itself rather than as a failure.
@@ -337,7 +374,7 @@ impl PendingResponder {
     /// Returns [`Error::Rejected`] for a wrong length, a bad `mac1`, or a
     /// handshake that fails to decrypt.
     pub fn read(local: &PrivateKey, local_public: &PublicKey, msg1: &[u8]) -> Result<Self> {
-        if msg1.len() != MSG1_LEN {
+        if !(MSG1_LEN..=MSG1_MAX).contains(&msg1.len()) {
             return Err(Error::Rejected);
         }
         let body = verify_mac1(local_public, msg1)?;
@@ -346,14 +383,17 @@ impl PendingResponder {
             .local_private_key(local.as_bytes())?
             .build_responder()?;
 
-        let mut payload = [0u8; PAYLOAD_LEN];
+        let mut payload = [0u8; PAYLOAD_LEN + MAX_PAD];
         let n = state
             .read_message(body, &mut payload)
             .map_err(|_| Error::Rejected)?;
-        if n != PAYLOAD_LEN {
+        if n < PAYLOAD_LEN {
             return Err(Error::Rejected);
         }
-        let (remote_index, epoch) = unpack_payload(&payload);
+        let Some(payload) = payload.get(..n) else {
+            return Err(Error::Rejected);
+        };
+        let (remote_index, epoch) = unpack_payload(payload);
 
         let raw = state.get_remote_static().ok_or(Error::Rejected)?;
         let initiator_static: [u8; 32] = raw.try_into().map_err(|_| Error::Rejected)?;
@@ -383,16 +423,28 @@ impl PendingResponder {
     ///
     /// # Errors
     /// Returns [`Error::Noise`] if `snow` rejects the transition.
-    pub fn accept(mut self, local_index: u32, now: Millis) -> Result<(Session, [u8; MSG2_LEN])> {
-        let mut msg = [0u8; MSG2_LEN];
+    pub fn accept(
+        mut self,
+        local_index: u32,
+        now: Millis,
+        pad: usize,
+    ) -> Result<(Session, ([u8; MSG2_MAX], usize))> {
+        let (payload, len) = pack_payload(local_index, self.epoch, pad);
+        let mut msg = [0u8; MSG2_MAX];
+        let total = MSG2_LEN + (len - PAYLOAD_LEN);
         let body_len = {
-            let (body, _) = msg.split_at_mut(MSG2_LEN - MAC1_LEN);
-            self.state
-                .write_message(&pack_payload(local_index, self.epoch), body)?
+            let (body, _) = msg.split_at_mut(total - MAC1_LEN);
+            let Some(payload) = payload.get(..len) else {
+                return Err(Error::Rejected);
+            };
+            self.state.write_message(payload, body)?
         };
-        debug_assert_eq!(body_len, MSG2_LEN - MAC1_LEN);
+        debug_assert_eq!(body_len, total - MAC1_LEN);
         // msg2's mac1 is keyed on the initiator's static key: it is the recipient.
-        seal_mac1(&self.initiator_static, &mut msg)?;
+        let Some(msg2) = msg.get_mut(..total) else {
+            return Err(Error::Rejected);
+        };
+        seal_mac1(&self.initiator_static, msg2)?;
 
         let session = Session {
             transport: self.state.into_stateless_transport_mode()?,
@@ -405,7 +457,7 @@ impl PendingResponder {
             is_initiator: false,
             epoch: self.epoch,
         };
-        Ok((session, msg))
+        Ok((session, (msg, total)))
     }
 }
 
@@ -630,21 +682,24 @@ mod tests {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (initiator, msg1) = Initiator::start(
+        let (initiator, (msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             0x1111_1111,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let msg1 = msg1_buf.get(..msg1_len).expect("msg");
 
         let pending =
-            PendingResponder::read(&server_kp.private, &server_kp.public, &msg1).expect("read");
+            PendingResponder::read(&server_kp.private, &server_kp.public, msg1).expect("read");
         assert_eq!(pending.initiator_static(), &client_kp.public);
 
-        let (server, msg2) = pending.accept(0x2222_2222, now).expect("accept");
-        let client = initiator.finish(&msg2, now).expect("finish");
+        let (server, (msg2_buf, msg2_len)) = pending.accept(0x2222_2222, now, 0).expect("accept");
+        let msg2 = msg2_buf.get(..msg2_len).expect("msg2");
+        let client = initiator.finish(msg2, now).expect("finish");
 
         (Pair { client, server }, client_kp, server_kp)
     }
@@ -688,18 +743,21 @@ mod tests {
     fn handshake_message_lengths_are_fixed() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (init, msg1) = Initiator::start(
+        let (init, (msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let msg1 = msg1_buf.get(..msg1_len).expect("msg");
         assert_eq!(msg1.len(), MSG1_LEN);
         let pending =
-            PendingResponder::read(&server_kp.private, &server_kp.public, &msg1).expect("read");
-        let (_, msg2) = pending.accept(2, 0).expect("accept");
+            PendingResponder::read(&server_kp.private, &server_kp.public, msg1).expect("read");
+        let (_, (msg2_buf, msg2_len)) = pending.accept(2, 0, 0).expect("accept");
+        let msg2 = msg2_buf.get(..msg2_len).expect("msg2");
         assert_eq!(msg2.len(), MSG2_LEN);
         drop(init);
     }
@@ -859,17 +917,19 @@ mod tests {
         let stranger = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (_, msg1) = Initiator::start(
+        let (_, (msg1_buf, msg1_len)) = Initiator::start(
             &stranger.private,
             &stranger.public,
             &server_kp.public,
             0xAAAA,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let msg1 = msg1_buf.get(..msg1_len).expect("msg");
 
         let pending =
-            PendingResponder::read(&server_kp.private, &server_kp.public, &msg1).expect("read");
+            PendingResponder::read(&server_kp.private, &server_kp.public, msg1).expect("read");
 
         // The responder learns who is calling and can simply drop the pending
         // handshake. No msg2 is produced, so nothing goes back on the wire.
@@ -883,19 +943,21 @@ mod tests {
         let intended = KeyPair::generate().expect("generate");
         let other_server = KeyPair::generate().expect("generate");
 
-        let (_, msg1) = Initiator::start(
+        let (_, (msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &intended.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let msg1 = msg1_buf.get(..msg1_len).expect("msg");
 
         // A server that is not the intended recipient rejects on mac1, before
         // doing any Diffie-Hellman at all.
         assert!(matches!(
-            PendingResponder::read(&other_server.private, &other_server.public, &msg1),
+            PendingResponder::read(&other_server.private, &other_server.public, msg1),
             Err(Error::Rejected)
         ));
     }
@@ -904,26 +966,97 @@ mod tests {
     fn mac1_rejects_a_corrupted_handshake() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (_, mut msg1) = Initiator::start(
+        let (_, (mut msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
 
-        msg1[0] ^= 0x01;
+        msg1_buf[0] ^= 0x01;
+        let msg1 = msg1_buf.get(..msg1_len).expect("msg");
         assert!(matches!(
-            PendingResponder::read(&server_kp.private, &server_kp.public, &msg1),
+            PendingResponder::read(&server_kp.private, &server_kp.public, msg1),
             Err(Error::Rejected)
         ));
     }
 
     #[test]
+    fn padding_changes_the_length_and_nothing_else() {
+        // The point of the padding is that the length varies. The point of this
+        // test is that varying it changes nothing else: the same handshake has
+        // to complete, and both ends have to agree on the indices and epoch
+        // that were packed in front of the padding.
+        let client_kp = KeyPair::generate().expect("generate");
+        let server_kp = KeyPair::generate().expect("generate");
+
+        let mut seen = std::collections::BTreeSet::new();
+        for pad in [0, 1, 7, MAX_PAD / 2, MAX_PAD] {
+            let (initiator, (msg1, msg1_len)) = Initiator::start(
+                &client_kp.private,
+                &client_kp.public,
+                &server_kp.public,
+                0x1111_1111,
+                TEST_EPOCH,
+                pad,
+            )
+            .expect("start");
+            let msg1 = msg1.get(..msg1_len).expect("msg1");
+            assert_eq!(msg1.len(), MSG1_LEN + pad);
+            seen.insert(msg1.len());
+
+            let pending =
+                PendingResponder::read(&server_kp.private, &server_kp.public, msg1).expect("read");
+            assert_eq!(pending.initiator_static(), &client_kp.public);
+            assert_eq!(
+                pending.epoch(),
+                TEST_EPOCH,
+                "the epoch survives the padding"
+            );
+
+            let (mut server, (msg2, msg2_len)) =
+                pending.accept(0x2222_2222, 0, pad).expect("accept");
+            let msg2 = msg2.get(..msg2_len).expect("msg2");
+            assert_eq!(msg2.len(), MSG2_LEN + pad);
+
+            let mut client = initiator.finish(msg2, 0).expect("finish");
+            assert_eq!(client.local_index(), 0x1111_1111);
+            assert_eq!(client.remote_index(), 0x2222_2222);
+
+            // And the session it produced actually works.
+            let mut wire = vec![0u8; 64 + OVERHEAD];
+            let mut out = vec![0u8; 64 + OVERHEAD];
+            let n = client.seal(b"padded", &mut wire, 0).expect("seal");
+            let got = server
+                .open(wire.get(..n).expect("sealed"), &mut out, 0)
+                .expect("open");
+            assert_eq!(out.get(..got), Some(&b"padded"[..]));
+        }
+        assert_eq!(seen.len(), 5, "every padding produced its own length");
+    }
+
+    #[test]
+    fn a_padded_message_is_still_rejected_past_the_maximum() {
+        let server_kp = KeyPair::generate().expect("generate");
+        for len in [MSG1_MAX + 1, MSG1_MAX + 64] {
+            let junk = vec![0u8; len];
+            assert!(
+                matches!(
+                    PendingResponder::read(&server_kp.private, &server_kp.public, &junk),
+                    Err(Error::Rejected)
+                ),
+                "{len} was accepted"
+            );
+        }
+    }
+
+    #[test]
     fn handshake_messages_of_the_wrong_length_are_rejected() {
         let server_kp = KeyPair::generate().expect("generate");
-        for len in [0usize, 1, MSG1_LEN - 1, MSG1_LEN + 1, 4096] {
+        for len in [0usize, 1, MSG1_LEN - 1, MSG1_MAX + 1, 4096] {
             let junk = vec![0u8; len];
             assert!(matches!(
                 PendingResponder::read(&server_kp.private, &server_kp.public, &junk),
@@ -936,14 +1069,16 @@ mod tests {
     fn a_forged_msg2_is_rejected() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (initiator, _msg1) = Initiator::start(
+        let (initiator, (_msg1_buf, _msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let _msg1 = _msg1_buf.get(.._msg1_len).expect("msg");
 
         let forged = [0u8; MSG2_LEN];
         assert!(matches!(initiator.finish(&forged, 0), Err(Error::Rejected)));
@@ -954,22 +1089,26 @@ mod tests {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (_, a) = Initiator::start(
+        let (_, (a_buf, a_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
-        let (_, b) = Initiator::start(
+        let a = a_buf.get(..a_len).expect("msg");
+        let (_, (b_buf, b_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let b = b_buf.get(..b_len).expect("msg");
 
         // Fresh ephemerals each time, so a recorded handshake cannot be replayed
         // as-is and identical sessions are not identifiable by their bytes.
@@ -1038,21 +1177,24 @@ mod tests {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (initiator, msg1) = Initiator::start(
+        let (initiator, (msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
             1,
             TEST_EPOCH,
+            0,
         )
         .expect("start");
+        let msg1 = msg1_buf.get(..msg1_len).expect("msg");
 
         let mut pending =
-            PendingResponder::read(&server_kp.private, &server_kp.public, &msg1).expect("read");
+            PendingResponder::read(&server_kp.private, &server_kp.public, msg1).expect("read");
         pending.epoch = TEST_EPOCH ^ 0xFFFF;
-        let (_, msg2) = pending.accept(2, 0).expect("accept");
+        let (_, (msg2_buf, msg2_len)) = pending.accept(2, 0, 0).expect("accept");
+        let msg2 = msg2_buf.get(..msg2_len).expect("msg2");
 
-        assert!(matches!(initiator.finish(&msg2, 0), Err(Error::Rejected)));
+        assert!(matches!(initiator.finish(msg2, 0), Err(Error::Rejected)));
     }
 
     #[test]
