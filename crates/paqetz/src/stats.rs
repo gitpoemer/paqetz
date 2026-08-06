@@ -59,6 +59,12 @@ pub(crate) struct Stats {
     /// disagree about what this flow carries, which is worth knowing before it
     /// is measured as packet loss.
     pub(crate) unparsed: AtomicU64,
+    /// Counters this end has asked the peer to send again.
+    pub(crate) asked: AtomicU64,
+    /// Packets sent again because the peer asked.
+    pub(crate) repeated: AtomicU64,
+    /// Packets recovered from a peer's repeat rather than lost.
+    pub(crate) repaired: AtomicU64,
     /// Whether the first refused source has already been explained.
     ///
     /// The counter says how many; it cannot say why, and the why is almost
@@ -136,6 +142,9 @@ impl Stats {
             ("tx-dropped", get(&self.tx_dropped)),
             ("device-full", get(&self.device_full)),
             ("unparsed", get(&self.unparsed)),
+            ("asked", get(&self.asked)),
+            ("repeated", get(&self.repeated)),
+            ("repaired", get(&self.repaired)),
             ("roams", get(&self.roams)),
         ] {
             if value > 0 {

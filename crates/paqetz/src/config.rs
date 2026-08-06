@@ -108,6 +108,20 @@ pub(crate) struct Interface {
     pub(crate) transmit: TransmitPath,
     /// Whether to answer a quiet peer with an empty packet.
     ///
+    /// How many recently-sent packets to hold for repeating, or zero for none.
+    ///
+    /// Off by default. Everything the tunnel carries already recovers from
+    /// loss on its own, and on an ordinary link a second mechanism doing the
+    /// same job is waste. It earns its place on a link losing several per cent,
+    /// where inner TCP's own recovery -- paced by a retransmission timer that
+    /// starts at a couple of hundred milliseconds and grows with every loss --
+    /// is far slower than simply asking the peer again.
+    ///
+    /// The cost is memory: this many inner packets are held, so 512 is under a
+    /// megabyte at a 1400-byte MTU. Repeats are bounded in both age and number,
+    /// so this never becomes a second congestion controller arguing with the
+    /// first.
+    pub(crate) retransmit: usize,
     /// WireGuard's passive keepalive, and on by default because a silent tunnel
     /// goes cold: measured on a live path, the first two seconds of traffic
     /// after any idle period were lost to a mapping that had lapsed, while every
@@ -397,6 +411,7 @@ struct RawInterface {
     transmit: Option<String>,
     #[serde(default)]
     keepalive: Option<bool>,
+    retransmit: Option<usize>,
     #[serde(default)]
     rotate: Option<bool>,
     #[serde(default)]
@@ -831,6 +846,17 @@ impl Config {
                 // Both on unless declined. Each was measured on a live path
                 // before being made the default, and each is one line to turn
                 // off for a path that does not want it.
+                retransmit: match iface.retransmit {
+                    Some(n) if n > 4096 => {
+                        return Err(invalid(
+                            "interface.retransmit",
+                            "more than 4096 packets is megabytes of memory held for \
+                             something that is only worth repeating for a fraction of \
+                             a second",
+                        ));
+                    }
+                    other => other.unwrap_or(0),
+                },
                 keepalive: iface.keepalive.unwrap_or(true),
                 rotate: iface.rotate.unwrap_or(true),
                 gateway: iface.gateway.unwrap_or(false),

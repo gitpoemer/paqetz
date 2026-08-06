@@ -177,6 +177,10 @@ struct PeerState {
     pending: Option<Initiator>,
     /// The synthetic TCP conversation with this peer.
     carrier: Option<Carrier>,
+    /// Recently sent packets, in case the peer asks for one again.
+    outbox: crate::repeat::Outbox,
+    /// Counters the peer has not delivered.
+    inbox: crate::repeat::Inbox,
     /// Where the peer currently is.
     endpoint: Option<SocketAddrV4>,
     /// When the last handshake was sent.
@@ -248,13 +252,15 @@ struct PeerState {
 }
 
 impl PeerState {
-    const fn new(endpoint: Option<SocketAddrV4>) -> Self {
+    fn new(endpoint: Option<SocketAddrV4>, retransmit: usize) -> Self {
         Self {
             session: None,
             next: None,
             previous: None,
             pending: None,
             carrier: None,
+            outbox: crate::repeat::Outbox::new(retransmit),
+            inbox: crate::repeat::Inbox::new(),
             endpoint,
             last_handshake: 0,
             rekey_at: Millis::MAX,
@@ -268,6 +274,19 @@ impl PeerState {
             last_data_receive: None,
             rotate_at: Millis::MAX,
         }
+    }
+
+    /// The header mask for this peer, if any session exists.
+    ///
+    /// The same for every session with one peer -- it is derived from the
+    /// responder's static key -- so any of the three will do, and it lets the
+    /// counter be read before it is known which session the packet belongs to.
+    fn mask(&self) -> Option<paqetz_core::framing::HeaderMask> {
+        self.session
+            .as_ref()
+            .or(self.previous.as_ref())
+            .or(self.next.as_ref())
+            .map(|s| s.mask().clone())
     }
 
     /// Makes `session` the one to seal under, keeping the old one for reading.
@@ -575,7 +594,10 @@ impl Tunnel {
         info!("transmit via {}", tx.name());
 
         Ok(Self {
-            state: Arc::new(Mutex::new(PeerState::new(cfg.peer.endpoint))),
+            state: Arc::new(Mutex::new(PeerState::new(
+                cfg.peer.endpoint,
+                cfg.interface.retransmit,
+            ))),
             cfg,
             health_interval,
             label: None,
@@ -1058,6 +1080,8 @@ impl Tunnel {
         let Some(session) = state.session.as_mut() else {
             return Ok(None);
         };
+        // The counter this packet will carry, read before sealing spends it.
+        let counter = session.sent();
         let n = session.seal(packet, sealed, now)?;
 
         // Nothing is counted, and nothing is claimed about liveness, until there
@@ -1086,6 +1110,13 @@ impl Tunnel {
         // keepalive, wait fifteen seconds, and rehandshake, for ever.
         if !packet.is_empty() {
             state.last_send = Some(now);
+        }
+        // Held only if the peer might ask for it. A packet that is itself a
+        // repeat or a request is not worth holding: repeating a repeat is a
+        // loop, and a lost request is re-derived from the next gap anyway.
+        if crate::repeat::parse(packet).is_none() {
+            state.outbox.record(counter, packet, now);
+            state.outbox.prune(now);
         }
         Stats::bump(&self.stats.tx_packets);
         Stats::add(&self.stats.tx_bytes, packet.len() as u64);
@@ -1354,6 +1385,13 @@ impl Tunnel {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Read before opening, because which session the packet belongs to is
+        // not yet known and the mask does not depend on the answer.
+        let counter = state
+            .mask()
+            .and_then(|mask| noise::peek_header(&mask, seg.payload).ok())
+            .map(|header| header.counter);
+
         let Some(opened) = state.open(seg.payload, inner, now) else {
             return Ok(());
         };
@@ -1389,14 +1427,90 @@ impl Tunnel {
         if n > 0 {
             state.last_data_receive = Some(now);
         }
-        drop(state);
+        // Only once the packet has authenticated: a gap claimed by anyone else
+        // would have this end asking its peer for packets nobody sent.
+        let asking = match counter {
+            Some(c) if self.cfg.interface.retransmit > 0 => state.inbox.arrived(c, now),
+            _ => Vec::new(),
+        };
 
+        // What a request asks for, resolved while the outbox is still in hand.
         let Some(packet) = inner.get(..n) else {
+            drop(state);
             return Ok(());
         };
+        let mut repeats: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut repeated: Option<Vec<u8>> = None;
+        match crate::repeat::parse(packet) {
+            Some(crate::repeat::Control::Nack(wanted)) => {
+                for want in wanted {
+                    if let Some(held) = state.outbox.get(want, now) {
+                        repeats.push((want, held.to_vec()));
+                    }
+                }
+            }
+            Some(crate::repeat::Control::Repeat { original, packet }) => {
+                state.inbox.satisfied(original);
+                repeated = Some(packet.to_vec());
+                Stats::bump(&self.stats.repaired);
+            }
+            None => {}
+        }
+        drop(state);
+
         Stats::bump(&self.stats.rx_packets);
         Stats::add(&self.stats.rx_bytes, n as u64);
-        self.deliver(packet)
+
+        if !asking.is_empty() {
+            self.ask_for(&asking);
+        }
+        for (original, held) in repeats {
+            self.repeat(original, &held);
+        }
+
+        // A repeat carries the packet that was lost; anything else is itself
+        // the packet. A request carries nothing to deliver.
+        match repeated {
+            Some(inner) => self.deliver(&inner),
+            None if crate::repeat::parse(packet).is_some() => Ok(()),
+            None => self.deliver(packet),
+        }
+    }
+
+    /// Asks the peer to send these counters again.
+    fn ask_for(&self, counters: &[u64]) {
+        let mut request = vec![0u8; 3 + counters.len() * 8];
+        let Some(n) = crate::repeat::write_nack(counters, &mut request) else {
+            return;
+        };
+        let Some(body) = request.get(..n) else {
+            return;
+        };
+        let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
+        let mut frame = vec![0u8; MAX_FRAME];
+        if let Err(e) = self.send_inner(body, &mut sealed, &mut frame) {
+            debug!("could not ask for a repeat: {e}");
+        } else {
+            Stats::add(&self.stats.asked, counters.len() as u64);
+        }
+    }
+
+    /// Sends a packet again, saying which counter it first went out under.
+    fn repeat(&self, original: u64, packet: &[u8]) {
+        let mut body = vec![0u8; crate::repeat::REPEAT_OVERHEAD + packet.len()];
+        let Some(n) = crate::repeat::write_repeat(original, packet, &mut body) else {
+            return;
+        };
+        let Some(body) = body.get(..n) else {
+            return;
+        };
+        let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
+        let mut frame = vec![0u8; MAX_FRAME];
+        if let Err(e) = self.send_inner(body, &mut sealed, &mut frame) {
+            debug!("could not repeat a packet: {e}");
+        } else {
+            Stats::bump(&self.stats.repeated);
+        }
     }
 
     /// Checks an inner packet and writes it to the device.
@@ -1865,7 +1979,7 @@ mod tests {
             last_send: sent,
             last_receive: heard,
             last_data_receive: heard,
-            ..PeerState::new(None)
+            ..PeerState::new(None, 0)
         }
     }
 
@@ -2016,7 +2130,7 @@ mod tests {
         let (old_client, mut old_server) = session_pair(&client, &server, 10);
         let (new_client, mut new_server) = session_pair(&client, &server, 20);
 
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         state.install(old_client);
 
         let mut wire = [0u8; 256];
@@ -2070,7 +2184,7 @@ mod tests {
         let (mut live_peer, live) = session_pair(&client, &server, 60);
         let (_, replayed) = session_pair(&client, &server, 70);
 
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         state.install(live);
         let established = state.session.as_ref().expect("a session").local_index();
 
@@ -2110,7 +2224,7 @@ mod tests {
         let (_, old) = session_pair(&client, &server, 80);
         let (mut peer, fresh) = session_pair(&client, &server, 90);
 
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         state.install(old);
         state.accept(fresh);
         let waiting = state.next.as_ref().expect("waiting").local_index();
@@ -2152,7 +2266,7 @@ mod tests {
         let rekeyed = paqetz_core::noise::REKEY_AFTER_TIME;
         let (mut peer, fresh) = session_pair_at(&client, &server, 120, rekeyed);
 
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         state.install(old);
         state.accept(fresh);
 
@@ -2180,7 +2294,7 @@ mod tests {
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (_, session) = session_pair(&client, &server, 140);
 
-        let mut s = PeerState::new(None);
+        let mut s = PeerState::new(None, 0);
         s.install(session);
         for _ in 0..CONFIRM_TRIES {
             assert!(s.confirm_owed, "still worth asking");
@@ -2202,7 +2316,7 @@ mod tests {
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (mut peer, session) = session_pair(&client, &server, 130);
 
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         state.install(session);
         assert!(state.confirm_owed);
 
@@ -2225,7 +2339,7 @@ mod tests {
         // condition survived the packet it emitted and fired again on the next
         // tick -- four empty packets a second for as long as the peer stayed
         // quiet.
-        let mut s = PeerState::new(None);
+        let mut s = PeerState::new(None, 0);
         s.last_data_receive = Some(1_000);
         assert!(!s.owes_keepalive(1_000), "not yet");
         assert!(
@@ -2252,7 +2366,7 @@ mod tests {
         // The other half of the same distinction: answering a peer is not
         // evidence the peer answered us, and conflating the two is what made an
         // idle tunnel handshake itself to death.
-        let mut s = PeerState::new(None);
+        let mut s = PeerState::new(None, 0);
         s.last_keepalive = Some(1_000);
         assert!(
             !s.presumed_dead(1_000 + PRESUMED_DEAD * 10),
@@ -2268,7 +2382,7 @@ mod tests {
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (session, _) = session_pair(&client, &server, 100);
 
-        let mut s = PeerState::new(None);
+        let mut s = PeerState::new(None, 0);
         assert!(!s.confirm_owed, "nothing has happened yet");
         s.install(session);
         assert!(
@@ -2289,7 +2403,7 @@ mod tests {
         let (second, _) = session_pair(&client, &server, 40);
         let (third, _) = session_pair(&client, &server, 50);
 
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         state.install(first);
         state.install(second);
         state.install(third);
@@ -2308,7 +2422,7 @@ mod tests {
 
     #[test]
     fn nothing_opens_before_there_is_a_session() {
-        let mut state = PeerState::new(None);
+        let mut state = PeerState::new(None, 0);
         let mut inner = [0u8; 64];
         assert!(state.open(&[0u8; 32], &mut inner, 0).is_none());
     }

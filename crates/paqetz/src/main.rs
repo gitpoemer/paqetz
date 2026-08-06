@@ -9,6 +9,7 @@ mod log;
 mod migrate;
 mod networkd;
 mod probe;
+mod repeat;
 mod service;
 mod setup;
 mod stats;

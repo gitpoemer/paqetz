@@ -346,6 +346,46 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+### When the link itself is losing packets
+
+The tunnel carries no reliability layer, because everything inside it already
+has one. That reasoning holds while a link loses a packet in a hundred. It stops
+holding at a packet in four: inner TCP's recovery is paced by its own
+retransmission timer, which starts around two hundred milliseconds and grows
+with every loss, so a quarter-lossy link is unusable however correct the tunnel
+is.
+
+```toml
+# under [tunnel.interface]
+retransmit = 512    # packets to hold, in case the peer asks for one again
+```
+
+Off by default. On an ordinary link a second recovery mechanism is waste, and
+worse than waste — it hides loss from the congestion control that is supposed to
+see it. Turn it on when you have **measured** several per cent of loss, which
+means comparing one end's `tx` against the other's `rx` over the same window.
+
+What it does is deliberately small. Every packet already carries a monotonic
+counter — it is the AEAD nonce — so a gap is visible without adding anything to
+the wire. The receiver notices a specific counter missing, asks for that one,
+and the sender re-seals it from a small ring. There is no ordering, no window,
+and no congestion control, so one lost packet never blocks the flows behind it —
+which is the cost the obvious design, a reliable stream inside the tunnel, would
+make you pay across dozens of unrelated connections at once.
+
+It gives up quickly and on purpose. A packet is only worth repeating for about
+400 ms and is asked for at most twice; past that, inner TCP has noticed anyway
+and two recoveries for one loss is waste on a link already struggling. Memory is
+`retransmit` inner packets, so 512 is under a megabyte at a 1400-byte MTU.
+
+Requests and repeats travel as ordinary transport packets, sealed under the same
+session. They are told apart by a leading zero byte, which no IPv4 packet can
+start with, so nothing new appears on the wire.
+
+Three counters appear in the health line when it is working: `asked`,
+`repeated`, and `repaired` — the last being packets that would otherwise have
+been lost.
+
 ### When the tunnel is up and nothing gets through
 
 A gateway whose host will not forward is the most convincing broken tunnel there
