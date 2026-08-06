@@ -39,6 +39,9 @@ const TICK: Duration = Duration::from_millis(250);
 /// How long to wait before repeating an unanswered confirmation.
 const CONFIRM_RETRY: Millis = 1_000;
 
+/// How many unanswered confirmations to send before letting it be.
+const CONFIRM_TRIES: u8 = 4;
+
 /// How long to wait before repeating an unanswered handshake.
 ///
 /// WireGuard's interval. Long enough not to flood a peer that is down, short
@@ -197,6 +200,19 @@ struct PeerState {
     /// the thing a lossy path drops. Sent once and assumed delivered, a single
     /// loss would strand the responder until the next rekey.
     confirm_owed: bool,
+    /// How many confirmations have gone unanswered.
+    ///
+    /// Bounded, because a peer that is idle has nothing to answer with: a
+    /// responder can promote the session, have nothing to say, and stay
+    /// silent, which is indistinguishable from never having promoted it. Left
+    /// unbounded, that reads as "keep asking" for ever -- a packet a second,
+    /// on a carrier whose whole purpose is to be unremarkable, for as long as
+    /// the tunnel is up.
+    ///
+    /// A handful of attempts is enough: they are only lost together if the
+    /// path is failing, and a path that drops [`CONFIRM_TRIES`] consecutive
+    /// packets has a problem no amount of repeating will solve.
+    confirm_tries: u8,
     /// When the carrier should move to the next port.
     rotate_at: Millis,
     /// When a packet carrying actual data last arrived.
@@ -223,6 +239,7 @@ impl PeerState {
             last_send: None,
             last_keepalive: None,
             confirm_owed: false,
+            confirm_tries: 0,
             last_data_receive: None,
             rotate_at: Millis::MAX,
         }
@@ -238,6 +255,7 @@ impl PeerState {
         // be confirmed; keeping it would be a third set of keys nobody has used.
         self.next = None;
         self.confirm_owed = true;
+        self.confirm_tries = 0;
     }
 
     /// Accepts `session` without sealing under it yet.
@@ -292,6 +310,7 @@ impl PeerState {
                     // the peer has it, so nothing more needs confirming.
                     if result.is_ok() {
                         self.confirm_owed = false;
+                        self.confirm_tries = 0;
                     }
                     return Some(result);
                 }
@@ -1498,6 +1517,15 @@ impl Tunnel {
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.last_keepalive = Some(now);
+        if state.confirm_owed {
+            state.confirm_tries = state.confirm_tries.saturating_add(1);
+            if state.confirm_tries >= CONFIRM_TRIES {
+                // Either it arrived and the peer has nothing to say, or the
+                // path is dropping every one of them. Neither is improved by a
+                // fifth.
+                state.confirm_owed = false;
+            }
+        }
         Ok(())
     }
 
@@ -2034,6 +2062,30 @@ mod tests {
                 .expect("the waiting session is reachable"),
             b"after expiry".len()
         );
+    }
+
+    #[test]
+    fn an_unanswered_confirmation_gives_up_rather_than_asking_for_ever() {
+        // A responder can promote the session, have nothing to say, and stay
+        // silent -- which looks exactly like never having promoted it. Asking
+        // again for ever turns that into one packet a second for the life of
+        // the tunnel, which was visible in the field as a transmit counter
+        // climbing at a steady 60 a minute with nothing using the tunnel.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (_, session) = session_pair(&client, &server, 140);
+
+        let mut s = PeerState::new(None);
+        s.install(session);
+        for _ in 0..CONFIRM_TRIES {
+            assert!(s.confirm_owed, "still worth asking");
+            // What `maybe_keepalive` records after each attempt.
+            s.confirm_tries = s.confirm_tries.saturating_add(1);
+            if s.confirm_tries >= CONFIRM_TRIES {
+                s.confirm_owed = false;
+            }
+        }
+        assert!(!s.confirm_owed, "asked enough");
     }
 
     #[test]
