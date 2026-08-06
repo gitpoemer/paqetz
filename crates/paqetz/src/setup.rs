@@ -50,6 +50,8 @@ pub(crate) struct Plan {
     pub(crate) route_all: bool,
     /// A SOCKS5 listener on the client, if wanted.
     pub(crate) socks5: Option<String>,
+    /// The firewall mark a policy route steers into the tunnel, if any.
+    pub(crate) route_marked: Option<u32>,
     /// An interface the server sends the forwarded traffic out by.
     pub(crate) egress: Option<String>,
 }
@@ -65,6 +67,7 @@ impl Default for Plan {
             gateway: true,
             route_all: false,
             socks5: None,
+            route_marked: None,
             egress: None,
         }
     }
@@ -166,6 +169,18 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(c, "# tunnel's own packets are excepted automatically, so")?;
         writeln!(c, "# turning this on does not cut the connection.")?;
         writeln!(c, "route_all = true")?;
+    }
+    if let Some(mark) = plan.route_marked {
+        writeln!(
+            c,
+            "\n# Sockets stamped with this mark are steered into the tunnel by a"
+        )?;
+        writeln!(
+            c,
+            "# policy route, so a program can opt in without the host doing so."
+        )?;
+        writeln!(c, "route_marked = {mark}")?;
+        writeln!(c, "route_table  = {mark}")?;
     }
     writeln!(c, "\n[tunnel.peer]")?;
     writeln!(c, "# The server's public key.")?;
@@ -636,10 +651,35 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         }
     };
 
+    // Offered after SOCKS5 because the two are alternatives more often than
+    // they are companions, and the second question reads differently once the
+    // first has been answered.
+    let route_marked = {
+        let want = yes_no(
+            "\n3. Steer marked sockets into the tunnel as well?\n   \
+             A program that can stamp a mark on its own sockets — Xray can —\n   \
+             then reaches the tunnel without a proxy in between, which is one\n   \
+             less hop and one less thing to hold the traffic up.",
+            true,
+        )?;
+        if want {
+            let raw = ask("   Which mark?", "81")?;
+            match raw.trim().parse::<u32>() {
+                Ok(0) | Err(_) => {
+                    println!("   Not a usable mark; leaving it out.");
+                    None
+                }
+                Ok(m) => Some(m),
+            }
+        } else {
+            None
+        }
+    };
+
     // The server's egress. Only sensible when it is a way out at all.
     let egress = if gateway {
         let want = yes_no(
-            "\n3. Should the server send the forwarded traffic out a different\n   \
+            "\n4. Should the server send the forwarded traffic out a different\n   \
              interface than its own?\n   \
              The usual reason is a Cloudflare WARP tunnel: the destination\n   \
              then sees WARP's address rather than the server's datacentre\n   \
@@ -663,6 +703,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         gateway,
         route_all,
         socks5: socks5.clone(),
+        route_marked,
         egress: egress.clone(),
         ..Plan::default()
     };
@@ -690,7 +731,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
              there, so the key is only ever on the host that uses it.\n"
         );
     } else if yes_no(
-        "4. Generate an Xray REALITY inbound for the client host?\n   \
+        "5. Generate an Xray REALITY inbound for the client host?\n   \
          This is how users reach the tunnel: they connect to Xray, and\n   \
          Xray forwards what it receives through paqetz.",
         false,
@@ -704,16 +745,28 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
 
         // Match the upstream to what the tunnel was configured for, rather
         // than asking the same question twice in different words.
-        let upstream = socks5
-            .as_ref()
-            .map_or(crate::xray::Upstream::Marked(81), |listen| {
+        // The mark wins when both are configured. A marked socket reaches the
+        // tunnel through the kernel's routing; SOCKS5 reaches it through a
+        // proxy that has to accept, parse, and relay every connection. Same
+        // destination, one fewer thing in the way.
+        let upstream = match (route_marked, socks5.as_ref()) {
+            (Some(mark), _) => {
+                println!("\n   Xray will mark its outbound sockets {mark}.");
+                crate::xray::Upstream::Marked(mark)
+            }
+            (None, Some(listen)) => {
+                println!("\n   Xray will forward through the SOCKS5 listener at {listen}.");
                 crate::xray::Upstream::Socks5(listen.clone())
-            });
-        if socks5.is_none() {
-            println!(
-                "\n   No SOCKS5 listener was configured, so Xray will mark its\n                    outbound sockets instead. Add `route_marked = 81` to the\n                    client's [interface] for the rule that steers them."
-            );
-        }
+            }
+            (None, None) => {
+                println!(
+                    "\n   Neither a mark nor a SOCKS5 listener was configured, so there\n   \
+                     is nowhere for Xray to send what it receives. Add one and run\n   \
+                     `paqetz xray setup`."
+                );
+                return Ok(egress);
+            }
+        };
 
         let generated = crate::xray::generate(&crate::xray::Plan {
             listen_port: 443,
@@ -877,6 +930,29 @@ fn warn_forwarding_blocked() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mark_reaches_the_clients_file_with_a_table_to_match() {
+        // The mark alone steers nothing: the rule that acts on it points at a
+        // table, and a table that does not exist is a rule that drops traffic.
+        let pair = super::render(&Plan {
+            route_marked: Some(81),
+            ..plan()
+        })
+        .expect("render");
+        assert!(pair.client.contains("route_marked = 81"), "{}", pair.client);
+        assert!(pair.client.contains("route_table  = 81"), "{}", pair.client);
+        let parsed = crate::config::Config::parse(&pair.client).expect("parses");
+        let client = parsed.tunnels.first().expect("a tunnel");
+        assert_eq!(client.interface.route_marked, Some(81));
+        assert_eq!(client.interface.route_table, 81);
+    }
+
+    #[test]
+    fn no_mark_leaves_the_file_without_one() {
+        let pair = super::render(&plan()).expect("render");
+        assert!(!pair.client.contains("route_marked"), "{}", pair.client);
+    }
+
     use super::*;
 
     fn plan() -> Plan {

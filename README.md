@@ -355,8 +355,11 @@ sudo paqetz xray setup vpn.example.com
 ```
 
 It reads the tunnel's own configuration to decide where Xray should send what it
-receives — the SOCKS5 listener if one is configured, otherwise the firewall mark
-— rather than asking a question whose answer is already written down. It offers
+receives, rather than asking a question whose answer is already written down.
+**The mark wins when both are configured**: a marked socket reaches the tunnel
+through the kernel's routing, where SOCKS5 reaches it through a proxy that must
+accept, parse, and relay every connection first — same destination, one fewer
+thing in the way. It offers
 to install Xray if it is missing, writes the configuration to
 `/etc/xray/config.json` at mode 0600 because it holds a REALITY private key,
 installs the service, and **restarts Xray if it was already running**. Then it

@@ -806,9 +806,12 @@ fn xray_setup(
             )
         })
     });
+    // The mark wins when both are configured: a marked socket reaches the
+    // tunnel through the kernel's routing, where SOCKS5 reaches it through a
+    // proxy that must accept, parse and relay every connection first.
     let upstream = match &tunnel {
-        Some((Some(listen), _)) => xray::Upstream::Socks5(listen.clone()),
-        Some((None, Some(mark))) => xray::Upstream::Marked(*mark),
+        Some((_, Some(mark))) => xray::Upstream::Marked(*mark),
+        Some((Some(listen), None)) => xray::Upstream::Socks5(listen.clone()),
         _ => {
             return Err(format!(
                 "read {} but found neither a socks5 listener nor route_marked, so there \
