@@ -27,8 +27,11 @@
 //!
 //! A repeat is worth sending while it would arrive sooner than inner TCP's own
 //! retransmission. Past that it is duplicated effort on a link that is already
-//! struggling, so [`DEADLINE`] bounds how old a packet may be to be worth
-//! resending and [`MAX_ASKS`] bounds how many times it may be asked for.
+//! struggling, so a deadline bounds how old a packet may be to be worth
+//! resending and a limit bounds how many times it may be asked for. Both are
+//! carried in [`Limits`] rather than fixed here, because the useful values
+//! follow from the path: see [`DEFAULT_DEADLINE`] and [`DEFAULT_ASKS`] for what
+//! they are when nothing is chosen.
 //!
 //! # What goes on the wire
 //!
