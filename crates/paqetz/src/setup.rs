@@ -768,6 +768,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
             }
         };
 
+        let upstream_kind = upstream.clone();
         let generated = crate::xray::generate(&crate::xray::Plan {
             listen_port: 443,
             dest,
@@ -786,6 +787,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
                 "/usr/local/bin",
                 crate::xray::CONFIG_PATH,
                 crate::service::has_credentials(),
+                matches!(upstream_kind, crate::xray::Upstream::Marked(_)),
             ),
         )?;
 
@@ -839,7 +841,11 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
                     // applied the same way whichever route got here -- and an
                     // Xray that is already running is restarted rather than
                     // left on the settings it started with.
-                    crate::xray::apply(&generated.config, crate::xray::DEFAULT_PREFIX)?;
+                    crate::xray::apply(
+                        &generated.config,
+                        crate::xray::DEFAULT_PREFIX,
+                        matches!(upstream_kind, crate::xray::Upstream::Marked(_)),
+                    )?;
                 }
             } else {
                 println!(

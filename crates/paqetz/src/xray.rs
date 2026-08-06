@@ -544,7 +544,11 @@ pub(crate) const CONFIG_PATH: &str = "/etc/xray/config.json";
 /// # Errors
 /// Returns an error if the file cannot be written or the unit cannot be
 /// installed.
-pub(crate) fn apply(config: &str, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn apply(
+    config: &str,
+    prefix: &str,
+    marked: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The REALITY private key lives in here.
     crate::service::write_file(std::path::Path::new(CONFIG_PATH), config, 0o600)?;
     println!("  wrote {CONFIG_PATH} (mode 0600)");
@@ -559,7 +563,12 @@ pub(crate) fn apply(config: &str, prefix: &str) -> Result<(), Box<dyn std::error
     } else {
         crate::service::install_unit(
             "xray",
-            &service_unit(prefix, CONFIG_PATH, crate::service::has_credentials()),
+            &service_unit(
+                prefix,
+                CONFIG_PATH,
+                crate::service::has_credentials(),
+                marked,
+            ),
             true,
         )?;
     }
@@ -752,7 +761,21 @@ pub(crate) fn install(
 
 /// A systemd unit that runs Xray with the generated configuration.
 #[must_use]
-pub(crate) fn service_unit(prefix: &str, config: &str, credentials: bool) -> String {
+pub(crate) fn service_unit(prefix: &str, config: &str, credentials: bool, marked: bool) -> String {
+    // Stamping a mark on a socket is `SO_MARK`, and `SO_MARK` is privileged:
+    // without CAP_NET_ADMIN the call fails and the socket goes out unmarked, so
+    // the policy route never sees it and the traffic takes the default path.
+    // Nothing reports this as an error -- the tunnel is up, Xray is running,
+    // and none of it goes through.
+    //
+    // Only granted when the configuration actually asks for a mark. Handing a
+    // service the ability to rewrite packet marks because it might one day need
+    // it is how a capability set stops meaning anything.
+    let caps = if marked {
+        "CAP_NET_BIND_SERVICE CAP_NET_ADMIN"
+    } else {
+        "CAP_NET_BIND_SERVICE"
+    };
     // The configuration holds a REALITY private key, so it is 0600 and owned by
     // root. A service running under `DynamicUser` gets a transient UID that
     // cannot open such a file -- which is exactly right, and exactly why the
@@ -794,9 +817,9 @@ pub(crate) fn service_unit(prefix: &str, config: &str, credentials: bool) -> Str
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
-         # Binding 443 is all the privilege it needs.\n\
-         AmbientCapabilities=CAP_NET_BIND_SERVICE\n\
-         CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n\
+         # What it needs: a low port, and a mark if it steers by one.\n\
+         AmbientCapabilities={caps}\n\
+         CapabilityBoundingSet={caps}\n\
          NoNewPrivileges=true\n\
          {isolation}\
          ProtectSystem=strict\n\
@@ -827,17 +850,59 @@ mod install_tests {
 
     #[test]
     fn the_service_unit_names_the_binary_and_the_configuration() {
-        let unit = service_unit("/usr/local/bin", CONFIG_PATH, false);
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, false, false);
         assert!(unit.contains("/usr/local/bin/xray run -config /etc/xray/config.json"));
         assert!(unit.contains("After=network-online.target paqetz.service"));
     }
 
     #[test]
-    fn the_service_unit_asks_for_only_what_binding_a_port_needs() {
-        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true);
-        assert!(unit.contains("CAP_NET_BIND_SERVICE"));
-        assert!(!unit.contains("CAP_NET_ADMIN"), "Xray needs no such thing");
+    fn a_socks5_upstream_asks_for_only_what_binding_a_port_needs() {
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true, false);
+        assert!(unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE\n"));
+        assert!(
+            !unit.contains("CAP_NET_ADMIN"),
+            "handing it to a service that does not mark anything is how a \
+             capability set stops meaning anything:\n{unit}"
+        );
         assert!(!unit.contains("User=root"), "and it is not run as root");
+    }
+
+    #[test]
+    fn a_marked_upstream_is_given_the_privilege_marking_requires() {
+        // The regression this closes: the configuration told Xray to stamp a
+        // mark, and the unit did not let it. `SO_MARK` needs CAP_NET_ADMIN, so
+        // the call failed, the socket went out unmarked, the policy route never
+        // saw it, and every connection took the default path -- with the tunnel
+        // up, Xray running, and nothing reporting an error.
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true, true);
+        assert!(
+            unit.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN"),
+            "the bounding set has to permit what the ambient set grants:\n{unit}"
+        );
+    }
+
+    #[test]
+    fn a_marked_configuration_and_a_marked_unit_go_together() {
+        // The two halves that have to agree: if the configuration asks for a
+        // mark, the unit must permit one. Read from the generated pair rather
+        // than asserted separately, so they cannot drift apart again.
+        let generated = generate(&Plan {
+            listen_port: 443,
+            dest: "www.microsoft.com".to_owned(),
+            upstream: Upstream::Marked(81),
+            public_address: "example.com".to_owned(),
+        })
+        .expect("generate");
+        assert!(
+            generated.config.contains("\"mark\": 81"),
+            "{}",
+            generated.config
+        );
+        assert!(service_unit("/usr/local/bin", CONFIG_PATH, true, true).contains("CAP_NET_ADMIN"));
     }
 
     #[test]
@@ -845,7 +910,7 @@ mod install_tests {
         // The failure this fixes: the configuration holds a private key, so it
         // is 0600 and owned by root, and a transient user cannot open such a
         // file. Xray restarted every five seconds saying "permission denied".
-        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true);
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true, false);
         assert!(unit.contains("DynamicUser=true"));
         assert!(
             unit.contains("LoadCredential=config:/etc/xray/config.json"),
@@ -866,7 +931,7 @@ mod install_tests {
         // Below systemd 247 there is no way to hand a file to a transient user.
         // Running as root is the lesser evil: loosening a file that holds a
         // private key so an unprivileged user could read it is the greater one.
-        let unit = service_unit("/usr/local/bin", CONFIG_PATH, false);
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, false, false);
         assert!(!unit.contains("DynamicUser"), "{unit}");
         assert!(!unit.contains("LoadCredential"), "{unit}");
         assert!(unit.contains("run -config /etc/xray/config.json"), "{unit}");

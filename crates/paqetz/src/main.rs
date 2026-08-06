@@ -848,6 +848,7 @@ fn xray_setup(
         }
     };
 
+    let upstream_kind = upstream.clone();
     let generated = xray::generate(&xray::Plan {
         listen_port: port,
         dest,
@@ -873,7 +874,11 @@ fn xray_setup(
         Some(v) => println!("\nXray {v} is installed."),
     }
 
-    xray::apply(&generated.config, prefix)?;
+    xray::apply(
+        &generated.config,
+        prefix,
+        matches!(upstream_kind, xray::Upstream::Marked(_)),
+    )?;
 
     println!("\nGive this to a user:\n");
     println!("{}\n", generated.uri);
