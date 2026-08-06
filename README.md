@@ -398,11 +398,17 @@ is.
 
 ```toml
 # under [tunnel.interface]
-retransmit          = 1200   # packets to hold, in case the peer asks again
+retransmit          = true   # off unless the path's loss has been measured
+retransmit_buffer   = 1200   # packets to hold, in case the peer asks again
 retransmit_deadline = 400    # ms a packet stays worth repeating
 retransmit_asks     = 2      # times one packet may be asked for
 retransmit_reorder  = 3      # later packets that must arrive before asking
 ```
+
+`retransmit` is the switch; the rest keep their values while it is off, so a
+path's settings survive being turned off and on again. `retransmit = 1200` — the
+spelling from before there was a switch, when the buffer size doubled as the way
+to disable it — still loads and means "on, holding 1200".
 
 Off by default. On an ordinary link a second recovery mechanism is waste, and
 worse than waste — it hides loss from the congestion control that is supposed to
@@ -423,13 +429,13 @@ and two recoveries for one loss is waste on a link already struggling.
 
 **All three follow from the path, not from taste.**
 
-`retransmit` follows from its *packet rate*: a packet only has to be held until
+`retransmit_buffer` follows from the path's *packet rate*: a packet only has to be held until
 it can be asked for, so the useful capacity is `peak pps × deadline`. At
 25 Mbit/s with a 1400-byte MTU that is ~2200 pps, or ~900 packets — 512 would
 quietly be too small, and a repeat asked for would find nothing to send. 1200
 covers about 3000 pps. Slots beyond that hold packets refused for age before
 anyone can ask. Memory settles at capacity times the largest packet: ~1.7 MB at
-1200. The ceiling is 8192.
+1200. The ceiling is 8192, and the default when unset is 1024.
 
 `retransmit_deadline` follows from its *round trip*: noticing a gap and
 completing one exchange costs about two round trips, so 400 ms has room for two

@@ -117,9 +117,12 @@ pub(crate) struct Interface {
     /// loss has been *measured*, by comparing one end's `tx` against the
     /// other's `rx` over the same window.
     ///
-    /// All three settings follow from the path rather than from taste:
-    /// `retransmit` from its packet rate, `retransmit_deadline` from its round
-    /// trip, and `retransmit_asks` from how much it loses.
+    /// `retransmit` turns it on. The rest follow from the path rather than
+    /// from taste: `retransmit_buffer` from its packet rate,
+    /// `retransmit_deadline` from its round trip, `retransmit_asks` from how
+    /// much it loses, and `retransmit_reorder` from whether it reorders. They
+    /// keep their values while it is off, so it can be turned off and on again
+    /// without losing what was measured.
     pub(crate) repeat: crate::repeat::Limits,
     /// WireGuard's passive keepalive, and on by default because a silent tunnel
     /// goes cold: measured on a live path, the first two seconds of traffic
@@ -410,7 +413,8 @@ struct RawInterface {
     transmit: Option<String>,
     #[serde(default)]
     keepalive: Option<bool>,
-    retransmit: Option<usize>,
+    retransmit: Option<RawRetransmit>,
+    retransmit_buffer: Option<usize>,
     retransmit_deadline: Option<u64>,
     retransmit_asks: Option<u8>,
     retransmit_reorder: Option<u64>,
@@ -478,6 +482,28 @@ pub(crate) enum Error {
 
 /// Result alias for this module.
 pub(crate) type Result<T> = core::result::Result<T, Error>;
+
+/// How `retransmit` may be written.
+///
+/// A boolean, which is what it means. An integer is the spelling it had before
+/// there was a switch, when the size of the buffer doubled as the way to turn
+/// the thing off -- accepted so that a configuration written against that
+/// version still loads, and read as "on, with this buffer".
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum RawRetransmit {
+    /// `retransmit = true`.
+    On(bool),
+    /// `retransmit = 1200`, as it used to be written.
+    Buffer(usize),
+}
+
+/// How many packets are held when nothing says otherwise.
+///
+/// The useful size is the path's packet rate times the deadline, and 1024 at
+/// the default 400ms covers about 2500 packets a second -- more than a tunnel
+/// like this usually carries, and under two megabytes.
+const DEFAULT_BUFFER: usize = 1024;
 
 /// The most packets that may be held for repeating.
 ///
@@ -881,18 +907,39 @@ impl Config {
                     // so the useful capacity is the path's packet rate times
                     // the deadline. Beyond that the extra slots hold packets
                     // that are refused for age before anyone can ask.
-                    let capacity = match iface.retransmit {
+                    // Whether to repeat at all, and how much to hold, are
+                    // separate questions -- they were one setting only because
+                    // a buffer of zero could stand in for "off", which meant
+                    // turning it off threw away the size that had been chosen.
+                    let (enabled, from_old_form) = match iface.retransmit {
+                        None => (false, None),
+                        Some(RawRetransmit::On(on)) => (on, None),
+                        Some(RawRetransmit::Buffer(n)) => (n > 0, Some(n)),
+                    };
+                    if from_old_form.is_some() && iface.retransmit_buffer.is_some() {
+                        return Err(invalid(
+                            "interface.retransmit",
+                            "given as a number and alongside `retransmit_buffer`, which are two \
+                             ways of saying the same thing. Write `retransmit = true` and put \
+                             the size in `retransmit_buffer`.",
+                        ));
+                    }
+                    let capacity = match from_old_form.or(iface.retransmit_buffer) {
                         Some(n) if n > MAX_RETRANSMIT => {
                             return Err(invalid(
-                                "interface.retransmit",
+                                "interface.retransmit_buffer",
                                 format!(
                                     "more than {MAX_RETRANSMIT} packets is megabytes held for \
                                      something worth repeating for a fraction of a second"
                                 ),
                             ));
                         }
-                        other => other.unwrap_or(0),
+                        other => other.unwrap_or(DEFAULT_BUFFER),
                     };
+                    // Off is expressed as holding nothing, which is what every
+                    // path below already understands.
+                    let capacity = if enabled { capacity } else { 0 };
+
                     let deadline = match iface.retransmit_deadline {
                         Some(ms) if !(MIN_DEADLINE..=MAX_DEADLINE).contains(&ms) => {
                             return Err(invalid(
@@ -1020,6 +1067,45 @@ mod tests {
     }
 
     #[test]
+    fn the_switch_and_the_size_are_separate_questions() {
+        // They were one setting, so turning repeating off meant throwing away
+        // the buffer size that had been measured for the path.
+        let off = with_interface("retransmit_buffer = 1200").expect("parses");
+        assert_eq!(
+            off.interface.repeat.capacity, 0,
+            "a size alone turns nothing on"
+        );
+
+        let on = with_interface("retransmit = true\nretransmit_buffer = 1200").expect("parses");
+        assert_eq!(on.interface.repeat.capacity, 1200);
+
+        // And off again, with the size still written down.
+        let again = with_interface("retransmit = false\nretransmit_buffer = 1200").expect("parses");
+        assert_eq!(again.interface.repeat.capacity, 0);
+
+        // On, with no size chosen.
+        let plain = with_interface("retransmit = true").expect("parses");
+        assert_eq!(plain.interface.repeat.capacity, super::DEFAULT_BUFFER);
+    }
+
+    #[test]
+    fn the_spelling_this_setting_used_to_have_still_loads() {
+        // `retransmit = 1200` meant "hold twelve hundred", because the size was
+        // also the switch. A configuration written against that version has to
+        // keep working.
+        let old = with_interface("retransmit = 1200").expect("parses");
+        assert_eq!(old.interface.repeat.capacity, 1200);
+        let old_off = with_interface("retransmit = 0").expect("parses");
+        assert_eq!(old_off.interface.repeat.capacity, 0);
+
+        // But not both ways at once, disagreeing.
+        assert!(
+            with_interface("retransmit = 1200\nretransmit_buffer = 512").is_err(),
+            "two ways of saying the same thing were accepted"
+        );
+    }
+
+    #[test]
     fn repeating_is_off_unless_asked_for() {
         let off = with_interface("").expect("parses");
         assert_eq!(off.interface.repeat.capacity, 0, "off by default");
@@ -1043,7 +1129,7 @@ mod tests {
         // or long past the inner protocol's own recovery, and an ask count
         // whose every extra attempt costs two packets to save one.
         for line in [
-            "retransmit = 8193",
+            "retransmit = true\nretransmit_buffer = 8193",
             "retransmit_deadline = 49",
             "retransmit_deadline = 5001",
             "retransmit_asks = 0",
@@ -1055,7 +1141,7 @@ mod tests {
         }
         // And the edges of each are allowed.
         for line in [
-            "retransmit = 8192",
+            "retransmit = true\nretransmit_buffer = 8192",
             "retransmit_deadline = 50",
             "retransmit_deadline = 5000",
             "retransmit_asks = 1",
