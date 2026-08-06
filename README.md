@@ -370,6 +370,23 @@ and stops. A configuration a running Xray has not re-read is not in force, and
 the gap between those two states costs an hour to notice: everything on disk
 looks right and the behaviour is the old one.
 
+Xray resolves `geoip:` and `geosite:` names out of two data files, and refuses
+to start when a rule names one it cannot resolve — every configuration generated
+here uses `geoip:private`, so `paqetz xray install` fetches `geoip.dat` and
+`geosite.dat` alongside the binary and verifies them against their published
+digests. They come from [Iran-v2ray-rules][rules], which carries rules for Iran
+that the upstream files do not.
+
+[rules]: https://github.com/Chocolate4U/Iran-v2ray-rules
+
+Setup also asks whether to keep domestic destinations out of the tunnel. Saying
+yes adds two rules — `geoip:ir` by address and `geosite:ir` by name, because
+either can be domestic without the other saying so — that send those
+destinations to the blackhole instead of abroad. They are reachable without a
+tunnel, and routing them out of the country and back is slower, more visible,
+and occasionally refused at the far end for arriving from the wrong place.
+`--block-domestic` sets it without being asked.
+
 ### When the link itself is losing packets
 
 The tunnel carries no reliability layer, because everything inside it already

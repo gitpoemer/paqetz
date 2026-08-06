@@ -225,6 +225,9 @@ enum XrayAction {
         /// Forward directly, marking sockets so a policy route tunnels them.
         #[arg(long, conflicts_with = "socks5")]
         mark: Option<u32>,
+        /// Keep Iranian destinations out of the tunnel.
+        #[arg(long)]
+        block_domestic: bool,
         /// Where to write the configuration.
         #[arg(short, long, default_value = "xray-config.json")]
         out: PathBuf,
@@ -246,6 +249,9 @@ enum XrayAction {
         /// Where the binary lives.
         #[arg(long, default_value = xray::DEFAULT_PREFIX)]
         prefix: String,
+        /// Keep Iranian destinations out of the tunnel. Asked for if omitted.
+        #[arg(long)]
+        block_domestic: Option<bool>,
     },
     /// Download and install Xray, verifying the published checksum.
     Install {
@@ -796,6 +802,7 @@ fn xray_setup(
     dest: Option<String>,
     port: u16,
     prefix: &str,
+    block_domestic: Option<bool>,
     config: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tunnel = config::Config::load(config).ok().and_then(|c| {
@@ -849,11 +856,21 @@ fn xray_setup(
     };
 
     let upstream_kind = upstream.clone();
+    let block_domestic = match block_domestic {
+        Some(b) => b,
+        None => setup::yes_no(
+            "\nKeep Iranian destinations out of the tunnel? They are reachable\n\
+             without it, and sending them abroad and back is slower, more\n\
+             visible, and sometimes refused at the far end.",
+            true,
+        )?,
+    };
     let generated = xray::generate(&xray::Plan {
         listen_port: port,
         dest,
         upstream,
         public_address: public,
+        block_domestic,
     })?;
 
     // Install before applying, so the configuration is never written for
@@ -898,6 +915,7 @@ fn xray_command(
             port,
             socks5,
             mark,
+            block_domestic,
             out,
         } => {
             let upstream = match (socks5, mark) {
@@ -910,6 +928,7 @@ fn xray_command(
                 dest,
                 upstream,
                 public_address,
+                block_domestic,
             })?;
             // Holds the REALITY private key.
             service::write_file(&out, &generated.config, 0o600)?;
@@ -924,7 +943,8 @@ fn xray_command(
             dest,
             port,
             prefix,
-        } => xray_setup(public_address, dest, port, &prefix, config),
+            block_domestic,
+        } => xray_setup(public_address, dest, port, &prefix, block_domestic, config),
         XrayAction::Install { version, prefix } => {
             let v = xray::install(version.as_deref(), &prefix)?;
             println!("\nInstalled {v}.");

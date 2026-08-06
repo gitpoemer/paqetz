@@ -37,6 +37,90 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use paqetz_core::KeyPair;
 
+/// Where the routing data files come from.
+///
+/// Xray resolves `geoip:` and `geosite:` names out of two data files, and
+/// refuses to start when a configuration names one it cannot resolve. The
+/// upstream files carry the whole world; these carry the same plus rules for
+/// Iran specifically, which is what makes "leave domestic traffic alone"
+/// expressible at all.
+const RULES_REPO: &str = "Chocolate4U/Iran-v2ray-rules";
+
+/// The two files Xray reads `geoip:` and `geosite:` names from.
+const RULES_FILES: [&str; 2] = ["geoip.dat", "geosite.dat"];
+
+/// Fetches the routing data files and puts them where Xray looks.
+///
+/// Beside the binary, which is the first place Xray searches -- the failure that
+/// prompted this said `open /usr/local/bin/geoip.dat`, naming that directory
+/// outright.
+///
+/// # Errors
+/// Returns an error if a file cannot be fetched or written.
+pub(crate) fn install_rules(prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let base = format!("https://github.com/{RULES_REPO}/releases/latest/download");
+    std::fs::create_dir_all(prefix)?;
+
+    for file in RULES_FILES {
+        let target = format!("{prefix}/{file}");
+        println!("  fetching {base}/{file}");
+        let tmp = std::env::temp_dir().join(format!("paqetz-{file}"));
+        let tmp_path = tmp.display().to_string();
+        capture(
+            "curl",
+            &[
+                "-fsSL",
+                "--max-time",
+                "180",
+                "-o",
+                &tmp_path,
+                &format!("{base}/{file}"),
+            ],
+        )?;
+
+        // Verified where a digest is published. These are data rather than
+        // code, so a bad one misroutes rather than executes -- but misrouting
+        // is what this file decides, so it is worth checking when it can be.
+        match capture(
+            "curl",
+            &[
+                "-fsSL",
+                "--max-time",
+                "60",
+                &format!("{base}/{file}.sha256sum"),
+            ],
+        ) {
+            Ok(published) => {
+                let want = published.split_whitespace().next().unwrap_or_default();
+                let got = capture("sha256sum", &[&tmp_path])?
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                if want.is_empty() || want != got {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!(
+                        "{file} does not match its published digest\n  expected {want}\n  got      {got}"
+                    )
+                    .into());
+                }
+                println!("    checksum verified");
+            }
+            Err(_) => println!("    no published checksum; installed unverified"),
+        }
+
+        std::fs::copy(&tmp, &target)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))?;
+        }
+        let _ = std::fs::remove_file(&tmp);
+        println!("    installed {target}");
+    }
+    Ok(())
+}
+
 /// Where Xray sends what it receives.
 #[derive(Debug, Clone)]
 pub(crate) enum Upstream {
@@ -59,6 +143,14 @@ pub(crate) struct Plan {
     pub(crate) upstream: Upstream,
     /// The address to put in the client's URI.
     pub(crate) public_address: String,
+    /// Keep domestic destinations out of the tunnel.
+    ///
+    /// Sends anything Xray recognises as Iranian -- by address or by name -- to
+    /// the blackhole rather than through the tunnel. A user's own country is
+    /// reachable without one, and routing it abroad and back is slower, more
+    /// visible, and occasionally blocked at the far end for arriving from the
+    /// wrong place.
+    pub(crate) block_domestic: bool,
 }
 
 /// The generated credentials and the two artefacts they appear in.
@@ -137,6 +229,23 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
         ),
     };
 
+    let domestic = if plan.block_domestic {
+        // Two rules rather than one: an address may be Iranian without its name
+        // saying so, and a name may resolve abroad while still being domestic.
+        r#",
+      {
+        "type": "field",
+        "ip": ["geoip:ir"],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "domain": ["geosite:ir"],
+        "outboundTag": "block"
+      }"#
+    } else {
+        ""
+    };
     let dest = &plan.dest;
     let listen_port = plan.listen_port;
     let config = format!(
@@ -183,7 +292,7 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
         "type": "field",
         "ip": ["geoip:private"],
         "outboundTag": "block"
-      }}
+      }}{domestic}
     ]
   }}
 }}
@@ -286,6 +395,44 @@ mod tests {
             dest: "www.microsoft.com".to_owned(),
             upstream: Upstream::Socks5("127.0.0.1:1080".to_owned()),
             public_address: "203.0.113.5".to_owned(),
+            block_domestic: false,
+        }
+    }
+
+    #[test]
+    fn domestic_destinations_are_blocked_only_when_asked_for() {
+        let off = generate(&Plan {
+            block_domestic: false,
+            ..plan()
+        })
+        .expect("generate");
+        assert!(!off.config.contains("geoip:ir"), "{}", off.config);
+        assert!(!off.config.contains("geosite:ir"), "{}", off.config);
+
+        let on = generate(&Plan {
+            block_domestic: true,
+            ..plan()
+        })
+        .expect("generate");
+        // Both, because an address can be domestic without its name saying so
+        // and a name can resolve abroad while still being domestic.
+        assert!(on.config.contains("\"geoip:ir\""), "{}", on.config);
+        assert!(on.config.contains("\"geosite:ir\""), "{}", on.config);
+        assert!(on.config.contains("\"geoip:private\""), "and private stays");
+    }
+
+    #[test]
+    fn the_generated_configuration_is_valid_json_either_way() {
+        // The domestic rules are spliced into a JSON array by hand, and a
+        // stray or missing comma there is a file Xray refuses to parse.
+        for block_domestic in [true, false] {
+            let generated = generate(&Plan {
+                block_domestic,
+                ..plan()
+            })
+            .expect("generate");
+            well_formed_json(&generated.config)
+                .unwrap_or_else(|e| panic!("{e}\n{}", generated.config));
         }
     }
 
@@ -756,6 +903,13 @@ pub(crate) fn install(
     let _ = std::fs::remove_dir_all(&dir);
 
     println!("  installed {version} to {target}");
+
+    // Not optional. Every configuration this program generates names
+    // `geoip:private`, and Xray refuses to start when it cannot resolve a name
+    // a rule uses -- so an Xray installed without these is an Xray that does
+    // not run.
+    install_rules(prefix)?;
+
     Ok(version)
 }
 
@@ -900,6 +1054,7 @@ mod install_tests {
             dest: "www.microsoft.com".to_owned(),
             upstream: Upstream::Marked(81),
             public_address: "example.com".to_owned(),
+            block_domestic: false,
         })
         .expect("generate");
         assert!(

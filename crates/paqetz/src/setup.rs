@@ -768,12 +768,21 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
             }
         };
 
+        let block_domestic = yes_no(
+            "\n   Keep Iranian destinations out of the tunnel?\n   \
+             They are reachable without it, and sending them abroad and back\n   \
+             is slower, more visible, and sometimes refused at the far end for\n   \
+             arriving from the wrong country.",
+            true,
+        )?;
+
         let upstream_kind = upstream.clone();
         let generated = crate::xray::generate(&crate::xray::Plan {
             listen_port: 443,
             dest,
             upstream,
             public_address: public,
+            block_domestic,
         })?;
 
         // The REALITY private key is in here, so it gets the same treatment as
