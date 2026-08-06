@@ -788,9 +788,14 @@ pub(crate) fn service_unit(prefix: &str, config: &str, credentials: bool, marked
     // key to work around it would be the worse trade.
     let (isolation, path) = if credentials {
         (
-            "DynamicUser=true\n             LoadCredential=config:{config}\n"
-                .replace("{config}", config),
-            "%d/config".to_owned(),
+            // Named for the format, because Xray reads the format off the
+            // extension: a credential called `config` arrives as a file with no
+            // extension, and Xray loads it and then refuses to parse it.
+            //
+            // No line continuation, for the same reason as below: this lands
+            // verbatim in a unit file.
+            "DynamicUser=true\nLoadCredential=config.json:{config}\n".replace("{config}", config),
+            "%d/config.json".to_owned(),
         )
     } else {
         (
@@ -913,17 +918,43 @@ mod install_tests {
         let unit = service_unit("/usr/local/bin", CONFIG_PATH, true, false);
         assert!(unit.contains("DynamicUser=true"));
         assert!(
-            unit.contains("LoadCredential=config:/etc/xray/config.json"),
+            unit.contains("LoadCredential=config.json:/etc/xray/config.json"),
             "{unit}"
         );
         assert!(
-            unit.contains("run -config %d/config"),
+            unit.contains("run -config %d/config.json"),
             "it must read what it was handed, not the path it cannot open:\n{unit}"
+        );
+        // Xray reads the format off the extension. A credential named `config`
+        // arrives without one, and Xray loads the file and then refuses it:
+        // "Failed to get format of /run/credentials/xray.service/config".
+        assert!(
+            !unit.contains("run -config %d/config\n"),
+            "the credential needs an extension Xray can read a format from:\n{unit}"
         );
         assert!(
             !unit.contains("run -config /etc/xray/config.json"),
             "{unit}"
         );
+    }
+
+    #[test]
+    fn no_generated_line_carries_the_indentation_of_the_code_that_wrote_it() {
+        // Twice now a wrapped source line has put its own leading whitespace
+        // into a unit file. systemd tolerates it and it is still wrong: what is
+        // written for a file must be written as that file will read it.
+        for credentials in [true, false] {
+            for marked in [true, false] {
+                let unit = service_unit("/usr/local/bin", CONFIG_PATH, credentials, marked);
+                for line in unit.lines() {
+                    assert_eq!(
+                        line,
+                        line.trim_start(),
+                        "indented line in a generated unit:\n{unit}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
