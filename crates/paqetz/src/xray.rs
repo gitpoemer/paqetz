@@ -559,7 +559,10 @@ fn arch_name() -> Result<&'static str, Box<dyn std::error::Error>> {
 
 /// Runs a command, returning its standard output.
 fn capture(program: &str, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let out = std::process::Command::new(program).args(args).output()?;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| crate::service::spawn_failure(program, &e))?;
     if !out.status.success() {
         return Err(format!(
             "`{program} {}` failed: {}",
@@ -623,6 +626,25 @@ pub(crate) fn install(
     std::fs::create_dir_all(&dir)?;
     let zip = dir.join(&file);
     let zip_path = zip.display().to_string();
+
+    // Checked before the download rather than after: finding out that the
+    // thing which unpacks the archive is missing, having already fetched
+    // twenty megabytes, is a worse way to learn it.
+    for tool in ["curl", "unzip"] {
+        if std::process::Command::new(tool)
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            return Err(format!(
+                "`{tool}` is not installed, and is needed to fetch and unpack Xray. \
+                 Install it (`apt install {tool}`) and run this again."
+            )
+            .into());
+        }
+    }
 
     println!("  fetching {base}/{file}");
     capture(

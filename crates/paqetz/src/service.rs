@@ -82,6 +82,20 @@ fn elevated_write(path: &Path, contents: &str, mode: u32) -> io::Result<()> {
     )
 }
 
+/// Explains a command that would not start.
+///
+/// The bare OS error for a missing program is `No such file or directory`,
+/// which names neither the program nor the fact that it is a program -- so the
+/// reader goes looking for a file that was never the problem. Every place that
+/// shells out routes its spawn failures through here.
+pub(crate) fn spawn_failure(program: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::NotFound {
+        format!("`{program}` is not installed, and is needed for this. Install it and try again.")
+    } else {
+        format!("could not run `{program}`: {e}")
+    }
+}
+
 /// Runs a command, elevating only if this process is not already root.
 ///
 /// # Errors
@@ -205,12 +219,40 @@ pub(crate) fn install_unit(name: &str, contents: &str, enable: bool) -> io::Resu
     println!("    wrote {path}");
     run_elevated("systemctl", &["daemon-reload"])?;
     if enable {
-        run_elevated("systemctl", &["enable", "--now", name])?;
+        if let Err(e) = run_elevated("systemctl", &["enable", "--now", name]) {
+            // systemd's own advice at this point is to go and read the journal,
+            // which is one command away and holds the actual reason. Printing
+            // it here saves the round trip, and the reason is almost always a
+            // single line naming exactly what is wrong.
+            report_unit_failure(name);
+            return Err(e);
+        }
         println!("    enabled and started {name}");
     } else {
         println!("    not started; `systemctl enable --now {name}` when ready");
     }
     Ok(())
+}
+
+/// Prints why a unit would not start.
+fn report_unit_failure(name: &str) {
+    let Ok(out) = Command::new("journalctl")
+        .args(["-u", name, "-n", "15", "--no-pager", "-o", "cat"])
+        .output()
+    else {
+        return;
+    };
+    let log = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return;
+    }
+    println!();
+    println!("  {name} would not start. Its own last words:");
+    for line in lines.iter().rev().take(6).rev() {
+        println!("    {line}");
+    }
+    println!();
 }
 
 /// Stops and removes a unit.
@@ -265,6 +307,23 @@ pub(crate) fn install_binary(prefix: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_program_says_so_rather_than_naming_a_file() {
+        // The bare OS error is "No such file or directory", which sends the
+        // reader looking for a file that was never the problem.
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let said = super::spawn_failure("unzip", &missing);
+        assert!(said.contains("`unzip`"), "{said}");
+        assert!(said.contains("not installed"), "{said}");
+        assert!(!said.contains("No such file"), "{said}");
+
+        // Anything else keeps the original wording, which is the useful part.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let said = super::spawn_failure("nft", &denied);
+        assert!(said.contains("`nft`"), "{said}");
+        assert!(said.contains("could not run"), "{said}");
+    }
+
     #[test]
     fn a_missing_unit_is_not_reported_as_present() {
         // The distinction the start/stop commands rely on: without it they

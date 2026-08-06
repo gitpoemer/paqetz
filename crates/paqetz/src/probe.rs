@@ -90,7 +90,8 @@ pub(crate) fn parse(output: &str) -> Option<Sample> {
 fn probe(target: &str, count: u32) -> Result<Sample, Box<dyn std::error::Error>> {
     let out = Command::new("ping")
         .args(["-c", &count.to_string(), "-i", INTERVAL, target])
-        .output()?;
+        .output()
+        .map_err(|e| crate::service::spawn_failure("ping", &e))?;
     // A run that lost everything exits non-zero but still prints a summary, and
     // total loss is a result rather than a failure to measure.
     let text = String::from_utf8_lossy(&out.stdout);

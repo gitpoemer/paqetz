@@ -53,7 +53,10 @@ fn latest_tag() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Runs a command, returning its standard output.
 fn capture(program: &str, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let out = std::process::Command::new(program).args(args).output()?;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| crate::service::spawn_failure(program, &e))?;
     if !out.status.success() {
         return Err(format!(
             "`{program} {}` failed: {}",
