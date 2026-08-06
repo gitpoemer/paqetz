@@ -52,12 +52,18 @@ const KIND_NACK: u8 = 1;
 /// A packet being sent again, carrying the counter it first went out under.
 const KIND_REPEAT: u8 = 2;
 
-/// How many packets beyond a gap must arrive before it is called a loss.
+/// How many packets beyond a gap must arrive before it is called a loss, by
+/// default.
 ///
 /// Reordering is not loss, and a path that delivers out of order would
 /// otherwise be asked to repeat packets that are already in flight. Three is
 /// TCP's own threshold for the same judgement, for the same reason.
-const REORDER_TOLERANCE: usize = 3;
+///
+/// It is also the *fixed* part of how long a repair takes: nothing is asked for
+/// until this many packets have gone past, which at twenty packets a second is
+/// 150ms before the request even leaves. On a busy tunnel it is nothing; on an
+/// interactive one it is most of the delay.
+pub(crate) const DEFAULT_REORDER: u64 = 3;
 
 /// How old a packet may be and still be worth repeating, by default.
 ///
@@ -97,6 +103,8 @@ pub(crate) struct Limits {
     pub(crate) deadline: Millis,
     /// How many times one packet may be asked for.
     pub(crate) asks: u8,
+    /// How many later packets must arrive before a gap is called a loss.
+    pub(crate) reorder: u64,
 }
 
 impl Limits {
@@ -106,6 +114,7 @@ impl Limits {
             capacity: 0,
             deadline: DEFAULT_DEADLINE,
             asks: DEFAULT_ASKS,
+            reorder: DEFAULT_REORDER,
         }
     }
 }
@@ -312,6 +321,7 @@ pub(crate) struct Inbox {
     gaps: BTreeMap<u64, Gap>,
     deadline: Millis,
     asks: u8,
+    reorder: u64,
 }
 
 impl Inbox {
@@ -321,12 +331,13 @@ impl Inbox {
             gaps: BTreeMap::new(),
             deadline: limits.deadline,
             asks: limits.asks,
+            reorder: limits.reorder,
         }
     }
 
     /// Records an arrival, and returns the counters now worth asking for.
     ///
-    /// A gap is only reported once [`REORDER_TOLERANCE`] later packets have
+    /// A gap is only reported once [`Limits::reorder`] later packets have
     /// arrived, so a path that delivers out of order is not asked to repeat
     /// what is already on its way.
     pub(crate) fn arrived(&mut self, counter: u64, now: Millis) -> Vec<u64> {
@@ -375,7 +386,7 @@ impl Inbox {
                 None => highest.saturating_sub(at),
                 Some(asked) => highest.saturating_sub(asked),
             };
-            if moved < REORDER_TOLERANCE as u64 {
+            if moved < self.reorder {
                 continue;
             }
             ask.push(at);
@@ -679,6 +690,7 @@ mod tests {
             capacity: 8,
             deadline: 1_000,
             asks: 4,
+            ..Limits::off()
         };
 
         let mut outbox = Outbox::new(limits);
@@ -697,6 +709,39 @@ mod tests {
         }
         assert_eq!(asks, usize::from(limits.asks), "asked {asks} times");
         assert_eq!(inbox.outstanding(), 0, "and then let it go");
+    }
+
+    #[test]
+    fn the_wait_before_asking_is_the_one_configured() {
+        // The fixed part of how long a repair takes. Nothing is asked for until
+        // this many packets have gone past, so on a slow flow it is most of the
+        // delay -- and on a path that does not reorder, waiting at all is pure
+        // cost.
+        let eager = Limits {
+            capacity: 8,
+            reorder: 1,
+            ..Limits::off()
+        };
+        let mut inbox = Inbox::new(eager);
+        inbox.arrived(1, 0);
+        // 2 is missing, and the very next packet settles it.
+        assert_eq!(inbox.arrived(3, 0), vec![2], "asked at once");
+
+        let patient = Limits {
+            capacity: 8,
+            reorder: 8,
+            ..Limits::off()
+        };
+        let mut inbox = Inbox::new(patient);
+        inbox.arrived(1, 0);
+        for c in 3..9u64 {
+            assert!(inbox.arrived(c, 0).is_empty(), "still waiting at {c}");
+        }
+        assert_eq!(
+            inbox.arrived(10, 0),
+            vec![2],
+            "and asked once far enough past"
+        );
     }
 
     #[test]

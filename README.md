@@ -401,6 +401,7 @@ is.
 retransmit          = 1200   # packets to hold, in case the peer asks again
 retransmit_deadline = 400    # ms a packet stays worth repeating
 retransmit_asks     = 2      # times one packet may be asked for
+retransmit_reorder  = 3      # later packets that must arrive before asking
 ```
 
 Off by default. On an ordinary link a second recovery mechanism is waste, and
@@ -448,6 +449,28 @@ repeat must both survive the same path — one exchange succeeds with probabilit
 
 Each extra attempt costs two packets to save one, which is worth it on a path
 that degrades and harmful on one that congests. 1 to 8, default 2.
+
+`retransmit_reorder` follows from whether the path *reorders*, and it is the one
+that decides how quickly a repair starts. Nothing is asked for until this many
+later packets have arrived, so the wait is `reorder ÷ packet rate` — nothing on a
+busy tunnel, and most of the delay on an interactive one:
+
+| packets/sec | reorder = 3 | reorder = 1 |
+|---|---|---|
+| 2000 (bulk) | 1.5 ms | 0.5 ms |
+| 200 | 15 ms | 5 ms |
+| 20 (interactive) | **150 ms** | 50 ms |
+
+Three is TCP's own threshold, and right when a path delivers out of order.
+Lower it when it does not: asking sooner costs nothing if the packet really was
+lost, and costs one wasted repeat if it was merely late. Most single paths do not
+reorder; ECMP across unequal paths does. 1 to 16, default 3.
+
+**The three delays add up.** A repair arrives after `reorder ÷ rate` + one round
+trip, and `retransmit_deadline` caps the whole thing. At 90 ms round trip and 20
+packets a second, `reorder = 3` means 150 + 90 = 240 ms before the first repair
+can land — so a 400 ms deadline has room for one further attempt, and setting
+`asks` above two would do nothing at all.
 
 **Cost.** Flat, not proportional to how badly the link is behaving. The outbox
 is a ring addressed by `counter % capacity`, so recording and finding are

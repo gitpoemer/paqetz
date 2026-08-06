@@ -413,6 +413,7 @@ struct RawInterface {
     retransmit: Option<usize>,
     retransmit_deadline: Option<u64>,
     retransmit_asks: Option<u8>,
+    retransmit_reorder: Option<u64>,
     #[serde(default)]
     rotate: Option<bool>,
     #[serde(default)]
@@ -493,6 +494,15 @@ const MAX_DEADLINE: u64 = 5_000;
 
 /// The most times one packet may be asked for.
 const MAX_ASKS: u8 = 8;
+
+/// The fewest later packets that may stand for "this one is not coming".
+///
+/// One means the very next packet settles it, which is right for a path that
+/// does not reorder and wasteful for one that does.
+const MIN_REORDER: u64 = 1;
+
+/// The most. Past this the wait before asking outlasts the repeat's usefulness.
+const MAX_REORDER: u64 = 16;
 
 /// The longest name Linux accepts for an interface, `IFNAMSIZ` less its NUL.
 const IFNAME_MAX: usize = 15;
@@ -914,10 +924,24 @@ impl Config {
                         }
                         other => other.unwrap_or(defaults.asks),
                     };
+                    let reorder = match iface.retransmit_reorder {
+                        Some(n) if !(MIN_REORDER..=MAX_REORDER).contains(&n) => {
+                            return Err(invalid(
+                                "interface.retransmit_reorder",
+                                format!(
+                                    "expected {MIN_REORDER} to {MAX_REORDER}: below one there is \
+                                     nothing to tell reordering from loss, and above {MAX_REORDER} \
+                                     the wait is longer than the repeat is worth"
+                                ),
+                            ));
+                        }
+                        other => other.unwrap_or(defaults.reorder),
+                    };
                     crate::repeat::Limits {
                         capacity,
                         deadline,
                         asks,
+                        reorder,
                     }
                 },
                 keepalive: iface.keepalive.unwrap_or(true),
@@ -1024,6 +1048,8 @@ mod tests {
             "retransmit_deadline = 5001",
             "retransmit_asks = 0",
             "retransmit_asks = 9",
+            "retransmit_reorder = 0",
+            "retransmit_reorder = 17",
         ] {
             assert!(with_interface(line).is_err(), "{line} was accepted");
         }
@@ -1034,6 +1060,8 @@ mod tests {
             "retransmit_deadline = 5000",
             "retransmit_asks = 1",
             "retransmit_asks = 8",
+            "retransmit_reorder = 1",
+            "retransmit_reorder = 16",
         ] {
             assert!(with_interface(line).is_ok(), "{line} was refused");
         }
