@@ -320,7 +320,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "paqetz"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "clap",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "paqetz-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "blake2",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "paqetz-dp"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "thiserror",
@@ -359,14 +359,14 @@ dependencies = [
 
 [[package]]
 name = "paqetz-fw"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "paqetz-net4"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "thiserror",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "paqetz-tcpwire"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "thiserror",
 ]
