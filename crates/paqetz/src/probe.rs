@@ -274,9 +274,14 @@ fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64, asked: f64, 
     // something is holding packets rather than dropping them, which a
     // throughput test would have reported as success.
     let added = loaded.avg - warm.avg;
-    if offered < 1.0 {
-        println!("Almost nothing went out during the loaded run, so that row means");
-        println!("nothing. The tunnel is probably down, or its address is unreachable.");
+    // Relative to what was asked for, not an absolute figure. An absolute one
+    // called a fully delivered 1 Mbit/s run "almost nothing", in the same
+    // breath as printing "1 of 1 Mbit/s offered" directly above it.
+    if offered < asked * 0.25 {
+        println!(
+            "Only {offered:.1} of the {asked:.0} Mbit/s asked for went out, so the loaded row"
+        );
+        println!("means little. The tunnel may be down, or its address unreachable.");
     } else if added > 100.0 {
         println!("Latency rose {added:.0}ms under load.");
         println!("Something on this path buffers rather than drops: a transfer will");
@@ -292,7 +297,12 @@ fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64, asked: f64, 
     }
 
     // The cold-path question, which is what the doubled idle run is for.
-    if cold.loss > warm.loss + 5.0 {
+    //
+    // Only when the *first* run is the lossy one. Loss that lands in whichever
+    // window happens to overlap it says nothing about warming up -- and reading
+    // it as a cold path sends the reader after a keepalive when what they have
+    // is a periodic outage.
+    if cold.loss > warm.loss + 5.0 && warm.loss < 2.0 && loaded.loss < 2.0 {
         println!();
         println!(
             "The first idle run lost {:.0}% and the second {:.0}%, with the same round",
@@ -313,12 +323,20 @@ fn report(cold: Sample, warm: Sample, loaded: Sample, offered: f64, asked: f64, 
         }
     }
 
-    if loaded.loss > 1.0 {
+    if loaded.loss > 1.0 || cold.loss > 1.0 || warm.loss > 1.0 {
         println!();
         println!(
-            "{:.0}% of probes were lost while busy, which is loss rather than delay.",
-            loaded.loss
+            "Probe loss was {:.0}% / {:.0}% / {:.0}% across the three runs.",
+            cold.loss, warm.loss, loaded.loss
         );
+        // Thirty probes is a small sample, and loss that comes in bursts either
+        // lands inside a window or misses it entirely. Reading one run as a
+        // rate is how a periodic outage gets mistaken for a rate-dependent one.
+        if (cold.loss - warm.loss).abs() > 5.0 || (warm.loss - loaded.loss).abs() > 5.0 {
+            println!("They disagree by more than the sample size can explain, which means the");
+            println!("loss arrives in bursts rather than at a steady rate. Compare this end's");
+            println!("`tx` against the peer's `rx` over the same window for a real figure.");
+        }
     }
 }
 
