@@ -175,25 +175,41 @@ mod tests {
         assert!(Level::Info < Level::Debug);
     }
 
+    /// Held by every test that moves the level.
+    ///
+    /// The level is one process-wide atomic and the test harness runs threads
+    /// in parallel, so two tests setting it were reading each other's writes --
+    /// rarely, and therefore at whichever moment was least convenient. A
+    /// comment claiming the tests were serialised is not a lock.
+    static LEVEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the level for the duration of a test, and puts it back after.
+    fn owning_the_level(test: impl FnOnce()) {
+        let guard = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = LEVEL.load(Ordering::Relaxed);
+        test();
+        LEVEL.store(restore, Ordering::Relaxed);
+        drop(guard);
+    }
+
     #[test]
     fn enabling_a_level_enables_everything_above_it() {
-        // Serialised through one global, so this test owns it for its duration.
-        set_level(Level::Warn);
-        assert!(enabled(Level::Error));
-        assert!(enabled(Level::Warn));
-        assert!(!enabled(Level::Info));
-        assert!(!enabled(Level::Debug));
+        owning_the_level(|| {
+            set_level(Level::Warn);
+            assert!(enabled(Level::Error));
+            assert!(enabled(Level::Warn));
+            assert!(!enabled(Level::Info));
+            assert!(!enabled(Level::Debug));
 
-        set_level(Level::Off);
-        assert!(!enabled(Level::Error));
-        assert!(!enabled(Level::Warn));
-        assert!(!enabled(Level::Info));
-        assert!(!enabled(Level::Debug));
+            set_level(Level::Off);
+            assert!(!enabled(Level::Error));
+            assert!(!enabled(Level::Warn));
+            assert!(!enabled(Level::Info));
+            assert!(!enabled(Level::Debug));
 
-        set_level(Level::Debug);
-        assert!(enabled(Level::Error) && enabled(Level::Debug));
-
-        set_level(Level::Info);
+            set_level(Level::Debug);
+            assert!(enabled(Level::Error) && enabled(Level::Debug));
+        });
     }
 
     #[test]
@@ -207,19 +223,19 @@ mod tests {
             CALLS.fetch_add(1, Ordering::Relaxed)
         }
 
-        set_level(Level::Off);
-        debug!("{}", expensive());
-        error!("{}", expensive());
-        assert_eq!(
-            CALLS.load(Ordering::Relaxed),
-            0,
-            "arguments must not be evaluated when the level is off"
-        );
+        owning_the_level(|| {
+            set_level(Level::Off);
+            debug!("{}", expensive());
+            error!("{}", expensive());
+            assert_eq!(
+                CALLS.load(Ordering::Relaxed),
+                0,
+                "arguments must not be evaluated when the level is off"
+            );
 
-        set_level(Level::Debug);
-        debug!("{}", expensive());
-        assert_eq!(CALLS.load(Ordering::Relaxed), 1);
-
-        set_level(Level::Info);
+            set_level(Level::Debug);
+            debug!("{}", expensive());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        });
     }
 }
