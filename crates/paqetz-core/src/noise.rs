@@ -243,7 +243,13 @@ pub fn verify_mac1<'a>(recipient: &PublicKey, message: &'a [u8]) -> Result<&'a [
 
 /// An initiator's handshake, waiting for the responder's reply.
 pub struct Initiator {
-    state: snow::HandshakeState,
+    /// Taken only once a reply has authenticated.
+    ///
+    /// An `Option` so that [`finish`](Self::finish) can borrow rather than
+    /// consume: a reply that fails to authenticate must leave the handshake
+    /// exactly as it was, because anyone able to forge one could otherwise
+    /// cancel every attempt this end makes.
+    state: Option<snow::HandshakeState>,
     responder_static: PublicKey,
     local_static: PublicKey,
     local_index: u32,
@@ -289,7 +295,7 @@ impl Initiator {
 
         Ok((
             Self {
-                state,
+                state: Some(state),
                 responder_static: *responder_static,
                 local_static: *local_public,
                 local_index,
@@ -304,16 +310,18 @@ impl Initiator {
     /// # Errors
     /// Returns [`Error::Rejected`] if `mac1` or the AEAD fails, which is what a
     /// forged or mis-sized reply produces.
-    pub fn finish(mut self, msg2: &[u8], now: Millis) -> Result<Session> {
+    pub fn finish(&mut self, msg2: &[u8], now: Millis) -> Result<Session> {
         if !(MSG2_LEN..=MSG2_MAX).contains(&msg2.len()) {
             return Err(Error::Rejected);
         }
-        // msg2's mac1 is keyed on *our* static key: we are its recipient.
+        // msg2's mac1 is keyed on *our* static key: we are its recipient. It is
+        // therefore forgeable by anyone holding our public key, which is why
+        // nothing below may disturb the handshake until the AEAD has spoken.
         let body = verify_mac1(&self.local_static, msg2)?;
 
+        let state = self.state.as_mut().ok_or(Error::Rejected)?;
         let mut payload = [0u8; PAYLOAD_LEN + MAX_PAD];
-        let n = self
-            .state
+        let n = state
             .read_message(body, &mut payload)
             .map_err(|_| Error::Rejected)?;
         if n < PAYLOAD_LEN {
@@ -330,8 +338,10 @@ impl Initiator {
             return Err(Error::Rejected);
         }
 
+        // Everything has authenticated; only now is the handshake spent.
+        let state = self.state.take().ok_or(Error::Rejected)?;
         Ok(Session {
-            transport: self.state.into_stateless_transport_mode()?,
+            transport: state.into_stateless_transport_mode()?,
             mask: HeaderMask::derive(&self.responder_static),
             local_index: self.local_index,
             remote_index,
@@ -668,7 +678,7 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
-    use crate::keys::KeyPair;
+    use crate::KeyPair;
 
     struct Pair {
         client: Session,
@@ -682,7 +692,7 @@ mod tests {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (initiator, (msg1_buf, msg1_len)) = Initiator::start(
+        let (mut initiator, (msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
@@ -985,6 +995,76 @@ mod tests {
     }
 
     #[test]
+    fn a_forged_reply_does_not_spend_the_handshake() {
+        // msg2's mac1 is keyed on the *recipient's* static public key, so
+        // anyone holding ours can produce something that reaches the handshake
+        // and then fails to decrypt. If that consumed the attempt, they could
+        // cancel every handshake this end tried simply by answering first --
+        // and the retry would hand them the next one to cancel.
+        let client = KeyPair::generate().expect("client");
+        let server = KeyPair::generate().expect("server");
+
+        let (mut initiator, (msg1, n)) = Initiator::start(
+            &client.private,
+            &client.public,
+            &server.public,
+            0x1111_1111,
+            TEST_EPOCH,
+            0,
+        )
+        .expect("start");
+        let msg1 = msg1.get(..n).expect("msg1");
+        let pending = PendingResponder::read(&server.private, &server.public, msg1).expect("read");
+        let (_, (msg2, m)) = pending.accept(0x2222_2222, 0, 0).expect("accept");
+        let genuine = msg2.get(..m).expect("msg2").to_vec();
+
+        // Right length, and a mac1 anyone can recompute from a published key.
+        let mut forged = vec![0u8; genuine.len()];
+        seal_mac1(&client.public, &mut forged).expect("mac1");
+        assert!(
+            verify_mac1(&client.public, &forged).is_ok(),
+            "the forgery has to get past the demux, or it proves nothing"
+        );
+
+        for _ in 0..4 {
+            assert!(
+                matches!(initiator.finish(&forged, 0), Err(Error::Rejected)),
+                "a forgery must be refused"
+            );
+        }
+
+        // And the real reply still completes, on the same handshake.
+        let session = initiator.finish(&genuine, 0).expect("the genuine reply");
+        assert_eq!(session.local_index(), 0x1111_1111);
+        assert_eq!(session.remote_index(), 0x2222_2222);
+    }
+
+    #[test]
+    fn a_handshake_is_spent_once_and_only_once() {
+        let (_, client_kp, server_kp) = handshake_at(0);
+        let (mut initiator, (msg1, n)) = Initiator::start(
+            &client_kp.private,
+            &client_kp.public,
+            &server_kp.public,
+            5,
+            TEST_EPOCH,
+            0,
+        )
+        .expect("start");
+        let msg1 = msg1.get(..n).expect("msg1");
+        let pending =
+            PendingResponder::read(&server_kp.private, &server_kp.public, msg1).expect("read");
+        let (_, (msg2, m)) = pending.accept(6, 0, 0).expect("accept");
+        let msg2 = msg2.get(..m).expect("msg2");
+
+        initiator.finish(msg2, 0).expect("first");
+        assert!(
+            matches!(initiator.finish(msg2, 0), Err(Error::Rejected)),
+            "a spent handshake cannot produce a second session"
+        );
+    }
+
+    #[test]
     fn padding_changes_the_length_and_nothing_else() {
         // The point of the padding is that the length varies. The point of this
         // test is that varying it changes nothing else: the same handshake has
@@ -995,7 +1075,7 @@ mod tests {
 
         let mut seen = std::collections::BTreeSet::new();
         for pad in [0, 1, 7, MAX_PAD / 2, MAX_PAD] {
-            let (initiator, (msg1, msg1_len)) = Initiator::start(
+            let (mut initiator, (msg1, msg1_len)) = Initiator::start(
                 &client_kp.private,
                 &client_kp.public,
                 &server_kp.public,
@@ -1069,7 +1149,7 @@ mod tests {
     fn a_forged_msg2_is_rejected() {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
-        let (initiator, (_msg1_buf, _msg1_len)) = Initiator::start(
+        let (mut initiator, (_msg1_buf, _msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,
@@ -1177,7 +1257,7 @@ mod tests {
         let client_kp = KeyPair::generate().expect("generate");
         let server_kp = KeyPair::generate().expect("generate");
 
-        let (initiator, (msg1_buf, msg1_len)) = Initiator::start(
+        let (mut initiator, (msg1_buf, msg1_len)) = Initiator::start(
             &client_kp.private,
             &client_kp.public,
             &server_kp.public,

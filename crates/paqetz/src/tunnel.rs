@@ -1288,11 +1288,18 @@ impl Tunnel {
     fn handle_msg2(&self, seg: &segment::Segment<'_>, payload: &[u8]) -> Result<()> {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(pending) = state.pending.take() else {
-            return Ok(());
+        // Borrowed, not taken. `mac1` is keyed on our own static public key, so
+        // a reply that gets this far has proved nothing except that its sender
+        // knows a key we publish: taking the handshake first meant anyone who
+        // did could cancel every attempt this end made, simply by answering
+        // before the peer could.
+        let result = match state.pending.as_mut() {
+            Some(pending) => pending.finish(payload, now),
+            None => return Ok(()),
         };
-        match pending.finish(payload, now) {
+        match result {
             Ok(session) => {
+                state.pending = None;
                 if let Some(carrier) = state.carrier.as_mut() {
                     carrier.on_receive(seg);
                 }
@@ -1947,7 +1954,7 @@ mod tests {
         index: u32,
         at: Millis,
     ) -> (Session, Session) {
-        let (initiator, (msg1, msg1_len)) = Initiator::start(
+        let (mut initiator, (msg1, msg1_len)) = Initiator::start(
             &client.private,
             &client.public,
             &server.public,
