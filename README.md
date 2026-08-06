@@ -398,7 +398,9 @@ is.
 
 ```toml
 # under [tunnel.interface]
-retransmit = 512    # packets to hold, in case the peer asks for one again
+retransmit          = 1200   # packets to hold, in case the peer asks again
+retransmit_deadline = 400    # ms a packet stays worth repeating
+retransmit_asks     = 2      # times one packet may be asked for
 ```
 
 Off by default. On an ordinary link a second recovery mechanism is waste, and
@@ -418,12 +420,34 @@ It gives up quickly and on purpose. A packet is only worth repeating for about
 400 ms and is asked for at most twice; past that, inner TCP has noticed anyway
 and two recoveries for one loss is waste on a link already struggling.
 
-**Sizing.** The outbox only has to hold a packet long enough to be asked for, so
-the useful capacity is `peak packets per second × 0.4`. At 25 Mbit/s with a
-1400-byte MTU that is around 2200 pps, or ~900 packets — so 512 would quietly be
-too small, and a repeat asked for would find nothing to send. 1200 covers about
-3000 pps. Memory settles at capacity times the largest packet held: ~1.7 MB at
-1200, and ~730 KB at 512.
+**All three follow from the path, not from taste.**
+
+`retransmit` follows from its *packet rate*: a packet only has to be held until
+it can be asked for, so the useful capacity is `peak pps × deadline`. At
+25 Mbit/s with a 1400-byte MTU that is ~2200 pps, or ~900 packets — 512 would
+quietly be too small, and a repeat asked for would find nothing to send. 1200
+covers about 3000 pps. Slots beyond that hold packets refused for age before
+anyone can ask. Memory settles at capacity times the largest packet: ~1.7 MB at
+1200. The ceiling is 8192.
+
+`retransmit_deadline` follows from its *round trip*: noticing a gap and
+completing one exchange costs about two round trips, so 400 ms has room for two
+attempts at 90 ms and for one at 180 ms. Longer buys more attempts and starts
+repeating packets the inner protocol has already recovered on its own. 50 to
+5000 ms.
+
+`retransmit_asks` follows from how much it *loses*, because a request and its
+repeat must both survive the same path — one exchange succeeds with probability
+`(1-p)²`:
+
+| loss | 1 ask | 2 asks | 3 asks | 4 asks |
+|---|---|---|---|---|
+| 10% | 81% | 96% | 99% | 99.9% |
+| 25% | 56% | 81% | 92% | 96% |
+| 40% | 36% | 59% | 74% | 83% |
+
+Each extra attempt costs two packets to save one, which is worth it on a path
+that degrades and harmful on one that congests. 1 to 8, default 2.
 
 **Cost.** Flat, not proportional to how badly the link is behaving. The outbox
 is a ring addressed by `counter % capacity`, so recording and finding are

@@ -56,19 +56,56 @@ const KIND_REPEAT: u8 = 2;
 /// TCP's own threshold for the same judgement, for the same reason.
 const REORDER_TOLERANCE: usize = 3;
 
-/// How old a packet may be and still be worth repeating.
+/// How old a packet may be and still be worth repeating, by default.
 ///
 /// Beyond this, inner TCP will have noticed the loss itself, and a repeat is
 /// two copies of the same recovery competing on a link that is already losing
 /// a quarter of what crosses it.
-const DEADLINE: Millis = 400;
+///
+/// Raising it buys room for more attempts on a slow path -- at a 90ms round
+/// trip, noticing a gap and completing one exchange costs about 200ms, so 400
+/// has room for two -- and costs the tunnel repeating packets that the inner
+/// protocol has already given up on.
+pub(crate) const DEFAULT_DEADLINE: Millis = 400;
 
-/// How many times one packet may be asked for.
+/// How many times one packet may be asked for, by default.
 ///
 /// Loss here arrives in bursts, so the request and the repeat can both be
-/// swallowed by the same burst that took the original. One retry covers that;
-/// more is a link that is not going to deliver this packet.
-const MAX_ASKS: u8 = 2;
+/// swallowed by the same burst that took the original. One retry covers that.
+///
+/// The right number follows from the loss rate, because a request and its
+/// repeat must both survive the same path: one exchange succeeds with
+/// probability `(1-p)²`, so at `p = 0.4` two attempts recover about 59% of
+/// losses and four about 83%. Each extra attempt costs two packets to save one,
+/// which is worth it on a path that degrades and harmful on one that congests.
+pub(crate) const DEFAULT_ASKS: u8 = 2;
+
+/// What this end will spend on repeating, and for how long.
+///
+/// Carried rather than compiled in, because the useful values follow from the
+/// path: the capacity from its packet rate, the deadline from its round trip,
+/// and the number of attempts from how much it loses. None of those are known
+/// here, and all three are measurable there.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// How many recently-sent packets to hold, or zero to hold none.
+    pub(crate) capacity: usize,
+    /// How old a packet may be and still be worth repeating.
+    pub(crate) deadline: Millis,
+    /// How many times one packet may be asked for.
+    pub(crate) asks: u8,
+}
+
+impl Limits {
+    /// Repeating turned off, which is the default.
+    pub(crate) const fn off() -> Self {
+        Self {
+            capacity: 0,
+            deadline: DEFAULT_DEADLINE,
+            asks: DEFAULT_ASKS,
+        }
+    }
+}
 
 /// How many counters may be outstanding at once.
 ///
@@ -170,6 +207,7 @@ pub(crate) const REPEAT_OVERHEAD: usize = 10;
 /// paid once instead of continuously.
 pub(crate) struct Outbox {
     slots: Vec<Slot>,
+    deadline: Millis,
 }
 
 /// One packet held for repeating.
@@ -183,16 +221,17 @@ struct Slot {
 }
 
 impl Outbox {
-    /// An outbox holding at most `capacity` packets.
-    pub(crate) fn new(capacity: usize) -> Self {
+    /// An outbox holding at most `limits.capacity` packets.
+    pub(crate) fn new(limits: Limits) -> Self {
         Self {
-            slots: (0..capacity)
+            slots: (0..limits.capacity)
                 .map(|_| Slot {
                     counter: None,
                     at: 0,
                     buf: Vec::new(),
                 })
                 .collect(),
+            deadline: limits.deadline,
         }
     }
 
@@ -227,7 +266,7 @@ impl Outbox {
         let slot = self.slots.get(self.slot(counter)?)?;
         // The slot holds whatever counter last landed on it. Only the one asked
         // for will do, and only while it is young enough to be worth sending.
-        (slot.counter == Some(counter) && now.saturating_sub(slot.at) <= DEADLINE)
+        (slot.counter == Some(counter) && now.saturating_sub(slot.at) <= self.deadline)
             .then_some(slot.buf.as_slice())
     }
 
@@ -268,13 +307,17 @@ pub(crate) struct Inbox {
     /// Highest counter seen, once anything has been.
     highest: Option<u64>,
     gaps: BTreeMap<u64, Gap>,
+    deadline: Millis,
+    asks: u8,
 }
 
 impl Inbox {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(limits: Limits) -> Self {
         Self {
             highest: None,
             gaps: BTreeMap::new(),
+            deadline: limits.deadline,
+            asks: limits.asks,
         }
     }
 
@@ -311,7 +354,7 @@ impl Inbox {
 
         // The oldest are at the front, so giving up costs only what it removes.
         while let Some((&at, gap)) = self.gaps.iter().next() {
-            if now.saturating_sub(gap.seen) > DEADLINE {
+            if now.saturating_sub(gap.seen) > self.deadline {
                 self.gaps.remove(&at);
             } else {
                 break;
@@ -335,7 +378,7 @@ impl Inbox {
             ask.push(at);
             gap.asks = gap.asks.saturating_add(1);
             gap.asked_at = Some(highest);
-            if gap.asks >= MAX_ASKS {
+            if gap.asks >= self.asks {
                 // Asked enough. Inner protocols own it from here.
                 spent.push(at);
             }
@@ -361,6 +404,22 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Repeating turned on, at the defaults.
+    fn on() -> Limits {
+        Limits {
+            capacity: 512,
+            ..Limits::off()
+        }
+    }
+
+    /// Repeating with a given capacity, at the default deadline and asks.
+    fn sized(capacity: usize) -> Limits {
+        Limits {
+            capacity,
+            ..Limits::off()
+        }
+    }
 
     #[test]
     fn a_control_message_cannot_be_mistaken_for_a_packet() {
@@ -419,7 +478,7 @@ mod tests {
         // Two packets swapped in flight must not produce a request. Asking for
         // a packet that is already on its way costs bandwidth on a link that
         // has none to spare, and arrives as a duplicate.
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         assert!(inbox.arrived(1, 0).is_empty());
         assert!(inbox.arrived(3, 0).is_empty());
         assert!(inbox.arrived(2, 0).is_empty(), "2 turned up on its own");
@@ -428,7 +487,7 @@ mod tests {
 
     #[test]
     fn a_gap_is_asked_for_once_enough_has_gone_past_it() {
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         assert!(inbox.arrived(1, 0).is_empty());
         // 2 is missing. 3, 4 arrive -- still within reordering tolerance.
         assert!(inbox.arrived(3, 0).is_empty());
@@ -439,7 +498,7 @@ mod tests {
 
     #[test]
     fn a_repeat_stops_the_asking() {
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         inbox.arrived(1, 0);
         inbox.arrived(3, 0);
         inbox.arrived(4, 0);
@@ -455,31 +514,31 @@ mod tests {
     fn asking_gives_up_rather_than_going_on_for_ever() {
         // A link that has swallowed a packet twice is not going to produce it,
         // and inner protocols own it from here.
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         inbox.arrived(1, 0);
         let mut asks = 0;
         for c in 3..40 {
             asks += inbox.arrived(c, 0).len();
         }
-        assert_eq!(asks, usize::from(MAX_ASKS), "asked {asks} times");
+        assert_eq!(asks, usize::from(DEFAULT_ASKS), "asked {asks} times");
         assert_eq!(inbox.outstanding(), 0, "and then let it go");
     }
 
     #[test]
     fn a_gap_older_than_the_deadline_is_abandoned() {
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         inbox.arrived(1, 0);
         inbox.arrived(3, 0);
         // Past the deadline, the packet is no longer worth repeating: inner TCP
         // has noticed by now, and two recoveries for one loss is waste on a
         // link that is already losing.
-        assert!(inbox.arrived(4, DEADLINE + 1).is_empty());
+        assert!(inbox.arrived(4, DEFAULT_DEADLINE + 1).is_empty());
         assert_eq!(inbox.outstanding(), 0);
     }
 
     #[test]
     fn a_peer_inventing_gaps_cannot_grow_this_without_bound() {
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         inbox.arrived(0, 0);
         inbox.arrived(u64::from(u32::MAX), 0);
         assert!(inbox.outstanding() <= MAX_OUTSTANDING);
@@ -487,14 +546,18 @@ mod tests {
 
     #[test]
     fn the_outbox_keeps_what_is_worth_repeating_and_drops_the_rest() {
-        let mut outbox = Outbox::new(4);
+        let mut outbox = Outbox::new(sized(4));
         for c in 0..4u64 {
             let byte = u8::try_from(c).expect("small");
             outbox.record(c, &[byte; 8], 0);
         }
         assert_eq!(outbox.get(2, 0), Some(&[2u8; 8][..]));
         assert_eq!(outbox.get(9, 0), None, "never sent");
-        assert_eq!(outbox.get(2, DEADLINE + 1), None, "too old to be worth it");
+        assert_eq!(
+            outbox.get(2, DEFAULT_DEADLINE + 1),
+            None,
+            "too old to be worth it"
+        );
 
         // Capacity is a hard bound. Counter 4 lands on the slot counter 0 holds
         // -- 4 % 4 -- so recording it is what evicts 0, and the slot reports the
@@ -512,7 +575,11 @@ mod tests {
         // Nothing is pruned, and nothing needs to be: a slot too old to be
         // worth repeating refuses to answer, and its buffer is waiting to be
         // written over rather than freed and allocated again.
-        assert_eq!(outbox.get(4, DEADLINE + 1), None, "too old to answer");
+        assert_eq!(
+            outbox.get(4, DEFAULT_DEADLINE + 1),
+            None,
+            "too old to answer"
+        );
         assert_eq!(outbox.len(), 4, "and still holding its buffers");
     }
 
@@ -526,7 +593,7 @@ mod tests {
         // largest occupant needed, where a fresh one is sized to whatever it
         // holds now. Comparing equal-sized writes cannot distinguish the two,
         // and an earlier version of this test did not.
-        let mut outbox = Outbox::new(4);
+        let mut outbox = Outbox::new(sized(4));
         outbox.record(0, &[0u8; 1400], 0);
         let grown = outbox.slots.first().expect("a slot").buf.capacity();
         assert!(grown >= 1400);
@@ -548,7 +615,7 @@ mod tests {
     fn finding_a_packet_does_not_depend_on_how_many_are_held() {
         // Addressed, not searched: the slot is arithmetic on the counter, and
         // the stored counter is what says whether it is still the right packet.
-        let mut outbox = Outbox::new(1200);
+        let mut outbox = Outbox::new(sized(1200));
         for c in 0..1200u64 {
             let byte = u8::try_from(c % 256).expect("in range");
             outbox.record(c, &[byte; 16], 0);
@@ -571,7 +638,7 @@ mod tests {
         // The work per packet has to be flat, or a link losing enough to make
         // this worth having is a link where it costs the most. With hundreds
         // outstanding, one arrival must not walk them all.
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         inbox.arrived(0, 0);
         // One enormous jump: 400 counters missing at once.
         inbox.arrived(400, 0);
@@ -590,7 +657,7 @@ mod tests {
     fn a_gap_is_not_asked_about_on_every_packet() {
         // Once asked, it waits as far again before being asked a second time,
         // or a single loss would produce a request per arriving packet.
-        let mut inbox = Inbox::new();
+        let mut inbox = Inbox::new(on());
         inbox.arrived(1, 0);
         inbox.arrived(3, 0);
         inbox.arrived(4, 0);
@@ -602,10 +669,38 @@ mod tests {
     }
 
     #[test]
+    fn the_deadline_and_the_ask_count_are_the_ones_configured() {
+        // Both are the path's to choose, not this file's: the deadline follows
+        // from its round trip, the ask count from how much it loses.
+        let limits = Limits {
+            capacity: 8,
+            deadline: 1_000,
+            asks: 4,
+        };
+
+        let mut outbox = Outbox::new(limits);
+        outbox.record(1, &[7u8; 8], 0);
+        assert!(
+            outbox.get(1, DEFAULT_DEADLINE + 1).is_some(),
+            "past the default, but inside the one configured"
+        );
+        assert!(outbox.get(1, 1_001).is_none(), "and refused past that");
+
+        let mut inbox = Inbox::new(limits);
+        inbox.arrived(1, 0);
+        let mut asks = 0;
+        for c in 3..80u64 {
+            asks += inbox.arrived(c, 0).len();
+        }
+        assert_eq!(asks, usize::from(limits.asks), "asked {asks} times");
+        assert_eq!(inbox.outstanding(), 0, "and then let it go");
+    }
+
+    #[test]
     fn an_outbox_of_no_capacity_holds_nothing() {
         // What `retransmit = false` gets: the code path stays, and costs a
         // comparison rather than a copy of every packet.
-        let mut outbox = Outbox::new(0);
+        let mut outbox = Outbox::new(sized(0));
         outbox.record(1, &[0u8; 1400], 0);
         assert_eq!(outbox.len(), 0);
         assert_eq!(outbox.get(1, 0), None);

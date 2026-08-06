@@ -108,20 +108,19 @@ pub(crate) struct Interface {
     pub(crate) transmit: TransmitPath,
     /// Whether to answer a quiet peer with an empty packet.
     ///
-    /// How many recently-sent packets to hold for repeating, or zero for none.
+    /// What this end will spend on repeating packets a lossy path swallowed.
     ///
     /// Off by default. Everything the tunnel carries already recovers from
     /// loss on its own, and on an ordinary link a second mechanism doing the
-    /// same job is waste. It earns its place on a link losing several per cent,
-    /// where inner TCP's own recovery -- paced by a retransmission timer that
-    /// starts at a couple of hundred milliseconds and grows with every loss --
-    /// is far slower than simply asking the peer again.
+    /// same job is waste -- worse than waste, since it hides loss from the
+    /// congestion control that ought to see it. Turn it on for a path whose
+    /// loss has been *measured*, by comparing one end's `tx` against the
+    /// other's `rx` over the same window.
     ///
-    /// The cost is memory: this many inner packets are held, so 512 is under a
-    /// megabyte at a 1400-byte MTU. Repeats are bounded in both age and number,
-    /// so this never becomes a second congestion controller arguing with the
-    /// first.
-    pub(crate) retransmit: usize,
+    /// All three settings follow from the path rather than from taste:
+    /// `retransmit` from its packet rate, `retransmit_deadline` from its round
+    /// trip, and `retransmit_asks` from how much it loses.
+    pub(crate) repeat: crate::repeat::Limits,
     /// WireGuard's passive keepalive, and on by default because a silent tunnel
     /// goes cold: measured on a live path, the first two seconds of traffic
     /// after any idle period were lost to a mapping that had lapsed, while every
@@ -412,6 +411,8 @@ struct RawInterface {
     #[serde(default)]
     keepalive: Option<bool>,
     retransmit: Option<usize>,
+    retransmit_deadline: Option<u64>,
+    retransmit_asks: Option<u8>,
     #[serde(default)]
     rotate: Option<bool>,
     #[serde(default)]
@@ -476,6 +477,22 @@ pub(crate) enum Error {
 
 /// Result alias for this module.
 pub(crate) type Result<T> = core::result::Result<T, Error>;
+
+/// The most packets that may be held for repeating.
+///
+/// At a 1400-byte MTU this is about twelve megabytes, and it covers a path
+/// moving twenty thousand packets a second at the default deadline -- far past
+/// anything a tunnel like this carries.
+const MAX_RETRANSMIT: usize = 8192;
+
+/// The shortest useful repeat deadline: a repeat has to survive a round trip.
+const MIN_DEADLINE: u64 = 50;
+
+/// The longest. Past this the inner protocol has recovered without help.
+const MAX_DEADLINE: u64 = 5_000;
+
+/// The most times one packet may be asked for.
+const MAX_ASKS: u8 = 8;
 
 /// The longest name Linux accepts for an interface, `IFNAMSIZ` less its NUL.
 const IFNAME_MAX: usize = 15;
@@ -846,16 +863,62 @@ impl Config {
                 // Both on unless declined. Each was measured on a live path
                 // before being made the default, and each is one line to turn
                 // off for a path that does not want it.
-                retransmit: match iface.retransmit {
-                    Some(n) if n > 4096 => {
-                        return Err(invalid(
-                            "interface.retransmit",
-                            "more than 4096 packets is megabytes of memory held for \
-                             something that is only worth repeating for a fraction of \
-                             a second",
-                        ));
+                repeat: {
+                    // One source for the defaults, so "off" and "unset" cannot
+                    // drift apart.
+                    let defaults = crate::repeat::Limits::off();
+                    // A packet is only worth holding until it can be asked for,
+                    // so the useful capacity is the path's packet rate times
+                    // the deadline. Beyond that the extra slots hold packets
+                    // that are refused for age before anyone can ask.
+                    let capacity = match iface.retransmit {
+                        Some(n) if n > MAX_RETRANSMIT => {
+                            return Err(invalid(
+                                "interface.retransmit",
+                                format!(
+                                    "more than {MAX_RETRANSMIT} packets is megabytes held for \
+                                     something worth repeating for a fraction of a second"
+                                ),
+                            ));
+                        }
+                        other => other.unwrap_or(0),
+                    };
+                    let deadline = match iface.retransmit_deadline {
+                        Some(ms) if !(MIN_DEADLINE..=MAX_DEADLINE).contains(&ms) => {
+                            return Err(invalid(
+                                "interface.retransmit_deadline",
+                                format!(
+                                    "expected {MIN_DEADLINE} to {MAX_DEADLINE} ms: below that a \
+                                     repeat cannot complete a round trip, and above it the inner \
+                                     protocol has long since recovered on its own"
+                                ),
+                            ));
+                        }
+                        other => other.unwrap_or(defaults.deadline),
+                    };
+                    let asks = match iface.retransmit_asks {
+                        Some(0) => {
+                            return Err(invalid(
+                                "interface.retransmit_asks",
+                                "asking zero times is what `retransmit = 0` already says",
+                            ));
+                        }
+                        Some(n) if n > MAX_ASKS => {
+                            return Err(invalid(
+                                "interface.retransmit_asks",
+                                format!(
+                                    "more than {MAX_ASKS} attempts costs two packets each to save \
+                                     one, on a path that is already dropping them"
+                                ),
+                            ));
+                        }
+                        other => other.unwrap_or(defaults.asks),
+                    };
+                    crate::repeat::Limits {
+                        capacity,
+                        deadline,
+                        asks,
                     }
-                    other => other.unwrap_or(0),
                 },
                 keepalive: iface.keepalive.unwrap_or(true),
                 rotate: iface.rotate.unwrap_or(true),
@@ -921,10 +984,61 @@ fn mask_from_prefix(prefix: u8) -> Ipv4Addr {
 
 #[cfg(test)]
 mod tests {
-    // Panicking on an out-of-range index is exactly what a test should do.
+
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+
+    /// The client fixture with extra interface settings.
+    fn with_interface(lines: &str) -> Result<TunnelConfig> {
+        Config::parse(&CLIENT.replace("[peer]", &format!("{lines}\n\n[peer]")))
+            .map(|c| c.into_only().expect("one tunnel"))
+    }
+
+    #[test]
+    fn repeating_is_off_unless_asked_for() {
+        let off = with_interface("").expect("parses");
+        assert_eq!(off.interface.repeat.capacity, 0, "off by default");
+        assert_eq!(
+            off.interface.repeat.deadline,
+            crate::repeat::DEFAULT_DEADLINE
+        );
+        assert_eq!(off.interface.repeat.asks, crate::repeat::DEFAULT_ASKS);
+
+        let on =
+            with_interface("retransmit = 1200\nretransmit_deadline = 700\nretransmit_asks = 3")
+                .expect("parses");
+        assert_eq!(on.interface.repeat.capacity, 1200);
+        assert_eq!(on.interface.repeat.deadline, 700);
+        assert_eq!(on.interface.repeat.asks, 3);
+    }
+
+    #[test]
+    fn each_repeat_setting_refuses_what_it_cannot_honour() {
+        // A capacity nobody could want, a deadline too short for a round trip
+        // or long past the inner protocol's own recovery, and an ask count
+        // whose every extra attempt costs two packets to save one.
+        for line in [
+            "retransmit = 8193",
+            "retransmit_deadline = 49",
+            "retransmit_deadline = 5001",
+            "retransmit_asks = 0",
+            "retransmit_asks = 9",
+        ] {
+            assert!(with_interface(line).is_err(), "{line} was accepted");
+        }
+        // And the edges of each are allowed.
+        for line in [
+            "retransmit = 8192",
+            "retransmit_deadline = 50",
+            "retransmit_deadline = 5000",
+            "retransmit_asks = 1",
+            "retransmit_asks = 8",
+        ] {
+            assert!(with_interface(line).is_ok(), "{line} was refused");
+        }
+    }
+    // Panicking on an out-of-range index is exactly what a test should do.
 
     /// Three tunnels in one file, in the form that can say so.
     const THREE: &str = r#"

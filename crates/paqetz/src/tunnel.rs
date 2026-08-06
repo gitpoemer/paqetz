@@ -265,15 +265,15 @@ struct PeerState {
 }
 
 impl PeerState {
-    fn new(endpoint: Option<SocketAddrV4>, retransmit: usize) -> Self {
+    fn new(endpoint: Option<SocketAddrV4>, repeat: crate::repeat::Limits) -> Self {
         Self {
             session: None,
             next: None,
             previous: None,
             pending: None,
             carrier: None,
-            outbox: crate::repeat::Outbox::new(retransmit),
-            inbox: crate::repeat::Inbox::new(),
+            outbox: crate::repeat::Outbox::new(repeat),
+            inbox: crate::repeat::Inbox::new(repeat),
             endpoint,
             last_handshake: 0,
             rekey_at: Millis::MAX,
@@ -669,7 +669,7 @@ impl Tunnel {
         Ok(Self {
             state: Arc::new(Mutex::new(PeerState::new(
                 cfg.peer.endpoint,
-                cfg.interface.retransmit,
+                cfg.interface.repeat,
             ))),
             cfg,
             health_interval,
@@ -1508,7 +1508,7 @@ impl Tunnel {
         // Only once the packet has authenticated: a gap claimed by anyone else
         // would have this end asking its peer for packets nobody sent.
         let asking = match counter {
-            Some(c) if self.cfg.interface.retransmit > 0 => state.inbox.arrived(c, now),
+            Some(c) if self.cfg.interface.repeat.capacity > 0 => state.inbox.arrived(c, now),
             _ => Vec::new(),
         };
 
@@ -2035,7 +2035,7 @@ mod tests {
             last_send: sent,
             last_receive: heard,
             last_data_receive: heard,
-            ..PeerState::new(None, 0)
+            ..PeerState::new(None, crate::repeat::Limits::off())
         }
     }
 
@@ -2087,7 +2087,7 @@ mod tests {
         // the client having stopped trying, with no path back. The signal that
         // used to be relied on -- `last_send` -- cannot move without a session,
         // and no session would be attempted until it moved.
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         s.attempt_started = Some(0);
         assert!(!s.exhausted(REKEY_ATTEMPT_TIME - 1), "still trying");
         assert!(s.exhausted(REKEY_ATTEMPT_TIME), "long enough to stop");
@@ -2111,7 +2111,7 @@ mod tests {
         // tunnel down until somebody noticed and restarted it -- and the thing
         // most likely to be waiting on it, Xray, resolves its names through it,
         // so it could not be the traffic that woke it either.
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         s.attempt_started = Some(0);
         s.last_handshake = REKEY_ATTEMPT_TIME - 5_000;
         s.retry_at = Millis::MAX;
@@ -2142,7 +2142,7 @@ mod tests {
     fn an_idle_tunnel_with_nothing_to_send_still_gives_up() {
         // The other half: attempts stop for a tunnel nobody is using, or an
         // unreachable peer is handshaked at for ever.
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         assert!(!s.exhausted(0), "nothing attempted yet");
         s.attempt_started = Some(1_000);
         assert!(s.exhausted(1_000 + REKEY_ATTEMPT_TIME));
@@ -2253,7 +2253,7 @@ mod tests {
         let (old_client, mut old_server) = session_pair(&client, &server, 10);
         let (new_client, mut new_server) = session_pair(&client, &server, 20);
 
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         state.install(old_client);
 
         let mut wire = [0u8; 256];
@@ -2307,7 +2307,7 @@ mod tests {
         let (mut live_peer, live) = session_pair(&client, &server, 60);
         let (_, replayed) = session_pair(&client, &server, 70);
 
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         state.install(live);
         let established = state.session.as_ref().expect("a session").local_index();
 
@@ -2347,7 +2347,7 @@ mod tests {
         let (_, old) = session_pair(&client, &server, 80);
         let (mut peer, fresh) = session_pair(&client, &server, 90);
 
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         state.install(old);
         state.accept(fresh);
         let waiting = state.next.as_ref().expect("waiting").local_index();
@@ -2389,7 +2389,7 @@ mod tests {
         let rekeyed = paqetz_core::noise::REKEY_AFTER_TIME;
         let (mut peer, fresh) = session_pair_at(&client, &server, 120, rekeyed);
 
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         state.install(old);
         state.accept(fresh);
 
@@ -2417,7 +2417,7 @@ mod tests {
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (_, session) = session_pair(&client, &server, 140);
 
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         s.install(session);
         for _ in 0..CONFIRM_TRIES {
             assert!(s.confirm_owed, "still worth asking");
@@ -2439,7 +2439,7 @@ mod tests {
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (mut peer, session) = session_pair(&client, &server, 130);
 
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         state.install(session);
         assert!(state.confirm_owed);
 
@@ -2462,7 +2462,7 @@ mod tests {
         // condition survived the packet it emitted and fired again on the next
         // tick -- four empty packets a second for as long as the peer stayed
         // quiet.
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         s.last_data_receive = Some(1_000);
         assert!(!s.owes_keepalive(1_000), "not yet");
         assert!(
@@ -2489,7 +2489,7 @@ mod tests {
         // The other half of the same distinction: answering a peer is not
         // evidence the peer answered us, and conflating the two is what made an
         // idle tunnel handshake itself to death.
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         s.last_keepalive = Some(1_000);
         assert!(
             !s.presumed_dead(1_000 + PRESUMED_DEAD * 10),
@@ -2505,7 +2505,7 @@ mod tests {
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (session, _) = session_pair(&client, &server, 100);
 
-        let mut s = PeerState::new(None, 0);
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
         assert!(!s.confirm_owed, "nothing has happened yet");
         s.install(session);
         assert!(
@@ -2526,7 +2526,7 @@ mod tests {
         let (second, _) = session_pair(&client, &server, 40);
         let (third, _) = session_pair(&client, &server, 50);
 
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         state.install(first);
         state.install(second);
         state.install(third);
@@ -2545,7 +2545,7 @@ mod tests {
 
     #[test]
     fn nothing_opens_before_there_is_a_session() {
-        let mut state = PeerState::new(None, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
         let mut inner = [0u8; 64];
         assert!(state.open(&[0u8; 32], &mut inner, 0).is_none());
     }
