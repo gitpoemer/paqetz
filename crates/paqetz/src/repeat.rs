@@ -38,7 +38,6 @@
 //! cannot be one. An observer sees packets of the same shape as any other.
 
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 
 use paqetz_core::Millis;
 
@@ -155,29 +154,69 @@ pub(crate) const REPEAT_OVERHEAD: usize = 10;
 /// cannot be sent twice — its counter is the AEAD nonce, and repeating a nonce
 /// under the same key is the one thing this construction must never do — so a
 /// repeat is a fresh sealing of the same contents.
+///
+/// # A ring, addressed by counter
+///
+/// Counters are monotonic, so `counter % capacity` names the slot a packet
+/// belongs in: recording and finding are both arithmetic rather than a search.
+/// The stored counter is checked on the way out, which is what distinguishes
+/// the packet asked for from the one that has since taken its place.
+///
+/// Each slot keeps its buffer between uses. The alternative -- a fresh `Vec` per
+/// packet -- puts an allocation and a free on the path of every packet the
+/// tunnel sends, to hold data that is discarded within half a second. The cost
+/// is that memory settles at capacity times the largest packet seen rather than
+/// growing with the traffic; at the default that is under a megabyte, and it is
+/// paid once instead of continuously.
 pub(crate) struct Outbox {
-    sent: VecDeque<(u64, Vec<u8>, Millis)>,
-    capacity: usize,
+    slots: Vec<Slot>,
+}
+
+/// One packet held for repeating.
+struct Slot {
+    /// The counter it went out under, or `None` if this slot is empty.
+    counter: Option<u64>,
+    /// When it went out.
+    at: Millis,
+    /// The packet. Retained across uses; `len` is what of it is current.
+    buf: Vec<u8>,
 }
 
 impl Outbox {
     /// An outbox holding at most `capacity` packets.
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            sent: VecDeque::with_capacity(capacity.min(1024)),
-            capacity,
+            slots: (0..capacity)
+                .map(|_| Slot {
+                    counter: None,
+                    at: 0,
+                    buf: Vec::new(),
+                })
+                .collect(),
         }
+    }
+
+    /// The slot a counter belongs to.
+    fn slot(&self, counter: u64) -> Option<usize> {
+        let capacity = u64::try_from(self.slots.len()).ok()?;
+        if capacity == 0 {
+            return None;
+        }
+        usize::try_from(counter % capacity).ok()
     }
 
     /// Records a packet that has just gone out under `counter`.
     pub(crate) fn record(&mut self, counter: u64, packet: &[u8], now: Millis) {
-        if self.capacity == 0 {
+        let Some(index) = self.slot(counter) else {
             return;
-        }
-        while self.sent.len() >= self.capacity {
-            self.sent.pop_front();
-        }
-        self.sent.push_back((counter, packet.to_vec(), now));
+        };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        slot.buf.clear();
+        slot.buf.extend_from_slice(packet);
+        slot.counter = Some(counter);
+        slot.at = now;
     }
 
     /// Returns the packet sent under `counter`, if it is still worth repeating.
@@ -185,36 +224,41 @@ impl Outbox {
     /// Kept rather than removed: a burst can swallow a repeat as easily as it
     /// swallowed the original, and the peer is allowed to ask twice.
     pub(crate) fn get(&self, counter: u64, now: Millis) -> Option<&[u8]> {
-        self.sent.iter().find_map(|(c, packet, at)| {
-            (*c == counter && now.saturating_sub(*at) <= DEADLINE).then_some(packet.as_slice())
-        })
+        let slot = self.slots.get(self.slot(counter)?)?;
+        // The slot holds whatever counter last landed on it. Only the one asked
+        // for will do, and only while it is young enough to be worth sending.
+        (slot.counter == Some(counter) && now.saturating_sub(slot.at) <= DEADLINE)
+            .then_some(slot.buf.as_slice())
     }
 
-    /// Drops everything too old to be worth repeating.
-    pub(crate) fn prune(&mut self, now: Millis) {
-        while let Some((_, _, at)) = self.sent.front() {
-            if now.saturating_sub(*at) > DEADLINE {
-                self.sent.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// How many packets are being held.
+    /// How many slots currently hold a packet.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.sent.len()
+        self.slots.iter().filter(|s| s.counter.is_some()).count()
     }
 }
+
+/// How many gaps may be considered on one arrival.
+///
+/// The work per packet has to be flat, or a link losing enough to make this
+/// feature worth having is a link where it costs the most. Gaps are ordered by
+/// counter and the oldest are the ones running out of time, so looking at a
+/// handful from the front asks about the right ones first and lets the rest
+/// wait for the next packet, which is never far behind.
+const ASK_SCAN: usize = 8;
 
 /// One counter that has not arrived.
 #[derive(Debug, Clone, Copy)]
 struct Gap {
     /// When the gap was first noticed.
     seen: Millis,
-    /// How many packets have arrived with a higher counter since.
-    ahead: usize,
+    /// The high-water mark when it was last asked for, if it has been.
+    ///
+    /// How far the stream has moved is read from the counters themselves rather
+    /// than counted per arrival: `highest - at` is the same judgement as
+    /// tallying every packet that went past, without touching every gap to make
+    /// it.
+    asked_at: Option<u64>,
     /// How many times it has been asked for.
     asks: u8,
 }
@@ -253,7 +297,7 @@ impl Inbox {
                     }
                     self.gaps.entry(missing).or_insert(Gap {
                         seen: now,
-                        ahead: 0,
+                        asked_at: None,
                         asks: 0,
                     });
                 }
@@ -261,28 +305,44 @@ impl Inbox {
             }
             Some(_) => {}
         }
+        let Some(highest) = self.highest else {
+            return Vec::new();
+        };
 
-        // This packet is "ahead" of every gap below it.
-        for (at, gap) in &mut self.gaps {
-            if *at < counter {
-                gap.ahead = gap.ahead.saturating_add(1);
+        // The oldest are at the front, so giving up costs only what it removes.
+        while let Some((&at, gap)) = self.gaps.iter().next() {
+            if now.saturating_sub(gap.seen) > DEADLINE {
+                self.gaps.remove(&at);
+            } else {
+                break;
             }
         }
 
         let mut ask = Vec::new();
-        self.gaps.retain(|at, gap| {
-            if now.saturating_sub(gap.seen) > DEADLINE || gap.asks >= MAX_ASKS {
-                // Too late to be worth repeating, or asked for enough times.
-                // Inner protocols own it from here.
-                return false;
+        let mut spent = Vec::new();
+        for (&at, gap) in self.gaps.iter_mut().take(ASK_SCAN) {
+            // How far the stream has moved past this counter. Reordering is not
+            // loss, so a gap is only called one once enough has gone by; a
+            // repeat that was already asked for waits the same distance again
+            // rather than being asked on every packet.
+            let moved = match gap.asked_at {
+                None => highest.saturating_sub(at),
+                Some(asked) => highest.saturating_sub(asked),
+            };
+            if moved < REORDER_TOLERANCE as u64 {
+                continue;
             }
-            if gap.ahead >= REORDER_TOLERANCE {
-                ask.push(*at);
-                gap.asks = gap.asks.saturating_add(1);
-                gap.ahead = 0;
+            ask.push(at);
+            gap.asks = gap.asks.saturating_add(1);
+            gap.asked_at = Some(highest);
+            if gap.asks >= MAX_ASKS {
+                // Asked enough. Inner protocols own it from here.
+                spent.push(at);
             }
-            true
-        });
+        }
+        for at in spent {
+            self.gaps.remove(&at);
+        }
         ask
     }
 
@@ -436,14 +496,109 @@ mod tests {
         assert_eq!(outbox.get(9, 0), None, "never sent");
         assert_eq!(outbox.get(2, DEADLINE + 1), None, "too old to be worth it");
 
-        // Capacity is a hard bound: the oldest goes to make room.
+        // Capacity is a hard bound. Counter 4 lands on the slot counter 0 holds
+        // -- 4 % 4 -- so recording it is what evicts 0, and the slot reports the
+        // counter it actually holds rather than the one asked for.
         outbox.record(4, &[4u8; 8], 0);
         assert_eq!(outbox.len(), 4);
-        assert_eq!(outbox.get(0, 0), None, "evicted");
+        assert_eq!(outbox.get(0, 0), None, "overwritten by 4");
         assert_eq!(outbox.get(4, 0), Some(&[4u8; 8][..]));
+        assert_eq!(
+            outbox.get(1, 0),
+            Some(&[1u8; 8][..]),
+            "and its neighbours stand"
+        );
 
-        outbox.prune(DEADLINE + 1);
-        assert_eq!(outbox.len(), 0);
+        // Nothing is pruned, and nothing needs to be: a slot too old to be
+        // worth repeating refuses to answer, and its buffer is waiting to be
+        // written over rather than freed and allocated again.
+        assert_eq!(outbox.get(4, DEADLINE + 1), None, "too old to answer");
+        assert_eq!(outbox.len(), 4, "and still holding its buffers");
+    }
+
+    #[test]
+    fn a_slot_keeps_its_buffer_between_uses() {
+        // The point of the ring. A fresh `Vec` per packet puts an allocation
+        // and a free on the path of every packet the tunnel sends, for data
+        // discarded within half a second.
+        //
+        // Told apart by shrinking: a reused buffer keeps the capacity its
+        // largest occupant needed, where a fresh one is sized to whatever it
+        // holds now. Comparing equal-sized writes cannot distinguish the two,
+        // and an earlier version of this test did not.
+        let mut outbox = Outbox::new(4);
+        outbox.record(0, &[0u8; 1400], 0);
+        let grown = outbox.slots.first().expect("a slot").buf.capacity();
+        assert!(grown >= 1400);
+
+        // Same slot, a much smaller packet.
+        outbox.record(4, &[1u8; 40], 0);
+        let slot = outbox.slots.first().expect("a slot");
+        assert_eq!(slot.buf.len(), 40, "it holds the new packet");
+        assert!(
+            slot.buf.capacity() >= grown,
+            "the buffer was replaced rather than written over: {} < {grown}",
+            slot.buf.capacity()
+        );
+        assert_eq!(outbox.get(4, 0), Some(&[1u8; 40][..]));
+        assert_eq!(outbox.get(0, 0), None, "and 0 is gone from that slot");
+    }
+
+    #[test]
+    fn finding_a_packet_does_not_depend_on_how_many_are_held() {
+        // Addressed, not searched: the slot is arithmetic on the counter, and
+        // the stored counter is what says whether it is still the right packet.
+        let mut outbox = Outbox::new(1200);
+        for c in 0..1200u64 {
+            let byte = u8::try_from(c % 256).expect("in range");
+            outbox.record(c, &[byte; 16], 0);
+        }
+        for c in 0..1200u64 {
+            let byte = u8::try_from(c % 256).expect("in range");
+            assert_eq!(outbox.get(c, 0), Some(&[byte; 16][..]), "counter {c}");
+        }
+        // One lap later, every slot answers for its new occupant and no other.
+        for c in 1200..2400u64 {
+            outbox.record(c, &[0xAB; 16], 0);
+        }
+        for c in 0..1200u64 {
+            assert_eq!(outbox.get(c, 0), None, "counter {c} was overwritten");
+        }
+    }
+
+    #[test]
+    fn an_arrival_considers_a_bounded_number_of_gaps() {
+        // The work per packet has to be flat, or a link losing enough to make
+        // this worth having is a link where it costs the most. With hundreds
+        // outstanding, one arrival must not walk them all.
+        let mut inbox = Inbox::new();
+        inbox.arrived(0, 0);
+        // One enormous jump: 400 counters missing at once.
+        inbox.arrived(400, 0);
+        assert_eq!(inbox.outstanding(), 399);
+
+        // Every subsequent arrival asks about at most a handful.
+        for c in 401..410u64 {
+            assert!(
+                inbox.arrived(c, 0).len() <= ASK_SCAN,
+                "one arrival asked about more than {ASK_SCAN} gaps"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_is_not_asked_about_on_every_packet() {
+        // Once asked, it waits as far again before being asked a second time,
+        // or a single loss would produce a request per arriving packet.
+        let mut inbox = Inbox::new();
+        inbox.arrived(1, 0);
+        inbox.arrived(3, 0);
+        inbox.arrived(4, 0);
+        assert_eq!(inbox.arrived(5, 0), vec![2], "asked once");
+        assert!(inbox.arrived(6, 0).is_empty(), "not again immediately");
+        assert!(inbox.arrived(7, 0).is_empty());
+        assert_eq!(inbox.arrived(8, 0), vec![2], "and once more, later");
+        assert_eq!(inbox.outstanding(), 0, "then left to inner protocols");
     }
 
     #[test]

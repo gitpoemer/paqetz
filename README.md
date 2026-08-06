@@ -416,8 +416,23 @@ make you pay across dozens of unrelated connections at once.
 
 It gives up quickly and on purpose. A packet is only worth repeating for about
 400 ms and is asked for at most twice; past that, inner TCP has noticed anyway
-and two recoveries for one loss is waste on a link already struggling. Memory is
-`retransmit` inner packets, so 512 is under a megabyte at a 1400-byte MTU.
+and two recoveries for one loss is waste on a link already struggling.
+
+**Sizing.** The outbox only has to hold a packet long enough to be asked for, so
+the useful capacity is `peak packets per second × 0.4`. At 25 Mbit/s with a
+1400-byte MTU that is around 2200 pps, or ~900 packets — so 512 would quietly be
+too small, and a repeat asked for would find nothing to send. 1200 covers about
+3000 pps. Memory settles at capacity times the largest packet held: ~1.7 MB at
+1200, and ~730 KB at 512.
+
+**Cost.** Flat, not proportional to how badly the link is behaving. The outbox
+is a ring addressed by `counter % capacity`, so recording and finding are
+arithmetic rather than a search, and each slot keeps its buffer between uses
+rather than allocating one per packet. On the receiving side, how far the stream
+has moved past a gap is read from the counters themselves rather than tallied
+per arrival, and at most a handful of gaps are considered on any one packet. The
+work per packet does not grow with the number of packets held or the number of
+gaps outstanding.
 
 Requests and repeats travel as ordinary transport packets, sealed under the same
 session. They are told apart by a leading zero byte, which no IPv4 packet can

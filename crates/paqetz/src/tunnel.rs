@@ -1141,8 +1141,9 @@ impl Tunnel {
         // repeat or a request is not worth holding: repeating a repeat is a
         // loop, and a lost request is re-derived from the next gap anyway.
         if crate::repeat::parse(packet).is_none() {
+            // No pruning: the ring reuses its slots, and `get` refuses anything
+            // too old to be worth repeating.
             state.outbox.record(counter, packet, now);
-            state.outbox.prune(now);
         }
         Stats::bump(&self.stats.tx_packets);
         Stats::add(&self.stats.tx_bytes, packet.len() as u64);
