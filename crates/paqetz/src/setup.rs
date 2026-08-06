@@ -782,7 +782,11 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         let unit_path = dir.join("xray.service");
         std::fs::write(
             &unit_path,
-            crate::xray::service_unit("/usr/local/bin", "/etc/xray/config.json"),
+            crate::xray::service_unit(
+                "/usr/local/bin",
+                crate::xray::CONFIG_PATH,
+                crate::service::has_credentials(),
+            ),
         )?;
 
         println!("\n   Wrote {}", config_path.display());

@@ -272,6 +272,36 @@ pub(crate) fn unit_exists(name: &str) -> bool {
     Path::new(&unit_path(name)).exists()
 }
 
+/// The running systemd's major version, if it can be determined.
+#[must_use]
+pub(crate) fn systemd_version() -> Option<u32> {
+    let out = Command::new("systemctl").arg("--version").output().ok()?;
+    parse_systemd_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Reads the version out of `systemctl --version`.
+///
+/// The first line is `systemd 249 (249.11-0ubuntu3)` and has been that shape
+/// for many years, but distributions add suffixes freely, so only the leading
+/// digits are taken and anything unrecognised is `None` rather than a guess.
+pub(crate) fn parse_systemd_version(output: &str) -> Option<u32> {
+    output.lines().next()?.split_whitespace().find_map(|word| {
+        let digits: String = word.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u32>().ok()
+    })
+}
+
+/// Whether this systemd can hand a service a file the service cannot open.
+///
+/// `LoadCredential` arrived in systemd 247. Below that, a service running as a
+/// transient user simply cannot read a root-owned private file, and the only
+/// honest options are to run it as root or to loosen the file -- and loosening
+/// a file that holds a private key is not an option at all.
+#[must_use]
+pub(crate) fn has_credentials() -> bool {
+    systemd_version().is_some_and(|v| v >= 247)
+}
+
 /// Whether a unit is running right now.
 #[must_use]
 pub(crate) fn unit_active(name: &str) -> bool {
@@ -316,6 +346,26 @@ pub(crate) fn install_binary(prefix: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_systemd_version_is_read_from_its_first_line() {
+        assert_eq!(
+            super::parse_systemd_version("systemd 249 (249.11-0ubuntu3.12)\n+PAM +AUDIT"),
+            Some(249)
+        );
+        assert_eq!(
+            super::parse_systemd_version("systemd 255 (255.4-1ubuntu8)"),
+            Some(255)
+        );
+        // Distributions append freely; only the leading digits are taken.
+        assert_eq!(
+            super::parse_systemd_version("systemd 247.3-7+deb11u4"),
+            Some(247)
+        );
+        // And anything unrecognised is not guessed at.
+        assert_eq!(super::parse_systemd_version(""), None);
+        assert_eq!(super::parse_systemd_version("not systemd at all"), None);
+    }
+
     #[test]
     fn a_missing_program_says_so_rather_than_naming_a_file() {
         // The bare OS error is "No such file or directory", which sends the

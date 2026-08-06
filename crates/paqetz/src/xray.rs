@@ -557,7 +557,11 @@ pub(crate) fn apply(config: &str, prefix: &str) -> Result<(), Box<dyn std::error
         crate::service::run_elevated("systemctl", &["restart", "xray"])?;
         println!("  restarted xray, so the new configuration is the one in force");
     } else {
-        crate::service::install_unit("xray", &service_unit(prefix, CONFIG_PATH), true)?;
+        crate::service::install_unit(
+            "xray",
+            &service_unit(prefix, CONFIG_PATH, crate::service::has_credentials()),
+            true,
+        )?;
     }
     Ok(())
 }
@@ -748,7 +752,33 @@ pub(crate) fn install(
 
 /// A systemd unit that runs Xray with the generated configuration.
 #[must_use]
-pub(crate) fn service_unit(prefix: &str, config: &str) -> String {
+pub(crate) fn service_unit(prefix: &str, config: &str, credentials: bool) -> String {
+    // The configuration holds a REALITY private key, so it is 0600 and owned by
+    // root. A service running under `DynamicUser` gets a transient UID that
+    // cannot open such a file -- which is exactly right, and exactly why the
+    // file has to be handed to it rather than left for it to find.
+    //
+    // `LoadCredential` has systemd read the file as root before dropping
+    // privileges and place it where only this service can see it. Where that is
+    // unavailable the service runs as root instead: an unread configuration is
+    // a service that does not start, and loosening a file that holds a private
+    // key to work around it would be the worse trade.
+    let (isolation, path) = if credentials {
+        (
+            "DynamicUser=true\n             LoadCredential=config:{config}\n"
+                .replace("{config}", config),
+            "%d/config".to_owned(),
+        )
+    } else {
+        (
+            // No line continuation here: what this string holds lands verbatim
+            // in a unit file, and a wrapped source line becomes a wrongly
+            // indented one.
+            "# This systemd is too old to hand a file to a service, so it runs\n# as root rather than as a user that could not read its own key.\n"
+                .to_owned(),
+            config.to_owned(),
+        )
+    };
     format!(
         "# Install to /etc/systemd/system/xray.service, then:\n\
          #   systemctl enable --now xray\n\
@@ -760,7 +790,7 @@ pub(crate) fn service_unit(prefix: &str, config: &str) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={prefix}/xray run -config {config}\n\
+         ExecStart={prefix}/xray run -config {path}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
@@ -768,7 +798,7 @@ pub(crate) fn service_unit(prefix: &str, config: &str) -> String {
          AmbientCapabilities=CAP_NET_BIND_SERVICE\n\
          CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n\
          NoNewPrivileges=true\n\
-         DynamicUser=true\n\
+         {isolation}\
          ProtectSystem=strict\n\
          ProtectHome=true\n\
          PrivateTmp=true\n\
@@ -797,17 +827,49 @@ mod install_tests {
 
     #[test]
     fn the_service_unit_names_the_binary_and_the_configuration() {
-        let unit = service_unit("/usr/local/bin", "/etc/xray/config.json");
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, false);
         assert!(unit.contains("/usr/local/bin/xray run -config /etc/xray/config.json"));
         assert!(unit.contains("After=network-online.target paqetz.service"));
     }
 
     #[test]
     fn the_service_unit_asks_for_only_what_binding_a_port_needs() {
-        let unit = service_unit("/usr/local/bin", "/etc/xray/config.json");
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true);
         assert!(unit.contains("CAP_NET_BIND_SERVICE"));
         assert!(!unit.contains("CAP_NET_ADMIN"), "Xray needs no such thing");
         assert!(!unit.contains("User=root"), "and it is not run as root");
+    }
+
+    #[test]
+    fn a_dynamic_user_is_handed_the_configuration_rather_than_left_to_open_it() {
+        // The failure this fixes: the configuration holds a private key, so it
+        // is 0600 and owned by root, and a transient user cannot open such a
+        // file. Xray restarted every five seconds saying "permission denied".
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, true);
+        assert!(unit.contains("DynamicUser=true"));
+        assert!(
+            unit.contains("LoadCredential=config:/etc/xray/config.json"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("run -config %d/config"),
+            "it must read what it was handed, not the path it cannot open:\n{unit}"
+        );
+        assert!(
+            !unit.contains("run -config /etc/xray/config.json"),
+            "{unit}"
+        );
+    }
+
+    #[test]
+    fn without_credentials_it_runs_as_root_rather_than_not_at_all() {
+        // Below systemd 247 there is no way to hand a file to a transient user.
+        // Running as root is the lesser evil: loosening a file that holds a
+        // private key so an unprivileged user could read it is the greater one.
+        let unit = service_unit("/usr/local/bin", CONFIG_PATH, false);
+        assert!(!unit.contains("DynamicUser"), "{unit}");
+        assert!(!unit.contains("LoadCredential"), "{unit}");
+        assert!(unit.contains("run -config /etc/xray/config.json"), "{unit}");
     }
 
     #[test]
