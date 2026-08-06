@@ -55,6 +55,19 @@ fn handshake_pad() -> usize {
     random_u32().map_or(0, |r| r as usize % (noise::MAX_PAD + 1))
 }
 
+/// How long to wait before trying a peer that has stopped answering entirely.
+///
+/// Attempts stop after [`REKEY_ATTEMPT_TIME`] so a tunnel nobody is using does
+/// not handshake for ever at a peer that is gone. They used to stop for good,
+/// waiting for traffic to restart them -- and an idle client has no traffic, so
+/// a path that swallowed ninety seconds of handshakes left a tunnel that stayed
+/// down until somebody restarted it.
+///
+/// That is the worse failure. A peer unreachable for ninety seconds is often
+/// reachable thirty seconds later, and two packets a minute at a peer that is
+/// genuinely gone is not a cost worth protecting against.
+const RETRY_WHEN_GONE: Millis = 30_000;
+
 /// How long to wait before repeating an unanswered confirmation.
 const CONFIRM_RETRY: Millis = 1_000;
 
@@ -385,6 +398,44 @@ impl PeerState {
     fn exhausted(&self, now: Millis) -> bool {
         self.attempt_started
             .is_some_and(|began| now.saturating_sub(began) >= REKEY_ATTEMPT_TIME)
+    }
+
+    /// Whether a run that gave up should be started again.
+    ///
+    /// See [`RETRY_WHEN_GONE`]. Measured from the last attempt rather than from
+    /// when the run began, so the wait is a gap in the traffic and not a
+    /// countdown that was already running.
+    fn revive(&self, now: Millis) -> bool {
+        self.exhausted(now)
+            && self.session.is_none()
+            && now.saturating_sub(self.last_handshake) >= RETRY_WHEN_GONE
+    }
+
+    /// Whether a handshake should be sent now.
+    ///
+    /// The whole decision, in one place a test can reach. It used to live
+    /// inside the function that acts on it, so what a test could check was a
+    /// second copy of the same reasoning -- which agrees with itself no matter
+    /// what either copy says.
+    fn wants_handshake(&self, now: Millis) -> bool {
+        let waited = now >= self.retry_at;
+        match self.session.as_ref() {
+            None if self.exhausted(now) => self.revive(now),
+            None => self.pending.is_none() || waited,
+            // A session is only known to work while the peer answers. Rekeying
+            // on the timer alone left a peer that had forgotten us undetected
+            // for two minutes, with everything sent in between encrypted to a
+            // key nobody holds.
+            //
+            // The time half is the tunnel's, so it can be jittered; the
+            // message-count half stays where the counter lives.
+            Some(s) => {
+                (s.is_initiator()
+                    && (now >= self.rekey_at
+                        || s.sent() >= paqetz_core::noise::REKEY_AFTER_MESSAGES))
+                    || (self.presumed_dead(now) && waited)
+            }
+        }
     }
 
     /// Records that there is something to send and nothing to send it under.
@@ -1775,33 +1826,13 @@ impl Tunnel {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
-        // A repeat waits a jittered interval; a first attempt does not wait at
-        // all, so a tunnel with something to send starts talking immediately.
-        let waited = now >= state.retry_at;
-
-        // Giving up is measured from when trying started. Past that the peer is
-        // not briefly unreachable, it is gone, and the attempt stops until there
-        // is traffic again -- which `last_send` moving will show.
-        let exhausted = state.exhausted(now);
-
-        let due = match state.session.as_ref() {
-            None if exhausted => false,
-            None => state.pending.is_none() || waited,
-            // A session is only known to work while the peer answers. Rekeying
-            // on the timer alone left a peer that had forgotten us undetected
-            // for two minutes, with everything sent in between encrypted to a
-            // key nobody holds.
-            // The time half of this is the tunnel's, so it can be jittered;
-            // the message-count half stays where the counter lives.
-            Some(s) => {
-                (s.is_initiator()
-                    && (now >= state.rekey_at
-                        || s.sent() >= paqetz_core::noise::REKEY_AFTER_MESSAGES))
-                    || (state.presumed_dead(now) && waited)
-            }
-        };
-        if !due {
+        if !state.wants_handshake(now) {
             return Ok(());
+        }
+        if state.revive(now) {
+            // A fresh run, so it gets its own ninety seconds rather than
+            // inheriting a clock that has already expired.
+            state.attempt_started = None;
         }
         if state.presumed_dead(now) && state.session.is_some() {
             warn_!(
@@ -2071,6 +2102,40 @@ mod tests {
             !s.exhausted(REKEY_ATTEMPT_TIME * 100),
             "traffic is what says the tunnel is wanted"
         );
+    }
+
+    #[test]
+    fn a_run_that_gave_up_is_started_again_rather_than_abandoned() {
+        // The gap left by making traffic the trigger: an idle client has no
+        // traffic. A path that swallowed ninety seconds of handshakes left a
+        // tunnel down until somebody noticed and restarted it -- and the thing
+        // most likely to be waiting on it, Xray, resolves its names through it,
+        // so it could not be the traffic that woke it either.
+        let mut s = PeerState::new(None, 0);
+        s.attempt_started = Some(0);
+        s.last_handshake = REKEY_ATTEMPT_TIME - 5_000;
+        s.retry_at = Millis::MAX;
+
+        assert!(
+            s.wants_handshake(REKEY_ATTEMPT_TIME - 1),
+            "a run under way keeps trying"
+        );
+        assert!(
+            !s.wants_handshake(REKEY_ATTEMPT_TIME),
+            "and stops when it has gone on long enough"
+        );
+
+        // Measured from the last attempt, not from when the run began.
+        let due_at = s.last_handshake + RETRY_WHEN_GONE;
+        assert!(!s.wants_handshake(due_at - 1), "not yet");
+        assert!(
+            s.wants_handshake(due_at),
+            "and then it tries again, instead of waiting for a restart"
+        );
+
+        // A fresh run gets its own ninety seconds, not a clock already expired.
+        s.attempt_started = None;
+        assert!(!s.exhausted(due_at), "the new run has time of its own");
     }
 
     #[test]
