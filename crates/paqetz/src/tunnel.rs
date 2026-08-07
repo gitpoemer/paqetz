@@ -400,6 +400,25 @@ impl PeerState {
             .is_some_and(|began| now.saturating_sub(began) >= REKEY_ATTEMPT_TIME)
     }
 
+    /// Drops sessions that can no longer carry anything.
+    ///
+    /// `seal` refuses a session past `REJECT_AFTER_TIME`, so keeping one means
+    /// every outbound packet fails and is counted as a drop -- for keys that
+    /// will never work again. In the field that read as a transmit-dropped
+    /// counter climbing by thousands while the transmit counter stood still,
+    /// which describes the symptom and hides the cause.
+    ///
+    /// Letting them go makes the state say what is true, and hands the
+    /// handshake the path it already has for having no session at all: bounded
+    /// attempts, then a slow retry.
+    fn retire_expired(&mut self, now: Millis) {
+        for slot in [&mut self.session, &mut self.previous, &mut self.next] {
+            if slot.as_ref().is_some_and(|s| s.is_expired(now)) {
+                *slot = None;
+            }
+        }
+    }
+
     /// Whether a run that gave up should be started again.
     ///
     /// See [`RETRY_WHEN_GONE`]. Measured from the last attempt rather than from
@@ -429,11 +448,16 @@ impl PeerState {
             //
             // The time half is the tunnel's, so it can be jittered; the
             // message-count half stays where the counter lives.
+            // Paced by `waited` like every other path here. It was not, and
+            // the deadline that makes a rekey due never stops being past -- so
+            // a peer that did not answer was handshaked at on every tick, four
+            // times a second, for as long as it stayed silent.
             Some(s) => {
-                (s.is_initiator()
-                    && (now >= self.rekey_at
-                        || s.sent() >= paqetz_core::noise::REKEY_AFTER_MESSAGES))
-                    || (self.presumed_dead(now) && waited)
+                waited
+                    && (s.is_initiator()
+                        && (now >= self.rekey_at
+                            || s.sent() >= paqetz_core::noise::REKEY_AFTER_MESSAGES)
+                        || self.presumed_dead(now))
             }
         }
     }
@@ -1826,6 +1850,9 @@ impl Tunnel {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
+        // Before deciding: a session too old to seal under is not a session.
+        state.retire_expired(now);
+
         if !state.wants_handshake(now) {
             return Ok(());
         }
@@ -2102,6 +2129,62 @@ mod tests {
             !s.exhausted(REKEY_ATTEMPT_TIME * 100),
             "traffic is what says the tunnel is wanted"
         );
+    }
+
+    #[test]
+    fn a_rekey_that_goes_unanswered_is_paced_like_everything_else() {
+        // The deadline that makes a rekey due never stops being past, so
+        // without pacing a silent peer was handshaked at on every tick -- four
+        // times a second, for as long as it stayed silent.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (session, _) = session_pair(&client, &server, 200);
+
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
+        s.install(session);
+        s.rekey_at = 1_000;
+        s.retry_at = 0;
+
+        assert!(
+            s.wants_handshake(1_000),
+            "due, and nothing has been sent yet"
+        );
+        // What `maybe_handshake` records when it sends one.
+        s.retry_at = 1_000 + REKEY_TIMEOUT;
+        assert!(
+            !s.wants_handshake(1_001),
+            "and not again on the very next tick"
+        );
+        assert!(!s.wants_handshake(1_000 + REKEY_TIMEOUT - 1));
+        assert!(
+            s.wants_handshake(1_000 + REKEY_TIMEOUT),
+            "and again once the interval has passed"
+        );
+    }
+
+    #[test]
+    fn a_session_too_old_to_seal_under_is_let_go() {
+        // Keeping one means every outbound packet fails and is counted as a
+        // drop, for keys that will never work again -- a transmit-dropped
+        // counter climbing by thousands while transmit stands still.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (a, _) = session_pair(&client, &server, 210);
+        let (b, _) = session_pair(&client, &server, 220);
+
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
+        s.install(a);
+        s.accept(b);
+
+        let alive = paqetz_core::noise::REJECT_AFTER_TIME - 1;
+        s.retire_expired(alive);
+        assert!(s.session.is_some(), "still usable");
+        assert!(s.next.is_some());
+
+        s.retire_expired(paqetz_core::noise::REJECT_AFTER_TIME);
+        assert!(s.session.is_none(), "expired, so no longer a session");
+        assert!(s.previous.is_none());
+        assert!(s.next.is_none());
     }
 
     #[test]
