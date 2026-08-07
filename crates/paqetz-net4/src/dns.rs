@@ -523,6 +523,39 @@ mod tests {
         assert!(!truncated(&[]));
     }
 
+    /// Whether an error means there was nowhere to send a query, rather than
+    /// that sending one went wrong.
+    ///
+    /// `scripts/test-privileged.sh` runs the ignored tests inside a throwaway
+    /// network namespace with no path off the host, where a resolver test
+    /// measures the sandbox rather than the resolver. Anything else — refused,
+    /// timed out, malformed, not permitted — is a real result and must fail.
+    fn no_route(e: &io::Error) -> bool {
+        matches!(
+            e.kind(),
+            io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
+        )
+    }
+
+    #[test]
+    fn only_having_nowhere_to_ask_is_a_reason_to_skip() {
+        assert!(no_route(&io::Error::from(
+            io::ErrorKind::NetworkUnreachable
+        )));
+        assert!(no_route(&io::Error::from(io::ErrorKind::HostUnreachable)));
+        // Everything else is a result the test below exists to catch, and
+        // skipping on it would turn a broken resolver into a green run.
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert!(!no_route(&io::Error::from(kind)), "{kind:?} was skipped");
+        }
+    }
+
     /// Everything above is synthetic. This one talks to a real resolver, so it
     /// is ignored by default: `cargo test -- --ignored --nocapture dns::tests::real`.
     #[test]
@@ -534,9 +567,14 @@ mod tests {
             device: None,
         };
 
-        let addrs = r
-            .lookup("one.one.one.one", 443)
-            .expect("a name that resolves");
+        let addrs = match r.lookup("one.one.one.one", 443) {
+            Ok(addrs) => addrs,
+            Err(e) if no_route(&e) => {
+                eprintln!("skipped: no route to a resolver ({e})");
+                return;
+            }
+            Err(e) => panic!("a name that resolves: {e}"),
+        };
         assert!(
             addrs.iter().any(|a| a.ip() == Ipv4Addr::new(1, 1, 1, 1)),
             "got {addrs:?}"
