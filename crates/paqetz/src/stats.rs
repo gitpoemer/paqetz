@@ -117,9 +117,14 @@ impl Stats {
     pub(crate) fn line(&self, now_ms: u64, ring_drops: Option<u32>) -> String {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
 
+        // How many have gone out, beside when one last completed. Without the
+        // first, "handshake never | tx 0 pkt" reads the same whether this end
+        // is sending into a hole or not sending at all -- and telling those
+        // apart needed a packet capture, every time.
+        let sent = get(&self.handshakes_sent);
         let handshake = match get(&self.last_handshake_ms) {
-            0 => "never".to_owned(),
-            at => format!("{}s ago", (now_ms.saturating_sub(at)) / 1000),
+            0 => format!("never, {sent} sent"),
+            at => format!("{}s ago, {sent} sent", (now_ms.saturating_sub(at)) / 1000),
         };
 
         let mut line = format!(
@@ -203,6 +208,27 @@ fn duration(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_line_says_how_many_handshakes_went_out() {
+        // The signal that was missing. "handshake never | tx 0 pkt" reads the
+        // same whether this end is sending into a hole or has stopped sending,
+        // and only one of those is a bug here -- telling them apart took a
+        // packet capture every time.
+        let s = super::Stats::default();
+        assert!(s.line(1_000, None).contains("handshake never, 0 sent"));
+
+        super::Stats::add(&s.handshakes_sent, 84);
+        let trying = s.line(1_000, None);
+        assert!(
+            trying.contains("handshake never, 84 sent"),
+            "eighty-four attempts and nothing completed:\n{trying}"
+        );
+
+        s.note_handshake(5_000);
+        let settled = s.line(65_000, None);
+        assert!(settled.contains("handshake 60s ago, 84 sent"), "{settled}");
+    }
+
     #[test]
     fn a_correction_cannot_wrap_a_counter() {
         // A short batch takes back what was counted when the packets were
