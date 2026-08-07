@@ -237,22 +237,51 @@ pub(crate) fn install_unit(name: &str, contents: &str, enable: bool) -> io::Resu
 /// Prints why a unit would not start.
 fn report_unit_failure(name: &str) {
     let Ok(out) = Command::new("journalctl")
-        .args(["-u", name, "-n", "15", "--no-pager", "-o", "cat"])
+        .args(["-u", name, "-n", "40", "--no-pager", "-o", "cat"])
         .output()
     else {
         return;
     };
     let log = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.is_empty() {
+    let chosen = failing_lines(&lines);
+    if chosen.is_empty() {
         return;
     }
     println!();
     println!("  {name} would not start. Its own last words:");
-    for line in lines.iter().rev().take(6).rev() {
+    for line in chosen {
         println!("    {line}");
     }
     println!();
+}
+
+/// Picks the lines from a unit's log that say what went wrong.
+///
+/// The last few lines are the wrong ones. A start-up that ends in a check
+/// failing prints a dozen passing checks after the one that failed, so the tail
+/// carries the summary -- "1 problem will stop the tunnel working" -- and not the
+/// problem. What is wanted is the lines that name it, wherever they sit.
+fn failing_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    let names_a_failure = |l: &str| {
+        let l = l.trim_start();
+        l.contains("[FAIL]")
+            || l.contains("[warn]")
+            || l.starts_with("error")
+            || l.starts_with("└─")
+    };
+    let named: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| names_a_failure(l))
+        .collect();
+    if named.is_empty() {
+        // Nothing announced itself, so the tail is the best guess left.
+        return lines.iter().rev().take(6).rev().copied().collect();
+    }
+    // Capped, because a unit that has been restarting for an hour has the same
+    // failure in the log many times over and one telling is enough.
+    named.into_iter().rev().take(8).rev().collect()
 }
 
 /// Stops and removes a unit.
@@ -346,6 +375,55 @@ pub(crate) fn install_binary(prefix: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_lines_that_name_the_failure_are_the_ones_shown() {
+        // The tail is the wrong choice: a start-up that ends in a failed check
+        // prints every passing check after the one that failed, so the last
+        // lines carry the summary and not the cause. This is what the field
+        // saw -- "1 problem(s) will stop the tunnel working" and no problem.
+        let log = vec![
+            "[ ok ] configuration          parses",
+            "[FAIL] capabilities            CAP_NET_ADMIN is not held",
+            "       └─ grant it, or run as root",
+            "[ ok ] TUN driver             present",
+            "[ ok ] default route          via eth0",
+            "[ ok ] inner addresses        10.7.0.3 ↔ 10.7.0.1",
+            "1 problem(s) will stop the tunnel working.",
+            "error: the host is not ready; see the failures above",
+        ];
+        let shown = super::failing_lines(&log);
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.contains("CAP_NET_ADMIN is not held")),
+            "the cause was left out: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|l| l.contains("grant it")),
+            "the remedy was left out: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|l| l.contains("[ ok ]")),
+            "passing checks are noise here: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_log_that_announces_nothing_falls_back_to_its_tail() {
+        let log = vec!["starting", "reading config", "bind: address in use"];
+        let shown = super::failing_lines(&log);
+        assert!(
+            shown.iter().any(|l| l.contains("address in use")),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_unit_that_has_been_failing_for_an_hour_is_not_quoted_in_full() {
+        let log: Vec<&str> = std::iter::repeat_n("[FAIL] capabilities  not held", 60).collect();
+        assert!(super::failing_lines(&log).len() <= 8);
+    }
+
     #[test]
     fn the_systemd_version_is_read_from_its_first_line() {
         assert_eq!(

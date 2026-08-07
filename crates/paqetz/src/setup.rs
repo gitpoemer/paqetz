@@ -355,13 +355,27 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
                 let contents = std::fs::read_to_string(&source)?;
                 crate::service::write_file(std::path::Path::new(config), &contents, 0o600)?;
                 println!("    wrote {config}");
-                crate::service::install_unit(
+                // Reported, not propagated. A service that will not start is
+                // a thing to fix afterwards -- the unit and the configuration
+                // are both written by now -- and abandoning the rest of setup
+                // over it leaves the host half-configured, which is a worse
+                // place to be than configured with one service down.
+                match crate::service::install_unit(
                     "paqetz",
                     &crate::service::tunnel_unit(&binary, config),
                     true,
-                )?;
-                println!("\n   Check it with: systemctl status paqetz");
-                println!("   Follow it with: journalctl -u paqetz -f");
+                ) {
+                    Ok(()) => {
+                        println!("\n   Check it with: systemctl status paqetz");
+                        println!("   Follow it with: journalctl -u paqetz -f");
+                    }
+                    Err(e) => {
+                        println!("\n   The service is installed but did not start: {e}");
+                        println!("   `paqetz doctor -c {config}` says what it is unhappy about.");
+                        println!("   Fix that, then: systemctl start paqetz");
+                        println!("\n   Carrying on with the rest of the setup.");
+                    }
+                }
             }
         } else {
             println!("\n5. No systemd on this host, so nothing to install.");
