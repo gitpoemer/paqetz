@@ -703,6 +703,22 @@ impl Config {
                 {
                     return Err(clash("mark", x.to_string()));
                 }
+                // The key is the identity. Two tunnels for one peer have
+                // nothing to tell their traffic apart by, so each handshake
+                // would take the session and the endpoint from the other and
+                // the two would trade them every fifteen seconds -- which looks
+                // like a flapping link and is a configuration error.
+                if a.peer.public_key == b.peer.public_key {
+                    return Err(clash("peer key", a.peer.public_key.to_string()));
+                }
+                // Zero is "pick one at start-up", and two tunnels both doing
+                // that will pick differently. Only a port written down twice
+                // is a clash.
+                if a.interface.listen_port != 0
+                    && a.interface.listen_port == b.interface.listen_port
+                {
+                    return Err(clash("outer port", a.interface.listen_port.to_string()));
+                }
             }
         }
         Ok(())
@@ -1179,7 +1195,7 @@ device = "paqetz1"
 mtu = 1280
 route_marked = 82
 [tunnel.peer]
-public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+public_key = "TmwuUmwHVDe4Q0z0PmVEZ0wYyBIDN0kUq5xkQzk0T3E="
 endpoint = "198.51.100.7:8443"
 tunnel_address = "10.8.0.1"
 
@@ -1191,7 +1207,7 @@ address = "10.9.0.2/24"
 device = "paqetz2"
 route_marked = 83
 [tunnel.peer]
-public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+public_key = "V3hLZ0FQdG9wbFJlYzBuZFNlcnZlckszeUZvclRlc3Q="
 endpoint = "192.0.2.9:8443"
 tunnel_address = "10.9.0.1"
 "#;
@@ -1202,7 +1218,7 @@ private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
 address = "10.7.0.2/24"
 
 [peer]
-public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+public_key = "SGVsbG9UaGlyZFNlcnZlcktleUZvclRlc3RzT25seTA="
 endpoint = "203.0.113.5:9999"
 tunnel_address = "10.7.0.1"
 "#;
@@ -1214,9 +1230,46 @@ address = "10.7.0.1/24"
 listen_port = 9999
 
 [peer]
-public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+public_key = "Rm91cnRoU2VydmVyS2V5VXNlZE9ubHlJblRoZXNlVGU="
 tunnel_address = "10.7.0.2"
 "#;
+
+    #[test]
+    fn two_tunnels_cannot_share_one_peer() {
+        // The key is the identity. Two tunnels for one peer have nothing to
+        // tell their traffic apart by: each handshake takes the session and the
+        // endpoint from the other, and the two trade them every fifteen
+        // seconds. That looks like a flapping link and is a configuration
+        // error, so it is refused rather than left to be diagnosed.
+        let same_peer = THREE.replace(
+            "public_key = \"TmwuUmwHVDe4Q0z0PmVEZ0wYyBIDN0kUq5xkQzk0T3E=\"",
+            "public_key = \"Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo=\"",
+        );
+        let e = Config::parse(&same_peer).expect_err("two tunnels, one peer");
+        assert!(e.to_string().contains("peer key"), "{e}");
+    }
+
+    #[test]
+    fn two_tunnels_cannot_share_a_written_down_port() {
+        let same_port = THREE.replace(
+            "[tunnel.interface]",
+            "[tunnel.interface]\nlisten_port = 8443",
+        );
+        let e = Config::parse(&same_port).expect_err("two tunnels, one port");
+        assert!(e.to_string().contains("outer port"), "{e}");
+    }
+
+    #[test]
+    fn tunnels_that_both_choose_a_port_at_start_up_do_not_clash() {
+        // Zero is "pick one when you start", and two tunnels doing that will
+        // pick differently. Refusing it would refuse the ordinary client.
+        let c = Config::parse(THREE).expect("parses");
+        assert!(
+            c.tunnels.iter().all(|t| t.interface.listen_port == 0),
+            "the fixture is meant to leave the port unset"
+        );
+        assert_eq!(c.tunnels.len(), 3);
+    }
 
     #[test]
     fn several_tunnels_are_read_in_order() {
