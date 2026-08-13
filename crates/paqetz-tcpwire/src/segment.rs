@@ -154,17 +154,17 @@ pub const MAX_OVERHEAD: usize = IPV4_LEN + TCP_LEN + SYN_OPTS_TS;
 /// Exists so header construction never indexes a slice directly: every field
 /// write is checked once, at the point it happens, and a short buffer surfaces
 /// as an error rather than a panic.
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     buf: &'a mut [u8],
-    pos: usize,
+    pub(crate) pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    const fn new(buf: &'a mut [u8]) -> Self {
+    pub(crate) const fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn put(&mut self, bytes: &[u8]) -> Result<()> {
         let end = self.pos + bytes.len();
         let have = self.buf.len();
         let slot = self
@@ -176,11 +176,11 @@ impl<'a> Cursor<'a> {
         Ok(())
     }
 
-    fn u8(&mut self, v: u8) -> Result<()> {
+    pub(crate) fn u8(&mut self, v: u8) -> Result<()> {
         self.put(&[v])
     }
 
-    fn u16(&mut self, v: u16) -> Result<()> {
+    pub(crate) fn u16(&mut self, v: u16) -> Result<()> {
         self.put(&v.to_be_bytes())
     }
 
@@ -319,7 +319,7 @@ fn write_options(c: &mut Cursor<'_>, kind: Kind, profile: &OsProfile, f: &Fields
     Ok(())
 }
 
-fn write_at(buf: &mut [u8], offset: usize, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_at(buf: &mut [u8], offset: usize, bytes: &[u8]) -> Result<()> {
     let end = offset + bytes.len();
     let have = buf.len();
     buf.get_mut(offset..end)

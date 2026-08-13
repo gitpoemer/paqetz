@@ -796,7 +796,7 @@ impl Tunnel {
 
         let rx = os(
             format!("opening a capture socket on {interface}"),
-            PacketRx::open(&interface, &ports),
+            PacketRx::open(&interface, paqetz_dp::bpf::Match::Ports(&ports)),
         )?;
         let _ = rx.set_recv_buffer(8 * 1024 * 1024);
 

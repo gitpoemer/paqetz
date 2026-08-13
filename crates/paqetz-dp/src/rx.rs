@@ -49,19 +49,20 @@ pub struct PacketRx {
 }
 
 impl PacketRx {
-    /// Opens a capture socket bound to one interface, filtered to these ports.
+    /// Opens a capture socket bound to one interface, filtered to `what`.
     ///
-    /// Several because the carrier rotates between them while it runs. The
-    /// filter covers the whole set from the start, so rotation needs neither a
-    /// new socket nor a new filter — which matters because the thread reading
-    /// this one is blocked in `recv` and cannot be handed either.
+    /// A port set for the fake-TCP carrier, which rotates between them while it
+    /// runs: the filter covers the whole set from the start, so rotation needs
+    /// neither a new socket nor a new filter — which matters because the thread
+    /// reading this one is blocked in `recv` and cannot be handed either. A bare
+    /// protocol number for a carrier that has no ports.
     ///
     /// Requires `CAP_NET_RAW`.
     ///
     /// # Errors
     /// Returns the underlying OS error, with a clearer message when the failure
     /// is simply a lack of privilege.
-    pub fn open(interface: &str, ports: &[u16]) -> io::Result<Self> {
+    pub fn open(interface: &str, what: bpf::Match<'_>) -> io::Result<Self> {
         let ifindex = sys::if_nametoindex(interface)?;
 
         // ETH_P_ALL would also deliver non-IP frames, which the filter would
@@ -74,7 +75,7 @@ impl PacketRx {
         // Attach the filter *before* binding. Between bind and attach a socket
         // is unfiltered, so frames matching nothing can queue up and be
         // delivered later; attaching first closes that window.
-        let program = bpf::program(ports);
+        let program = bpf::program(what);
         let prog = SockFprog {
             len: libc::c_ushort::try_from(program.len())
                 .map_err(|_| io::Error::other("filter program is implausibly long"))?,
@@ -205,7 +206,7 @@ mod tests {
     fn a_missing_interface_fails_before_the_socket_is_opened() {
         // The interface lookup runs first, so this fails the same way whether
         // or not we are privileged.
-        assert!(PacketRx::open("definitely-not-real", &[9999]).is_err());
+        assert!(PacketRx::open("definitely-not-real", bpf::Match::Ports(&[9999])).is_err());
     }
 
     #[test]
@@ -220,7 +221,7 @@ mod tests {
     #[test]
     #[ignore = "opens a raw socket; run with --ignored in a throwaway namespace"]
     fn a_socket_can_be_opened_on_loopback() {
-        let rx = PacketRx::open("lo", &[9999]).expect("open");
+        let rx = PacketRx::open("lo", bpf::Match::Ports(&[9999])).expect("open");
         rx.set_recv_buffer(4 * 1024 * 1024).expect("set buffer");
         assert_eq!(rx.drops().expect("drops"), 0);
     }

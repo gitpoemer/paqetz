@@ -52,17 +52,48 @@ const ICMP_FRAGMENTATION_NEEDED: u32 = 0x0304;
 /// Snapshot length returned for an accepted packet: the whole frame.
 const ACCEPT: u32 = 262_144;
 
+/// The path-MTU tail: read a report and drop everything else.
+///
+/// Placed after the carrier's own `accept` and `drop`, because classic BPF
+/// jumps only forward and so nothing down here can reach them.
+const MTU_TAIL_LEN: usize = 8;
+
 /// Instructions before and after the port comparisons.
 ///
 /// Eight of preamble, then one comparison per port, then accept and drop --
-/// and then the eight of the path-MTU tail, which sits after them because
-/// classic BPF only jumps forward and so cannot share their `accept`.
-const FIXED_LEN: usize = 18;
+/// and then the path-MTU tail.
+const FIXED_LEN: usize = 10 + MTU_TAIL_LEN;
 
-/// How many instructions the program for `ports` will be.
+/// Instructions in a program matching one IP protocol rather than a port set.
+///
+/// Six of preamble, accept and drop, then the same tail. No ports to compare
+/// and no header to reach into: the protocol number in the IPv4 header is the
+/// whole test.
+const PROTOCOL_LEN: usize = 8 + MTU_TAIL_LEN;
+
+/// What the capture socket should accept, beside path-MTU reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Match<'a> {
+    /// TCP addressed to any of these ports.
+    ///
+    /// Several because the fake-TCP carrier rotates between them while it runs.
+    Ports(&'a [u16]),
+    /// This IP protocol, whatever it carries.
+    ///
+    /// For a carrier with no ports -- GRE and the raw-IP shapes -- where the
+    /// protocol number is the only thing in the outer header that distinguishes
+    /// the tunnel's traffic. Everything it lets through is checked again above:
+    /// the peer's address, and then the AEAD.
+    Protocol(u8),
+}
+
+/// How many instructions the program for `what` will be.
 #[must_use]
-pub const fn program_len(ports: usize) -> usize {
-    FIXED_LEN + ports
+pub const fn program_len(what: Match<'_>) -> usize {
+    match what {
+        Match::Ports(ports) => FIXED_LEN + ports.len(),
+        Match::Protocol(_) => PROTOCOL_LEN,
+    }
 }
 
 /// Builds the filter program for this end's local ports.
@@ -111,7 +142,63 @@ pub const fn program_len(ports: usize) -> usize {
 /// TCP header, so without it the port comparison would read whatever payload
 /// bytes happened to sit at that offset.
 #[must_use]
-pub fn program(ports: &[u16]) -> Vec<Insn> {
+pub fn program(what: Match<'_>) -> Vec<Insn> {
+    match what {
+        Match::Ports(ports) => ports_program(ports),
+        Match::Protocol(proto) => protocol_program(proto),
+    }
+}
+
+/// A program accepting one IP protocol outright.
+///
+/// ```text
+///   ldh  [12]
+///   jeq  #0x0800      jf fail
+///   ldb  [23]
+///   jeq  #proto       jf icmp
+///   ldh  [20]
+///   jset #0x1fff      jt fail ; must not be a later fragment
+///   ret  #262144
+/// fail:
+///   ret  #0
+/// icmp:                       ; the same tail as above
+/// ```
+///
+/// No port comparison, because there is no port: for GRE the outer header ends
+/// at the protocol number, and everything that identifies the flow is either
+/// the peer's address -- checked in userspace, so that roaming still works --
+/// or inside the AEAD.
+fn protocol_program(proto: u8) -> Vec<Insn> {
+    let mut prog = Vec::with_capacity(PROTOCOL_LEN);
+    prog.push(insn(LD_H_ABS, 0, 0, 12));
+    prog.push(insn(JEQ_K, 0, 5, ETHERTYPE_IPV4));
+    prog.push(insn(LD_B_ABS, 0, 0, 23));
+    prog.push(insn(JEQ_K, 0, 4, u32::from(proto)));
+    prog.push(insn(LD_H_ABS, 0, 0, 20));
+    prog.push(insn(JSET_K, 1, 0, FRAGMENT_OFFSET_MASK));
+    prog.push(insn(RET_K, 0, 0, ACCEPT));
+    prog.push(insn(RET_K, 0, 0, 0));
+    push_mtu_tail(&mut prog);
+    prog
+}
+
+/// The eight instructions that let a path-MTU report through.
+///
+/// Reached with the accumulator still holding the IP protocol, from a jump
+/// taken when it was not the carrier's.
+fn push_mtu_tail(prog: &mut Vec<Insn>) {
+    prog.push(insn(JEQ_K, 0, 6, PROTO_ICMP));
+    prog.push(insn(LD_H_ABS, 0, 0, 20));
+    prog.push(insn(JSET_K, 4, 0, FRAGMENT_OFFSET_MASK));
+    prog.push(insn(LDX_B_MSH, 0, 0, 14));
+    prog.push(insn(LD_H_IND, 0, 0, 14));
+    prog.push(insn(JEQ_K, 0, 1, ICMP_FRAGMENTATION_NEEDED));
+    prog.push(insn(RET_K, 0, 0, ACCEPT));
+    prog.push(insn(RET_K, 0, 0, 0));
+}
+
+/// A program accepting TCP on any of a set of destination ports.
+fn ports_program(ports: &[u16]) -> Vec<Insn> {
     let n = ports.len();
     // Jump offsets are relative to the instruction *after* the jump. `accept`
     // sits at index 8 + n and `fail` at 9 + n, so a jump to `fail` from index i
@@ -120,7 +207,7 @@ pub fn program(ports: &[u16]) -> Vec<Insn> {
     // The path-MTU tail begins just past `fail`, at 10 + n.
     let to_icmp = |i: usize| u8::try_from(10 + n - i - 1).unwrap_or(u8::MAX);
 
-    let mut prog = Vec::with_capacity(program_len(n));
+    let mut prog = Vec::with_capacity(FIXED_LEN + n);
     prog.push(insn(LD_H_ABS, 0, 0, 12));
     prog.push(insn(JEQ_K, 0, to_fail(1), ETHERTYPE_IPV4));
     prog.push(insn(LD_B_ABS, 0, 0, 23));
@@ -144,21 +231,14 @@ pub fn program(ports: &[u16]) -> Vec<Insn> {
     prog.push(insn(RET_K, 0, 0, ACCEPT));
     prog.push(insn(RET_K, 0, 0, 0));
 
-    // A holds the IP protocol still: nothing between the jump here and the
-    // comparison above it touched the accumulator.
+    // The accumulator still holds the IP protocol: nothing between the jump
+    // here and the comparison above it touched it.
     //
-    // Anything this accepts is checked again in userspace, where the quoted
+    // Anything the tail accepts is checked again in userspace, where the quoted
     // packet is compared against what this end actually sent. The filter's job
     // is only to stop the capture thread from being handed every ICMP message
     // on the interface.
-    prog.push(insn(JEQ_K, 0, 6, PROTO_ICMP));
-    prog.push(insn(LD_H_ABS, 0, 0, 20));
-    prog.push(insn(JSET_K, 4, 0, FRAGMENT_OFFSET_MASK));
-    prog.push(insn(LDX_B_MSH, 0, 0, 14));
-    prog.push(insn(LD_H_IND, 0, 0, 14));
-    prog.push(insn(JEQ_K, 0, 1, ICMP_FRAGMENTATION_NEEDED));
-    prog.push(insn(RET_K, 0, 0, ACCEPT));
-    prog.push(insn(RET_K, 0, 0, 0));
+    push_mtu_tail(&mut prog);
     prog
 }
 
@@ -245,12 +325,76 @@ mod tests {
     }
 
     #[test]
+    fn a_protocol_program_accepts_that_protocol_and_no_other() {
+        // GRE has no ports, so the protocol number in the IPv4 header is the
+        // whole outer test. Everything past it -- which peer, which session --
+        // is checked above, where roaming can still move the address.
+        let prog = program(Match::Protocol(47));
+        assert_eq!(prog.len(), program_len(Match::Protocol(47)));
+        assert_eq!(run(&prog, &frame(0x0800, 47, 0x4000, 0, 5)), ACCEPT);
+        // Options in the header do not move the protocol byte, so a program
+        // with no port to reach for does not care about them.
+        assert_eq!(run(&prog, &frame(0x0800, 47, 0x4000, 0, 9)), ACCEPT);
+
+        for proto in [6u8, 4, 17, 58, 143, 0] {
+            assert_eq!(
+                run(&prog, &frame(0x0800, proto, 0x4000, 9999, 5)),
+                0,
+                "protocol {proto} is not this carrier's"
+            );
+        }
+        assert_eq!(run(&prog, &frame(0x86DD, 47, 0x4000, 0, 5)), 0, "not IPv4");
+    }
+
+    #[test]
+    fn a_protocol_program_still_reads_path_mtu_reports() {
+        // The whole reason the tail is a shared helper: a carrier with 24 bytes
+        // of outer header instead of fifty-odd changes the MTU, and getting
+        // that wrong would be silent without these.
+        let prog = program(Match::Protocol(47));
+        assert_eq!(run(&prog, &icmp(3, 4, 0x4000, 5)), ACCEPT);
+        assert_eq!(run(&prog, &icmp(8, 0, 0x4000, 5)), 0);
+        assert_eq!(run(&prog, &icmp(3, 4, 0x0001, 5)), 0, "a later fragment");
+    }
+
+    #[test]
+    fn a_protocol_programs_fragments_are_refused() {
+        let prog = program(Match::Protocol(47));
+        for offset in [0x0001, 0x0100, 0x1FFF] {
+            assert_eq!(
+                run(&prog, &frame(0x0800, 47, offset, 0, 5)),
+                0,
+                "offset {offset:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_jump_in_a_protocol_program_lands_inside_it() {
+        // Its offsets are written out by hand rather than computed, so nothing
+        // else would catch an off-by-one -- and the failure would be a filter
+        // that silently drops everything.
+        for proto in [1u8, 4, 6, 47, 58, 143, 255] {
+            let prog = program(Match::Protocol(proto));
+            for (i, ins) in prog.iter().enumerate() {
+                for off in [ins.jt, ins.jf] {
+                    let dest = i + 1 + usize::from(off);
+                    assert!(
+                        dest <= prog.len(),
+                        "proto {proto}: instruction {i} jumps out"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_path_mtu_report_reaches_userspace() {
         // Without this the tunnel cannot learn that the path shrank: the
         // packets simply stop arriving, and every counter looks the same as it
         // does when something is dropping them for any other reason. The
         // report is the only notice the network gives.
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         assert_eq!(run(&prog, &icmp(3, 4, 0x4000, 5)), ACCEPT);
         // Options in the way move the ICMP header, and the filter reads its
         // offset from the IHL rather than assuming twenty bytes.
@@ -261,7 +405,7 @@ mod tests {
     fn other_icmp_stays_in_the_kernel() {
         // Every ping on the interface would otherwise wake the capture thread
         // for nothing, and a host that is pinged is a host doing normal work.
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         for (kind, code) in [(8u8, 0u8), (0, 0), (3, 0), (3, 3), (11, 0), (5, 1)] {
             assert_eq!(
                 run(&prog, &icmp(kind, code, 0x4000, 5)),
@@ -276,7 +420,7 @@ mod tests {
         // The type and code live in the first fragment; a later one has the
         // payload at that offset instead, and would be read as whichever
         // message those bytes happen to spell.
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         for offset in [0x0001, 0x0100, 0x1FFF] {
             assert_eq!(run(&prog, &icmp(3, 4, offset, 5)), 0, "offset {offset:#x}");
         }
@@ -297,7 +441,7 @@ mod tests {
     fn protocols_that_are_neither_tcp_nor_icmp_are_still_dropped() {
         // The TCP miss now falls through to the ICMP tail rather than straight
         // to `fail`, so everything else has to be refused there instead.
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         for proto in [17u8, 47, 58, 143, 0] {
             assert_eq!(
                 run(&prog, &frame(0x0800, proto, 0x4000, 9999, 5)),
@@ -309,13 +453,13 @@ mod tests {
 
     #[test]
     fn accepts_our_traffic() {
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         assert_eq!(run(&prog, &good(9999)), ACCEPT);
     }
 
     #[test]
     fn rejects_another_port() {
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         assert_eq!(run(&prog, &good(9998)), 0);
         assert_eq!(run(&prog, &good(443)), 0);
         assert_eq!(run(&prog, &good(0)), 0);
@@ -323,7 +467,7 @@ mod tests {
 
     #[test]
     fn rejects_non_ipv4() {
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         assert_eq!(run(&prog, &frame(0x86DD, 6, 0, 9999, 5)), 0, "IPv6");
         assert_eq!(run(&prog, &frame(0x0806, 6, 0, 9999, 5)), 0, "ARP");
         assert_eq!(run(&prog, &frame(0x8100, 6, 0, 9999, 5)), 0, "VLAN");
@@ -331,14 +475,14 @@ mod tests {
 
     #[test]
     fn rejects_non_tcp() {
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         assert_eq!(run(&prog, &frame(0x0800, 17, 0, 9999, 5)), 0, "UDP");
         assert_eq!(run(&prog, &frame(0x0800, 1, 0, 9999, 5)), 0, "ICMP");
     }
 
     #[test]
     fn rejects_later_fragments() {
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         // A non-zero fragment offset means there is no TCP header here at all;
         // without this check the port comparison would read payload bytes.
         for frag in [0x0001u16, 0x00FF, 0x1FFF, 0x2001] {
@@ -358,7 +502,7 @@ mod tests {
     fn finds_the_port_past_ipv4_options() {
         // The port offset is computed from IHL rather than assumed, so a header
         // carrying options still parses.
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         for ihl in [5u8, 6, 8, 15] {
             assert_eq!(
                 run(&prog, &frame(0x0800, 6, 0, 9999, ihl)),
@@ -375,7 +519,7 @@ mod tests {
         // dropped rather than read past.
         const LAST_BYTE_EXAMINED: usize = 14 + 20 + 4;
 
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         let full = good(9999);
         for len in 0..LAST_BYTE_EXAMINED {
             assert_eq!(run(&prog, &full[..len]), 0, "truncated to {len}");
@@ -394,7 +538,7 @@ mod tests {
         // them has to reach us -- including the one we are about to move to, and
         // the one we have just left, which is still carrying replies.
         let ports = [61001u16, 61002, 61003, 61004];
-        let prog = program(&ports);
+        let prog = program(Match::Ports(&ports));
         for p in ports {
             assert_eq!(
                 run(&prog, &frame(0x0800, 6, 0, p, 5)),
@@ -418,7 +562,7 @@ mod tests {
         // in use went unexercised. Run every port of a full-sized pool through
         // the interpreter, and one either side of it.
         let ports: Vec<u16> = (0..20u16).map(|i| 61_000 + i * 7).collect();
-        let prog = program(&ports);
+        let prog = program(Match::Ports(&ports));
         for p in &ports {
             assert_eq!(
                 run(&prog, &frame(0x0800, 6, 0, *p, 5)),
@@ -437,8 +581,8 @@ mod tests {
 
     #[test]
     fn one_port_still_produces_what_it_always_did() {
-        let prog = program(&[9999]);
-        assert_eq!(prog.len(), program_len(1));
+        let prog = program(Match::Ports(&[9999]));
+        assert_eq!(prog.len(), program_len(Match::Ports(&[0u16; 1])));
         assert_eq!(
             prog.len(),
             19,
@@ -452,7 +596,10 @@ mod tests {
             let ports: Vec<u16> = (0..n)
                 .map(|i| 61_000 + u16::try_from(i).expect("small"))
                 .collect();
-            assert_eq!(program(&ports).len(), program_len(n));
+            assert_eq!(
+                program(Match::Ports(&ports)).len(),
+                program_len(Match::Ports(&vec![0u16; n]))
+            );
         }
     }
 
@@ -469,7 +616,7 @@ mod tests {
             let ports: Vec<u16> = (0..n)
                 .map(|i| 61_000 + u16::try_from(i).expect("small"))
                 .collect();
-            let prog = program(&ports);
+            let prog = program(Match::Ports(&ports));
             for (i, ins) in prog.iter().enumerate() {
                 for off in [ins.jt, ins.jf] {
                     let dest = i + 1 + usize::from(off);
@@ -478,7 +625,7 @@ mod tests {
             }
         }
 
-        let prog = program(&[9999]);
+        let prog = program(Match::Ports(&[9999]));
         for (i, insn) in prog.iter().enumerate() {
             if insn.code == JEQ_K || insn.code == JSET_K {
                 for target in [insn.jt, insn.jf] {
@@ -493,7 +640,7 @@ mod tests {
     fn the_program_terminates_on_every_path() {
         // Both terminal instructions must be returns, or a frame could run off
         // the end of the program.
-        let prog = program(&[1]);
+        let prog = program(Match::Ports(&[1]));
         assert_eq!(prog[prog.len() - 1].code, RET_K);
         assert_eq!(prog[prog.len() - 2].code, RET_K);
     }
