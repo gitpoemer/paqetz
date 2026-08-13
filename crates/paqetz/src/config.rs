@@ -426,6 +426,8 @@ struct RawInterface {
     retransmit_asks: Option<u8>,
     retransmit_reorder: Option<u64>,
     #[serde(default)]
+    fragment: Option<String>,
+    #[serde(default)]
     rotate: Option<bool>,
     rotate_after: Option<u64>,
     rotate_jitter: Option<u64>,
@@ -841,6 +843,37 @@ impl Config {
                 return Err(invalid(
                     "interface.transmit",
                     format!("expected \"raw\" or \"afpacket\", got {other:?}"),
+                ));
+            }
+        };
+
+        // Validated and then discarded: there is one behaviour, so nothing
+        // downstream has a choice to make. It is a setting anyway because the
+        // *other* value is one somebody will reach for -- the encapsulation
+        // this borrows from clears Don't Fragment deliberately -- and an
+        // explicit refusal saying why beats an unknown-field error.
+        match iface.fragment.as_deref().unwrap_or("never") {
+            "never" => {}
+            // Accepted as a name so the refusal can say what is missing, rather
+            // than reading as a typo. Clearing Don't Fragment without also
+            // reassembling is worse than not offering it: the path fragments,
+            // the capture socket sees the pieces before the kernel joins them,
+            // the filter passes only the first, and the packet is lost with
+            // nothing anywhere to say so. Don't Fragment at least makes a
+            // router send the report this build now reads.
+            "path" => {
+                return Err(invalid(
+                    "interface.fragment",
+                    "\"path\" needs fragment reassembly in the capture path, which is not \
+                     implemented. Clearing Don't Fragment without it loses every fragmented \
+                     packet silently, because the capture socket sees fragments before the \
+                     kernel reassembles them and the filter passes only the first.",
+                ));
+            }
+            other => {
+                return Err(invalid(
+                    "interface.fragment",
+                    format!("expected \"never\" or \"path\", got {other:?}"),
                 ));
             }
         };
@@ -1262,6 +1295,27 @@ mod tests {
         assert_eq!(on.interface.repeat.capacity, 1200);
         assert_eq!(on.interface.repeat.deadline, 700);
         assert_eq!(on.interface.repeat.asks, 3);
+    }
+
+    #[test]
+    fn asking_the_path_to_fragment_is_refused_with_the_reason() {
+        // Not an unknown field: it is the value somebody will reach for, and
+        // clearing Don't Fragment without reassembly loses every fragmented
+        // packet with nothing anywhere to say so. The message has to explain
+        // that, or the refusal reads as a typo.
+        let err = with_interface("fragment = \"path\"").expect_err("should refuse");
+        let text = err.to_string();
+        assert!(text.contains("reassembly"), "{text}");
+        assert!(
+            text.contains("silently") || text.contains("fragments"),
+            "{text}"
+        );
+
+        assert!(with_interface("fragment = \"never\"").is_ok());
+        assert!(with_interface("fragment = \"sometimes\"").is_err());
+        // And unset is the same as never, which is what the carrier has always
+        // done -- this setting named an existing behaviour, it did not add one.
+        assert!(Config::parse(CLIENT).is_ok());
     }
 
     #[test]

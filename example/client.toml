@@ -58,6 +58,27 @@ tunnel_address = "10.7.0.1"
 # output of `paqetz firewall plan` yourself.
 #manage_firewall = true
 
+# What to do about a hop that cannot carry a full-sized packet.
+#
+#   "never" (default) — set Don't Fragment, refuse fragments, and read the
+#                       ICMP reports that come back. A hop too small to pass a
+#                       packet answers with the MTU it can take; that report is
+#                       counted as `too-big` in the health line and announced
+#                       once with the value to lower `mtu` to. Nothing is
+#                       applied automatically -- the message is unauthenticated,
+#                       and an MTU the network can set is a lever worth being
+#                       slow about.
+#   "path"            — not implemented, and refused rather than accepted.
+#                       Clearing Don't Fragment without also reassembling loses
+#                       every fragmented packet silently: the capture socket
+#                       sees fragments before the kernel joins them, and the
+#                       filter passes only the first.
+#
+# `too-big` appearing in the health line means full-sized packets are being
+# dropped out on the path. It reads as ordinary loss from both ends, which is
+# exactly why it is counted apart -- this one is fixed by lowering `mtu`.
+#fragment = "never"
+
 # --- Moving the outer five-tuple ---
 #
 # On by default, and the initiating side only: the side that waits has to be

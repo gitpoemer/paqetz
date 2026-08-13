@@ -40,16 +40,24 @@ const RET_K: u16 = 0x06;
 const ETHERTYPE_IPV4: u32 = 0x0800;
 /// IP protocol number for TCP.
 const PROTO_TCP: u32 = 6;
+/// IP protocol number for ICMP.
+const PROTO_ICMP: u32 = 1;
 /// Mask selecting the fragment-offset bits of the flags/offset word.
 const FRAGMENT_OFFSET_MASK: u32 = 0x1FFF;
+
+/// ICMP type and code, as one halfword: destination unreachable, fragmentation
+/// needed.
+const ICMP_FRAGMENTATION_NEEDED: u32 = 0x0304;
 
 /// Snapshot length returned for an accepted packet: the whole frame.
 const ACCEPT: u32 = 262_144;
 
 /// Instructions before and after the port comparisons.
 ///
-/// Eight of preamble, then one comparison per port, then accept and drop.
-const FIXED_LEN: usize = 10;
+/// Eight of preamble, then one comparison per port, then accept and drop --
+/// and then the eight of the path-MTU tail, which sits after them because
+/// classic BPF only jumps forward and so cannot share their `accept`.
+const FIXED_LEN: usize = 18;
 
 /// How many instructions the program for `ports` will be.
 #[must_use]
@@ -65,7 +73,7 @@ pub const fn program_len(ports: usize) -> usize {
 ///   ldh  [12]                 ; EtherType
 ///   jeq  #0x0800      jf fail ; must be IPv4
 ///   ldb  [23]                 ; IP protocol
-///   jeq  #6           jf fail ; must be TCP
+///   jeq  #6           jf icmp ; TCP below, anything else may be a PMTU report
 ///   ldh  [20]                 ; flags and fragment offset
 ///   jset #0x1fff      jt fail ; must not be a later fragment
 ///   ldxb 4*([14]&0xf)         ; X := IP header length
@@ -77,7 +85,20 @@ pub const fn program_len(ports: usize) -> usize {
 ///   ret  #262144              ; accept the whole frame
 /// fail:
 ///   ret  #0                   ; drop
+/// icmp:                       ; A still holds the IP protocol
+///   jeq  #1           jf drop ; must be ICMP
+///   ldh  [20]
+///   jset #0x1fff      jt drop ; must not be a later fragment
+///   ldxb 4*([14]&0xf)
+///   ldh  [x + 14]             ; ICMP type and code, as one halfword
+///   jeq  #0x0304      jf drop ; fragmentation needed, and DF was set
+///   ret  #262144
+/// drop:
+///   ret  #0
 /// ```
+///
+/// The tail is duplicated rather than shared because classic BPF jumps only
+/// forward: nothing after `fail` can reach the `accept` above it.
 ///
 /// Several ports because the carrier moves between them while it runs: a flow
 /// that lives for hours accumulates attention somewhere on the path, and
@@ -96,12 +117,17 @@ pub fn program(ports: &[u16]) -> Vec<Insn> {
     // sits at index 8 + n and `fail` at 9 + n, so a jump to `fail` from index i
     // is 9 + n - i - 1.
     let to_fail = |i: usize| u8::try_from(9 + n - i - 1).unwrap_or(u8::MAX);
+    // The path-MTU tail begins just past `fail`, at 10 + n.
+    let to_icmp = |i: usize| u8::try_from(10 + n - i - 1).unwrap_or(u8::MAX);
 
     let mut prog = Vec::with_capacity(program_len(n));
     prog.push(insn(LD_H_ABS, 0, 0, 12));
     prog.push(insn(JEQ_K, 0, to_fail(1), ETHERTYPE_IPV4));
     prog.push(insn(LD_B_ABS, 0, 0, 23));
-    prog.push(insn(JEQ_K, 0, to_fail(3), PROTO_TCP));
+    // Not TCP is not yet a reason to drop: a router reporting that a packet was
+    // too big sends ICMP, and that report is the only notice the tunnel gets
+    // that the path has shrunk under it.
+    prog.push(insn(JEQ_K, 0, to_icmp(3), PROTO_TCP));
     prog.push(insn(LD_H_ABS, 0, 0, 20));
     prog.push(insn(JSET_K, to_fail(5), 0, FRAGMENT_OFFSET_MASK));
     prog.push(insn(LDX_B_MSH, 0, 0, 14));
@@ -115,6 +141,22 @@ pub fn program(ports: &[u16]) -> Vec<Insn> {
         prog.push(insn(JEQ_K, jt, jf, u32::from(*port)));
     }
 
+    prog.push(insn(RET_K, 0, 0, ACCEPT));
+    prog.push(insn(RET_K, 0, 0, 0));
+
+    // A holds the IP protocol still: nothing between the jump here and the
+    // comparison above it touched the accumulator.
+    //
+    // Anything this accepts is checked again in userspace, where the quoted
+    // packet is compared against what this end actually sent. The filter's job
+    // is only to stop the capture thread from being handed every ICMP message
+    // on the interface.
+    prog.push(insn(JEQ_K, 0, 6, PROTO_ICMP));
+    prog.push(insn(LD_H_ABS, 0, 0, 20));
+    prog.push(insn(JSET_K, 4, 0, FRAGMENT_OFFSET_MASK));
+    prog.push(insn(LDX_B_MSH, 0, 0, 14));
+    prog.push(insn(LD_H_IND, 0, 0, 14));
+    prog.push(insn(JEQ_K, 0, 1, ICMP_FRAGMENTATION_NEEDED));
     prog.push(insn(RET_K, 0, 0, ACCEPT));
     prog.push(insn(RET_K, 0, 0, 0));
     prog
@@ -186,6 +228,83 @@ mod tests {
 
     fn good(port: u16) -> Vec<u8> {
         frame(0x0800, 6, 0x4000, port, 5)
+    }
+
+    /// An ICMP message of this type and code, with a plausible body.
+    fn icmp(kind: u8, code: u8, frag: u16, ihl_words: u8) -> Vec<u8> {
+        let ip_header_len = usize::from(ihl_words) * 4;
+        let mut f = vec![0u8; 14 + ip_header_len + 8 + 28];
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14] = 0x40 | ihl_words;
+        f[14 + 6..14 + 8].copy_from_slice(&frag.to_be_bytes());
+        f[14 + 9] = 1;
+        let at = 14 + ip_header_len;
+        f[at] = kind;
+        f[at + 1] = code;
+        f
+    }
+
+    #[test]
+    fn a_path_mtu_report_reaches_userspace() {
+        // Without this the tunnel cannot learn that the path shrank: the
+        // packets simply stop arriving, and every counter looks the same as it
+        // does when something is dropping them for any other reason. The
+        // report is the only notice the network gives.
+        let prog = program(&[9999]);
+        assert_eq!(run(&prog, &icmp(3, 4, 0x4000, 5)), ACCEPT);
+        // Options in the way move the ICMP header, and the filter reads its
+        // offset from the IHL rather than assuming twenty bytes.
+        assert_eq!(run(&prog, &icmp(3, 4, 0x4000, 8)), ACCEPT);
+    }
+
+    #[test]
+    fn other_icmp_stays_in_the_kernel() {
+        // Every ping on the interface would otherwise wake the capture thread
+        // for nothing, and a host that is pinged is a host doing normal work.
+        let prog = program(&[9999]);
+        for (kind, code) in [(8u8, 0u8), (0, 0), (3, 0), (3, 3), (11, 0), (5, 1)] {
+            assert_eq!(
+                run(&prog, &icmp(kind, code, 0x4000, 5)),
+                0,
+                "ICMP {kind}/{code} should not be captured"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_fragment_of_a_report_is_dropped_before_it_is_read() {
+        // The type and code live in the first fragment; a later one has the
+        // payload at that offset instead, and would be read as whichever
+        // message those bytes happen to spell.
+        let prog = program(&[9999]);
+        for offset in [0x0001, 0x0100, 0x1FFF] {
+            assert_eq!(run(&prog, &icmp(3, 4, offset, 5)), 0, "offset {offset:#x}");
+        }
+
+        // More Fragments with a zero offset is a *first* fragment, and this
+        // filter passes it -- exactly as it does on the carrier path, whose
+        // mask is the same. The strict check belongs in userspace, which can
+        // see the whole flags word rather than the offset bits alone, and
+        // `toobig` refuses it there.
+        assert_eq!(
+            run(&prog, &icmp(3, 4, 0x2000, 5)),
+            ACCEPT,
+            "the filter is a coarse pre-check, not the whole test"
+        );
+    }
+
+    #[test]
+    fn protocols_that_are_neither_tcp_nor_icmp_are_still_dropped() {
+        // The TCP miss now falls through to the ICMP tail rather than straight
+        // to `fail`, so everything else has to be refused there instead.
+        let prog = program(&[9999]);
+        for proto in [17u8, 47, 58, 143, 0] {
+            assert_eq!(
+                run(&prog, &frame(0x0800, proto, 0x4000, 9999, 5)),
+                0,
+                "protocol {proto} should not be captured"
+            );
+        }
     }
 
     #[test]
@@ -322,8 +441,8 @@ mod tests {
         assert_eq!(prog.len(), program_len(1));
         assert_eq!(
             prog.len(),
-            11,
-            "the original program was eleven instructions"
+            19,
+            "eleven for the carrier, plus eight for the path-MTU tail"
         );
     }
 

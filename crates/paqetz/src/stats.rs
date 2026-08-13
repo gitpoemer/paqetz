@@ -77,6 +77,14 @@ pub(crate) struct Stats {
     pub(crate) handshakes_done: AtomicU64,
     /// Times the peer's endpoint changed under an authenticated packet.
     pub(crate) roams: AtomicU64,
+    /// Reports from the path that a packet was too large to forward.
+    ///
+    /// Non-zero means the tunnel's MTU is above what some hop will carry, and
+    /// every packet at full size is being dropped out on the path. It looks
+    /// exactly like loss from both ends, which is why it is counted separately
+    /// -- the difference is that this one is fixed by one line of
+    /// configuration rather than by a new provider.
+    pub(crate) too_big: AtomicU64,
     /// Milliseconds of uptime at the last completed handshake.
     pub(crate) last_handshake_ms: AtomicU64,
 }
@@ -147,6 +155,7 @@ impl Stats {
             ("tx-dropped", get(&self.tx_dropped)),
             ("device-full", get(&self.device_full)),
             ("unparsed", get(&self.unparsed)),
+            ("too-big", get(&self.too_big)),
             ("asked", get(&self.asked)),
             ("repeated", get(&self.repeated)),
             ("repaired", get(&self.repaired)),

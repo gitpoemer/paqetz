@@ -342,6 +342,13 @@ struct PeerState {
     confirm_tries: u8,
     /// When the carrier should move to the next port.
     rotate_at: Millis,
+    /// The smallest path MTU a hop has reported, if any has.
+    ///
+    /// Kept so the report is announced when it changes rather than when it
+    /// arrives. A router repeats one for every oversized packet, and the rule
+    /// here is that no per-packet event gets its own line -- otherwise whoever
+    /// is sending them decides how much this process writes.
+    reported_mtu: Option<u16>,
     /// Handshakes sent since the last one that was answered.
     ///
     /// Distinct from `attempt_started`, which offered traffic clears, so it
@@ -381,6 +388,7 @@ impl PeerState {
             confirm_tries: 0,
             last_data_receive: None,
             rotate_at: Millis::MAX,
+            reported_mtu: None,
             unanswered: 0,
         }
     }
@@ -1386,6 +1394,10 @@ impl Tunnel {
                     continue;
                 };
                 let Some(seg) = segment::parse_ethernet(bytes) else {
+                    // Counted here as well as on the unbatched path. It was
+                    // not, so which datapath was in use decided whether an
+                    // unrecognised frame was a number or nothing at all.
+                    self.handle_unparsed(bytes);
                     continue;
                 };
                 if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
@@ -1393,6 +1405,76 @@ impl Tunnel {
                 }
             }
         }
+    }
+
+    /// Handles a frame the carrier parser did not recognise.
+    ///
+    /// Almost always nothing: the filter is coarser than the parser and lets
+    /// through a little it will not accept. The exception is the one message
+    /// the network sends on purpose -- a hop saying a packet was too large --
+    /// which is worth more than everything else this sees put together,
+    /// because a path that has silently shrunk is indistinguishable from one
+    /// that is dropping packets, and that diagnosis has already cost days.
+    fn handle_unparsed(&self, bytes: &[u8]) {
+        let Some(report) = paqetz_tcpwire::toobig::parse_ethernet(bytes) else {
+            Stats::bump(&self.stats.unparsed);
+            return;
+        };
+        self.note_too_big(&report);
+    }
+
+    /// Records a path-MTU report, if it describes a packet this end sent.
+    ///
+    /// The check is what makes an unauthenticated message safe to act on. It
+    /// arrives from an intermediate router rather than from the peer, so there
+    /// is nothing to verify it against except the five-tuple it quotes -- which
+    /// an off-path party does not have. Someone on the path can forge one, but
+    /// they can drop the packets outright, which no MTU setting was going to
+    /// answer either.
+    ///
+    /// Nothing is applied. The advertised MTU decides how large a packet may
+    /// be, and taking that instruction from the network unverified is a lever
+    /// worth being slow about; what this does is say the number out loud, so a
+    /// person can decide.
+    fn note_too_big(&self, report: &paqetz_tcpwire::toobig::TooBig) {
+        let local = self.local();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(peer) = state.endpoint else {
+            return;
+        };
+        if !report.describes(
+            local,
+            (*peer.ip(), peer.port()),
+            paqetz_tcpwire::segment::PROTO_TCP,
+        ) {
+            // Not ours. Someone else's flow, or a forgery that did not know
+            // where to aim -- either way it says nothing about this tunnel.
+            Stats::bump(&self.stats.unparsed);
+            return;
+        }
+        let Some(over) = report.shortfall() else {
+            // A stale report, or one for a packet that already fits. Routers
+            // send these; acting on one would shrink the tunnel for nothing.
+            return;
+        };
+        Stats::bump(&self.stats.too_big);
+
+        // Announced when the number changes, not when a packet arrives.
+        let mtu = report.mtu;
+        if state.reported_mtu.is_some_and(|seen| seen <= mtu) {
+            return;
+        }
+        state.reported_mtu = Some(mtu);
+        drop(state);
+
+        let suggested = self.cfg.interface.mtu.saturating_sub(u32::from(over));
+        warn_!(
+            "{}a hop on the path takes {mtu} bytes and this end is sending {}; \
+             every full-sized packet is being dropped out there. \
+             Set interface.mtu to {suggested} or less.",
+            self.tag(),
+            report.size,
+        );
     }
 
     /// Records a per-packet inbound failure.
@@ -1431,7 +1513,7 @@ impl Tunnel {
                 continue;
             };
             let Some(seg) = segment::parse_ethernet(bytes) else {
-                Stats::bump(&self.stats.unparsed);
+                self.handle_unparsed(bytes);
                 continue;
             };
             if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {

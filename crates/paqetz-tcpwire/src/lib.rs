@@ -40,6 +40,7 @@ pub mod checksum;
 pub mod endpoint;
 pub mod profile;
 pub mod segment;
+pub mod toobig;
 
 pub use endpoint::{Carrier, Config, Endpoint, Phase, Role, Sequencing};
 pub use profile::OsProfile;
