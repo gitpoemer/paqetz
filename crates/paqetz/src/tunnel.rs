@@ -462,8 +462,24 @@ impl PeerState {
     /// Indistinguishable from a peer that is down, and deliberately so: the
     /// answer is the same either way, and the one that is cheap to be wrong
     /// about is moving.
-    fn stuck(&self) -> bool {
-        self.session.is_none() && self.unanswered >= ROTATE_AFTER_UNANSWERED
+    ///
+    /// Silence is the test, not the absence of a session. Keying this to
+    /// `session.is_none()` made recovery wait for the keys to age out at
+    /// `REJECT_AFTER_TIME` -- three minutes of handshaking onto a tuple already
+    /// known to be dead, because a session that nothing can reach is still a
+    /// session until it expires. The keys were never the problem: they work
+    /// perfectly well over the next port, so the peer's own roaming can put the
+    /// tunnel back without a rekey at all.
+    ///
+    /// Both halves are needed. Unanswered handshakes alone would fire on a
+    /// lossy path that is otherwise carrying traffic, where a rekey can lose
+    /// four messages in a row while data flows the whole time -- and moving the
+    /// carrier under a working tunnel is a cost with nothing bought.
+    fn stuck(&self, now: Millis) -> bool {
+        self.unanswered >= ROTATE_AFTER_UNANSWERED
+            && self
+                .last_receive
+                .is_none_or(|heard| now.saturating_sub(heard) >= PRESUMED_DEAD)
     }
 
     /// Whether a handshake should be sent now.
@@ -1764,7 +1780,7 @@ impl Tunnel {
         }
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let stuck = state.stuck();
+        let stuck = state.stuck(now);
         if !stuck {
             if state.session.is_none() {
                 return;
@@ -2164,52 +2180,100 @@ mod tests {
         // Rotation was the cure and ran only while a session existed, so it was
         // off exactly when it was needed. Only a restart recovered it, and the
         // one thing a restart changes is the port.
+        let now = 10 * PRESUMED_DEAD;
         let mut state = spoke(None, None);
-        assert!(!state.stuck(), "a fresh state has not tried anything yet");
+        assert!(
+            !state.stuck(now),
+            "a fresh state has not tried anything yet"
+        );
 
         for _ in 0..ROTATE_AFTER_UNANSWERED - 1 {
             state.unanswered += 1;
             assert!(
-                !state.stuck(),
+                !state.stuck(now),
                 "a handful of losses is a lossy path, not a dead tuple"
             );
         }
         state.unanswered += 1;
-        assert!(state.stuck(), "past the threshold the tuple is the suspect");
+        assert!(
+            state.stuck(now),
+            "past the threshold the tuple is the suspect"
+        );
 
         // Traffic offered by the application clears `attempt_started`, which is
         // why that clock could not be used here: on a busy tunnel it never runs
         // out. This count answers to replies alone.
         state.wants_to_send();
         assert!(
-            state.stuck(),
+            state.stuck(now),
             "offered traffic is not an answer from the peer"
         );
 
-        state.established(1_000, 120_000);
-        assert!(!state.stuck(), "a reply proves the tuple still reaches");
+        state.established(now, 120_000);
+        assert!(!state.stuck(now), "a reply proves the tuple still reaches");
     }
 
     #[test]
-    fn a_live_session_is_never_stuck() {
-        // `stuck` asks whether the carrier is the problem. A rekey that goes
-        // unanswered raises the same count while a perfectly good session is
-        // still carrying traffic, and moving the port under it would turn a
-        // routine retry into a five-tuple change on a working tunnel.
+    fn a_dead_tuple_is_left_without_waiting_for_the_keys_to_age_out() {
+        // The first cut of this asked `session.is_none()`, which reads as "the
+        // tunnel is down" and is not the same thing. A session no packet can
+        // reach is still a session until REJECT_AFTER_TIME, so recovery waited
+        // three minutes for keys to expire that were never the problem -- they
+        // work perfectly over the next port, and the peer's roaming picks them
+        // up there without a rekey at all.
         let client = paqetz_core::KeyPair::generate().expect("client");
         let server = paqetz_core::KeyPair::generate().expect("server");
         let (session, _) = session_pair(&client, &server, 1);
 
-        let mut state = spoke(Some(0), Some(0));
+        let heard = 1_000;
+        let mut state = spoke(Some(heard), Some(heard));
+        state.session = Some(session);
+        state.unanswered = ROTATE_AFTER_UNANSWERED;
+
+        assert!(
+            !state.stuck(heard + PRESUMED_DEAD - 1),
+            "a peer heard from this recently is answering something"
+        );
+        assert!(
+            state.stuck(heard + PRESUMED_DEAD),
+            "silence for a liveness interval is the signal, not expiry"
+        );
+        assert!(
+            !state
+                .session
+                .as_ref()
+                .expect("session")
+                .is_expired(heard + PRESUMED_DEAD),
+            "and the session is still good, which is exactly the point"
+        );
+    }
+
+    #[test]
+    fn a_carrier_still_hearing_replies_is_never_stuck() {
+        // A lossy path can swallow four handshakes in a row while the tunnel
+        // carries data the whole time -- the old VPS lost one packet in five,
+        // which makes that ordinary rather than rare. Moving the carrier there
+        // buys nothing and costs a five-tuple that was working.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (session, _) = session_pair(&client, &server, 1);
+
+        let heard = 60_000;
+        let mut state = spoke(Some(heard), Some(heard));
         state.session = Some(session);
         state.unanswered = ROTATE_AFTER_UNANSWERED * 10;
         assert!(
-            !state.stuck(),
-            "an unanswered rekey is not a reason to move a working carrier"
+            !state.stuck(heard + 1),
+            "no count of unanswered rekeys outweighs a peer that is answering"
         );
 
+        // Losing the session changes nothing on its own; the silence is what
+        // decides, and here there has not been any.
         state.session = None;
-        assert!(state.stuck(), "with nothing left to carry it, it is");
+        assert!(
+            !state.stuck(heard + 1),
+            "a missing session is not evidence about the path"
+        );
     }
 
     #[test]
