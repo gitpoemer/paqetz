@@ -962,8 +962,12 @@ impl Config {
                 }
                 // Zero is "pick one at start-up", and two tunnels both doing
                 // that will pick differently. Only a port written down twice
-                // is a clash.
-                if a.interface.listen_port != 0
+                // is a clash -- and only for a carrier that has ports, where
+                // two tunnels on one would genuinely be indistinguishable.
+                // Refusing it otherwise turns a line with no effect into a
+                // reason the tunnel will not start.
+                if a.interface.shape.has_ports()
+                    && a.interface.listen_port != 0
                     && a.interface.listen_port == b.interface.listen_port
                 {
                     return Err(clash("outer port", a.interface.listen_port.to_string()));
@@ -1699,6 +1703,35 @@ tunnel_address = "10.8.0.1"
             assert!(
                 Config::parse(&pair(line, "203.0.113.5:8443", line, "198.51.100.7:8443")).is_ok(),
                 "two of one shape should be allowed: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_port_written_twice_only_clashes_where_ports_exist() {
+        // The line has no effect for a carrier with none, so refusing it turns
+        // something harmless into a reason the tunnel will not start.
+        let same_port = |carrier: &str| {
+            pair(carrier, "203.0.113.5:8443", carrier, "198.51.100.7:8443")
+                .replace(
+                    "device = \"paqetz0\"",
+                    "device = \"paqetz0\"\nlisten_port = 8443",
+                )
+                .replace(
+                    "device = \"paqetz1\"",
+                    "device = \"paqetz1\"\nlisten_port = 8443",
+                )
+        };
+        let err = Config::parse(&same_port("")).expect_err("ports really do clash");
+        assert!(err.to_string().contains("outer port"), "{err}");
+
+        for carrier in [
+            "carrier = \"gre\"",
+            "carrier = \"rawip\"\ncarrier_protocol = 143",
+        ] {
+            assert!(
+                Config::parse(&same_port(carrier)).is_ok(),
+                "{carrier}: a port that means nothing cannot clash"
             );
         }
     }

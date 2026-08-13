@@ -1207,16 +1207,11 @@ fn firewall(
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::load(path)?;
-    let port = effective_port(&cfg).ok_or(
-        "this end takes an ephemeral outer port at start-up, so its rules \
-         cannot be named ahead of time. `run` installs them itself; to manage \
-         them by hand, set interface.listen_port to a fixed port.",
-    )?;
+    let guard = effective_guard(&cfg)?;
 
     // `plan` must work on a host with neither tool installed — printing what to
     // run by hand is exactly what it is for.
     if matches!(action, FirewallAction::Plan) {
-        let guard = paqetz_fw::rules::Guard::Ports(vec![port]);
         let fw = Firewall::detect(guard.clone())
             .unwrap_or_else(|_| Firewall::with_backend(paqetz_fw::Backend::Nft, guard));
         for line in fw.plan() {
@@ -1225,7 +1220,7 @@ fn firewall(
         return Ok(());
     }
 
-    let fw = Firewall::detect(paqetz_fw::rules::Guard::Ports(vec![port]))?;
+    let fw = Firewall::detect(guard)?;
     match action {
         FirewallAction::Plan => unreachable!("handled above"),
         FirewallAction::Apply => fw.apply()?,
@@ -1240,6 +1235,32 @@ fn firewall(
 /// The rules have to name the port *this* kernel would send resets from, which
 /// is the port we receive on — not the peer's. An end that takes an ephemeral
 /// port does not know it until start-up, so there is nothing to return.
+/// What this configuration's firewall rules should name.
+///
+/// Follows the carrier, as `run` does. Built from a port unconditionally, a
+/// port-less carrier was handed rules about TCP ports it never sends: they
+/// protect nothing, and the kernel goes on answering its packets. The whole
+/// point of this command is the host where `manage_firewall` is off, so being
+/// wrong here is being wrong in the one place nothing else covers.
+fn effective_guard(cfg: &Config) -> Result<paqetz_fw::rules::Guard, &'static str> {
+    // Mixed shapes in one process are refused when the file is read, so the
+    // first tunnel speaks for all of them.
+    if let Some(shape) = cfg.tunnels.first().map(|t| t.interface.shape)
+        && !shape.has_ports()
+    {
+        // Nameable whatever `listen_port` says: these rules are about a
+        // protocol number, and that is fixed before anything is bound.
+        return Ok(paqetz_fw::rules::Guard::Protocol(shape.protocol()));
+    }
+    effective_port(cfg)
+        .map(|p| paqetz_fw::rules::Guard::Ports(vec![p]))
+        .ok_or(
+            "this end takes an ephemeral outer port at start-up, so its rules \
+             cannot be named ahead of time. `run` installs them itself; to manage \
+             them by hand, set interface.listen_port to a fixed port.",
+        )
+}
+
 fn effective_port(cfg: &Config) -> Option<u16> {
     // The first tunnel with a fixed port. A process whose tunnels all take
     // ephemeral ones has nothing to report until they are bound.
@@ -1253,6 +1274,52 @@ fn effective_port(cfg: &Config) -> Option<u16> {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
+
+    #[test]
+    fn the_firewall_command_names_what_the_carrier_actually_sends() {
+        // The command exists for the host where `manage_firewall` is off, so
+        // being wrong here is being wrong in the one place nothing else covers.
+        // Rules built from a port for a carrier that has none protect nothing,
+        // and the kernel goes on answering its packets.
+        let with = |lines: &str| {
+            let text = format!(
+                r#"
+[[tunnel]]
+name = "one"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.7.0.2/24"
+{lines}
+[tunnel.peer]
+public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+endpoint = "203.0.113.5:8443"
+tunnel_address = "10.7.0.1"
+"#
+            );
+            effective_guard(&Config::parse(&text).expect("parse"))
+        };
+
+        assert_eq!(
+            with("listen_port = 8443").expect("a fixed port is nameable"),
+            paqetz_fw::rules::Guard::Ports(vec![8443])
+        );
+        assert_eq!(
+            with("carrier = \"gre\"").expect("a protocol is always nameable"),
+            paqetz_fw::rules::Guard::Protocol(47)
+        );
+        assert_eq!(
+            with("carrier = \"rawip\"\ncarrier_protocol = 143").expect("likewise"),
+            paqetz_fw::rules::Guard::Protocol(143)
+        );
+        // A port-less carrier is nameable whatever `listen_port` says, because
+        // its rules were never about a port.
+        assert_eq!(
+            with("carrier = \"gre\"\nlisten_port = 0").expect("still nameable"),
+            paqetz_fw::rules::Guard::Protocol(47)
+        );
+        // An ephemeral port genuinely is not, and says so rather than guessing.
+        assert!(with("").is_err(), "an ephemeral port cannot be named early");
+    }
 
     #[test]
     fn the_command_line_is_well_formed() {

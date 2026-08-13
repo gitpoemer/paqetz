@@ -824,7 +824,13 @@ impl Tunnel {
         // so it keeps the port it was configured with; the side that initiates
         // takes several and moves between them, which is what stops a single
         // five-tuple living for hours.
-        let ports: Vec<u16> = if cfg.interface.listen_port == 0 {
+        let ports: Vec<u16> = if !cfg.interface.shape.has_ports() {
+            // Nothing to fill: this carrier addresses a peer with two addresses
+            // and a protocol number. A pool would be twenty numbers nothing
+            // reads, and `listen_port` on such a tunnel is a line with no
+            // effect rather than a port anything binds.
+            Vec::new()
+        } else if cfg.interface.listen_port == 0 {
             let pool = cfg.interface.rotation.ports;
             let mut v = Vec::with_capacity(pool);
             while v.len() < pool {
