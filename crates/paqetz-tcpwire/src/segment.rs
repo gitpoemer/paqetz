@@ -122,6 +122,14 @@ pub struct Fields {
     pub ts_val: u32,
     /// Timestamp option echo reply.
     pub ts_ecr: u32,
+    /// Whether to set Don't Fragment.
+    ///
+    /// Set, a hop too small to pass the packet says so and the tunnel can read
+    /// the answer. Clear, that hop fragments instead -- which only works if
+    /// something reassembles, and the capture socket sees the pieces before
+    /// the kernel would. So clearing this is safe only alongside an MTU small
+    /// enough that no hop needs to.
+    pub dont_fragment: bool,
 }
 
 /// Bytes of TCP options a segment of this kind carries under this profile.
@@ -219,7 +227,7 @@ pub fn emit(
         c.u8(0)?; // DSCP 0 (D6: paqet marked DSCP 46, which stands out)
         c.u16(ip_total)?;
         c.u16(fields.ip_id)?;
-        c.u16(0x4000)?; // Don't Fragment
+        c.u16(if fields.dont_fragment { 0x4000 } else { 0 })?;
         c.u8(profile.ttl)?;
         c.u8(PROTO_TCP)?;
         c.u16(0)?; // checksum, filled below
@@ -508,6 +516,7 @@ mod tests {
             ip_id: 0xABCD,
             ts_val: 0x0011_2233,
             ts_ecr: 0x4455_6677,
+            dont_fragment: true,
         }
     }
 

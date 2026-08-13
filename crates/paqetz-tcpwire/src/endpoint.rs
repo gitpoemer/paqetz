@@ -127,6 +127,8 @@ pub struct Config {
     pub ts_base: u32,
     /// How to number the segments.
     pub sequencing: Sequencing,
+    /// Whether to set Don't Fragment on every packet.
+    pub dont_fragment: bool,
 }
 
 /// How the sequence and acknowledgement numbers are chosen.
@@ -173,6 +175,7 @@ pub struct Endpoint {
 
     /// Drives IP Identification and window jitter.
     counter: u32,
+    dont_fragment: bool,
     /// Whether our SYN's one byte of sequence space has been counted.
     ///
     /// A retransmitted SYN carries the same sequence number as the original, so
@@ -200,6 +203,7 @@ impl Endpoint {
                 Phase::Idle
             },
             sequencing: cfg.sequencing,
+            dont_fragment: cfg.dont_fragment,
             local_isn: cfg.isn,
             remote_isn: if midstream { Some(cfg.peer_isn) } else { None },
             sent: 0,
@@ -375,6 +379,7 @@ impl Endpoint {
             ip_id: self.ip_id(),
             ts_val: self.ts_val(now),
             ts_ecr: self.peer_ts_val,
+            dont_fragment: self.dont_fragment,
         }
     }
 
@@ -540,12 +545,14 @@ mod tests {
             // The tests below check the byte-accurate numbering specifically,
             // so they ask for it. `Opaque` is the default and has its own.
             sequencing: Sequencing::Stream,
+            dont_fragment: true,
         }
     }
 
     fn opaque(role: Role) -> Config {
         Config {
             sequencing: Sequencing::Opaque,
+            dont_fragment: true,
             ..cfg(role, Carrier::Midstream, LINUX_6)
         }
     }
@@ -1091,6 +1098,7 @@ mod tests {
                 ip_id: 1,
                 ts_val: 0,
                 ts_ecr: 0,
+                dont_fragment: true,
             },
             &[],
             &mut buf,
@@ -1239,6 +1247,7 @@ mod tests {
                 ip_id: 7,
                 ts_val: 1,
                 ts_ecr: 0,
+                dont_fragment: true,
             },
             &[],
             &mut buf,

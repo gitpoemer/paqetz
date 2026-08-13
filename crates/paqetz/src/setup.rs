@@ -131,17 +131,55 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     // Which of these a path carries is a property of that path and cannot be
     // discovered from here -- so the value is left where someone who has
     // measured their own path can find it, and nowhere more prominent.
-    let carrier_note = |t: &mut String| -> std::fmt::Result {
+    // Everything the questions above do not ask about, listed commented with
+    // the value already in force. Values only: what each one does, and what it
+    // costs, is not written here. A configuration file that explains the
+    // behaviour of the thing it configures is a description of that behaviour
+    // sitting on every host that runs it, and these hosts are not the only
+    // ones reading. Units where a bare number would be ambiguous, nothing else.
+    //
+    // `initiator` because rotation is the initiating side's alone: the side
+    // that waits has to be findable, so its port cannot move.
+    let tuning = |t: &mut String, initiator: bool| -> std::fmt::Result {
         writeln!(
             t,
-            "\n# carrier = \"midstream\"   # or \"gre\", or \"rawip\""
+            "\n# --- Optional. Values shown are the ones in force. ---"
         )?;
         writeln!(
             t,
-            "# carrier_protocol = 143   # required by \"rawip\", ignored by the rest"
+            "# carrier = \"midstream\"       # midstream | gre | rawip"
         )?;
-        writeln!(t, "# Both ends must agree. Change one and the other stops")?;
-        writeln!(t, "# hearing anything at all.")
+        writeln!(t, "# carrier_protocol = 143")?;
+        writeln!(
+            t,
+            "# profile = \"linux-6\"         # linux-6 | windows-11 | android-14"
+        )?;
+        writeln!(t, "# fragment = \"never\"          # never | path")?;
+        writeln!(t, "# mtu = 1400")?;
+        writeln!(t, "# keepalive = true")?;
+        writeln!(t, "#")?;
+        writeln!(t, "# retransmit = false")?;
+        writeln!(t, "# retransmit_buffer = 1024     # packets")?;
+        writeln!(t, "# retransmit_deadline = 400    # ms")?;
+        writeln!(t, "# retransmit_asks = 2")?;
+        writeln!(t, "# retransmit_reorder = 3       # packets")?;
+        if initiator {
+            writeln!(t, "#")?;
+            writeln!(t, "# rotate = true")?;
+            writeln!(t, "# rotate_after = 900           # seconds")?;
+            writeln!(t, "# rotate_jitter = 300          # seconds")?;
+            writeln!(t, "# rotate_ports = 20")?;
+            writeln!(t, "# rotate_after_unanswered = 4")?;
+        }
+        writeln!(t, "#")?;
+        writeln!(t, "# datapath = \"simple\"         # simple | batched")?;
+        writeln!(t, "# transmit = \"raw\"            # raw | afpacket")?;
+        writeln!(t, "# manage_firewall = true")?;
+        writeln!(
+            t,
+            "# log = \"info\"                # off | error | warn | info | debug"
+        )?;
+        writeln!(t, "# health_interval = 60         # seconds")
     };
 
     // The form that can hold several tunnels, written even for one. A file that
@@ -168,7 +206,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(s, "# Bringing it up is not paqetz's job.")?;
         writeln!(s, "egress = \"{iface}\"")?;
     }
-    carrier_note(&mut s)?;
+    tuning(&mut s, false)?;
     writeln!(s, "\n[tunnel.peer]")?;
     writeln!(s, "# The client's public key.")?;
     writeln!(s, "public_key = \"{}\"", client.public.to_base64())?;
@@ -200,7 +238,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(c, "route_marked = {mark}")?;
         writeln!(c, "route_table  = {mark}")?;
     }
-    carrier_note(&mut c)?;
+    tuning(&mut c, true)?;
     writeln!(c, "\n[tunnel.peer]")?;
     writeln!(c, "# The server's public key.")?;
     writeln!(c, "public_key = \"{}\"", server.public.to_base64())?;
@@ -982,6 +1020,75 @@ fn warn_forwarding_blocked() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_generated_files_carry_every_setting_the_questions_do_not_ask() {
+        // Left out entirely, the only way to find these is to read the source;
+        // written as comments with their current values, the file is its own
+        // reference and nothing is turned on by accident.
+        let rendered = super::render(&plan()).expect("render");
+        let (server, client) = (rendered.server, rendered.client);
+
+        for (which, text) in [("server", &server), ("client", &client)] {
+            for key in [
+                "carrier",
+                "carrier_protocol",
+                "profile",
+                "fragment",
+                "mtu",
+                "keepalive",
+                "retransmit",
+                "retransmit_buffer",
+                "retransmit_deadline",
+                "retransmit_asks",
+                "retransmit_reorder",
+                "datapath",
+                "transmit",
+                "log",
+                "health_interval",
+                "manage_firewall",
+            ] {
+                assert!(
+                    text.contains(&format!("# {key} =")),
+                    "{which} is missing {key}"
+                );
+            }
+            // Commented, every one of them: a generated file that turned a
+            // setting on would be deciding something it was never told.
+            for line in text.lines() {
+                let bare = line.trim_start();
+                if bare.starts_with('#') || bare.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !bare.starts_with("carrier")
+                        && !bare.starts_with("retransmit")
+                        && !bare.starts_with("rotate")
+                        && !bare.starts_with("fragment"),
+                    "{which} sets {bare:?} rather than showing it"
+                );
+            }
+        }
+
+        // Rotation is the initiating side's alone -- the side that waits has to
+        // be findable, so its port cannot move -- and offering it in the server
+        // file would be offering something that does nothing.
+        for key in [
+            "rotate",
+            "rotate_after",
+            "rotate_ports",
+            "rotate_after_unanswered",
+        ] {
+            assert!(
+                client.contains(&format!("# {key} =")),
+                "client missing {key}"
+            );
+        }
+        assert!(
+            !server.contains("# rotate ="),
+            "the server cannot rotate and should not be told it can"
+        );
+    }
     #[test]
     fn a_mark_reaches_the_clients_file_with_a_table_to_match() {
         // The mark alone steers nothing: the rule that acts on it points at a

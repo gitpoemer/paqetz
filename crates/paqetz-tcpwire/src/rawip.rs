@@ -109,6 +109,8 @@ pub struct Config {
     pub profile: OsProfile,
     /// What goes between the IPv4 header and the payload.
     pub shell: Shell,
+    /// Whether to set Don't Fragment.
+    pub dont_fragment: bool,
 }
 
 /// A GRE carrier for one peer.
@@ -123,6 +125,7 @@ pub struct Carrier {
     remote: Ipv4Addr,
     profile: OsProfile,
     shell: Shell,
+    dont_fragment: bool,
     /// Packets sent, feeding the IP Identification.
     ///
     /// Deliberately `u32`: the hash below multiplies and then shifts down
@@ -143,6 +146,7 @@ impl Carrier {
             remote: cfg.remote,
             profile: cfg.profile,
             shell: cfg.shell,
+            dont_fragment: cfg.dont_fragment,
             counter: 0,
         }
     }
@@ -186,11 +190,11 @@ impl Carrier {
             c.u8(0)?; // DSCP 0, as the fake-TCP carrier emits
             c.u16(ip_total)?;
             c.u16(ip_id)?;
-            // Don't Fragment, as the fake-TCP carrier sets. A path too small to
-            // carry this then says so, and `toobig` reads the answer; clearing
-            // it would fragment silently into a capture socket that sees the
-            // pieces before the kernel joins them.
-            c.u16(0x4000)?;
+            // Set, a hop too small to carry this says so and `toobig` reads
+            // the answer. Clear, that hop fragments instead -- and the capture
+            // socket sees the pieces before the kernel joins them, so this is
+            // only safe alongside an MTU no hop needs to fragment.
+            c.u16(if self.dont_fragment { 0x4000 } else { 0 })?;
             c.u8(self.profile.ttl)?;
             c.u8(self.shell.protocol())?;
             c.u16(0)?; // checksum, filled below
@@ -353,6 +357,7 @@ mod tests {
             remote: Ipv4Addr::new(203, 0, 113, 5),
             profile: crate::profile::LINUX_6,
             shell,
+            dont_fragment: true,
         })
     }
 
@@ -473,6 +478,33 @@ mod tests {
             "a correct header sums to zero over itself"
         );
         let _ = n;
+    }
+
+    #[test]
+    fn dont_fragment_follows_what_was_asked_for() {
+        // The bit itself, on the wire, for both shells. A knob that changed a
+        // field nobody checked would be indistinguishable from one that did
+        // nothing.
+        for shell in [Shell::Gre, Shell::Bare(143)] {
+            for df in [true, false] {
+                let mut c = Carrier::new(Config {
+                    local: Ipv4Addr::new(10, 0, 0, 1),
+                    remote: Ipv4Addr::new(203, 0, 113, 5),
+                    profile: crate::profile::LINUX_6,
+                    shell,
+                    dont_fragment: df,
+                });
+                let mut out = vec![0u8; 200];
+                c.data(b"payload", &mut out).expect("emit");
+                assert_eq!(
+                    u16::from_be_bytes([out[6], out[7]]),
+                    if df { 0x4000 } else { 0 },
+                    "{shell:?} with dont_fragment = {df}"
+                );
+                // Whichever way, the header still checks out.
+                assert_eq!(checksum::of(&out[..IPV4_LEN]), 0);
+            }
+        }
     }
 
     #[test]

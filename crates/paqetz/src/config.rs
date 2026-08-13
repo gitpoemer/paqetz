@@ -131,6 +131,8 @@ pub(crate) struct Interface {
     /// seconds, which is a metronome — a real trade, and the wrong side of it is
     /// losing the first click after a pause.
     pub(crate) keepalive: bool,
+    /// What to do about a hop too small to pass a packet whole.
+    pub(crate) fragment: Fragment,
     /// Whether the carrier moves between outer ports, and how.
     ///
     /// On by default. A five-tuple that lives for hours and carries gigabytes
@@ -270,6 +272,21 @@ impl Shape {
         }
     }
 
+    /// The largest inner packet whose outer packet no path should fragment.
+    ///
+    /// The ceiling with Don't Fragment cleared, because nothing here reassembles
+    /// what a hop would split.
+    pub(crate) const fn fragment_free_mtu(self) -> u32 {
+        let room = FRAGMENT_FREE_OUTER - self.overhead() - paqetz_core::framing::OVERHEAD;
+        // Exact: `room` is around a thousand.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bounded by FRAGMENT_FREE_OUTER, which is 1280"
+        )]
+        let capped = room as u32;
+        capped
+    }
+
     /// The largest inner packet to use when nothing says otherwise.
     ///
     /// Expressed as a difference from the fake-TCP default rather than derived
@@ -295,6 +312,46 @@ impl Shape {
         }
     }
 }
+
+/// What the carrier does about a hop too small to pass a packet whole.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Fragment {
+    /// Set Don't Fragment, and read the reports that come back.
+    ///
+    /// The default. A hop too small answers with ICMP fragmentation-needed
+    /// carrying the MTU it can take, which is counted and reported; without it
+    /// a shrunken path is indistinguishable from one dropping packets for any
+    /// other reason.
+    #[default]
+    Never,
+    /// Clear it, and stay small enough that no hop should need to.
+    ///
+    /// For a path whose inspection treats Don't Fragment as worth noticing.
+    /// Ordinary traffic sets it constantly, so this is unlikely to be the thing
+    /// that stands out -- but it is one bit, it costs little to turn off, and
+    /// what a particular path objects to cannot be known from here.
+    ///
+    /// The cost is real and is why this is not the default. Nothing reassembles
+    /// fragments: the capture socket sees them before the kernel would, and the
+    /// filter passes only the first. So the MTU is capped to
+    /// [`FRAGMENT_FREE_OUTER`], small enough that no path in practice
+    /// fragments, and an `mtu` above that cap is refused rather than accepted
+    /// into a tunnel that would lose packets whenever the path narrowed.
+    ///
+    /// Should a hop fragment anyway, the pieces are dropped and counted as
+    /// `unparsed` -- so the failure is a counter that moves rather than
+    /// silence.
+    Path,
+}
+
+/// The largest outer packet no path in practice needs to fragment.
+///
+/// The floor every IPv6-capable link must carry, and a de-facto minimum for
+/// IPv4 too. Below this a path exists in principle -- IPv4 guarantees only 576
+/// -- and a tunnel on one, with Don't Fragment cleared, loses packets whenever
+/// it narrows. `fragment = "never"` is what detects that; this trades the
+/// detection away for the bit.
+const FRAGMENT_FREE_OUTER: usize = 1280;
 
 /// The other end.
 #[derive(Debug, Clone)]
@@ -978,15 +1035,48 @@ impl Config {
             ));
         }
 
+        let fragment = match iface.fragment.as_deref().unwrap_or("never") {
+            "never" => Fragment::Never,
+            "path" => Fragment::Path,
+            other => {
+                return Err(invalid(
+                    "interface.fragment",
+                    format!("expected \"never\" or \"path\", got {other:?}"),
+                ));
+            }
+        };
+
         // After the carrier, because the room left for an inner packet is
-        // whatever its outer header does not take.
-        let mtu = iface.mtu.unwrap_or_else(|| shape.default_mtu());
+        // whatever its outer header does not take -- and after `fragment`,
+        // because clearing Don't Fragment is only safe below a size no hop
+        // needs to split.
+        let cap = shape.fragment_free_mtu();
+        let mtu = iface.mtu.unwrap_or_else(|| match fragment {
+            Fragment::Never => shape.default_mtu(),
+            Fragment::Path => cap,
+        });
         if !(576..=9000).contains(&mtu) {
             return Err(invalid(
                 "interface.mtu",
                 format!("{mtu} is outside the usable range 576-9000"),
             ));
         }
+        // Lowered rather than refused. A configuration that worked yesterday
+        // should not stop a tunnel from starting today because a second
+        // setting narrowed what the first may be -- and the value that keeps
+        // the tunnel up is knowable, so taking it is better than stopping.
+        // Said out loud, because a silently different MTU is a thing to
+        // discover from a packet capture.
+        let mtu = if fragment == Fragment::Path && mtu > cap {
+            crate::log::warn_!(
+                "interface.mtu {mtu} is above {cap}, which is the largest that fragment = \
+                 \"path\" can carry: nothing here reassembles what a hop splits, because the \
+                 capture socket sees the pieces before the kernel joins them. Using {cap}."
+            );
+            cap
+        } else {
+            mtu
+        };
 
         let sequencing = match iface.sequencing.as_deref().unwrap_or("opaque") {
             "opaque" => paqetz_tcpwire::Sequencing::Opaque,
@@ -1017,37 +1107,6 @@ impl Config {
                 return Err(invalid(
                     "interface.transmit",
                     format!("expected \"raw\" or \"afpacket\", got {other:?}"),
-                ));
-            }
-        };
-
-        // Validated and then discarded: there is one behaviour, so nothing
-        // downstream has a choice to make. It is a setting anyway because the
-        // *other* value is one somebody will reach for -- the encapsulation
-        // this borrows from clears Don't Fragment deliberately -- and an
-        // explicit refusal saying why beats an unknown-field error.
-        match iface.fragment.as_deref().unwrap_or("never") {
-            "never" => {}
-            // Accepted as a name so the refusal can say what is missing, rather
-            // than reading as a typo. Clearing Don't Fragment without also
-            // reassembling is worse than not offering it: the path fragments,
-            // the capture socket sees the pieces before the kernel joins them,
-            // the filter passes only the first, and the packet is lost with
-            // nothing anywhere to say so. Don't Fragment at least makes a
-            // router send the report this build now reads.
-            "path" => {
-                return Err(invalid(
-                    "interface.fragment",
-                    "\"path\" needs fragment reassembly in the capture path, which is not \
-                     implemented. Clearing Don't Fragment without it loses every fragmented \
-                     packet silently, because the capture socket sees fragments before the \
-                     kernel reassembles them and the filter passes only the first.",
-                ));
-            }
-            other => {
-                return Err(invalid(
-                    "interface.fragment",
-                    format!("expected \"never\" or \"path\", got {other:?}"),
                 ));
             }
         };
@@ -1270,6 +1329,7 @@ impl Config {
                     }
                 },
                 keepalive: iface.keepalive.unwrap_or(true),
+                fragment,
                 rotation: {
                     // One source for the defaults, as above, so "unset" and
                     // what the tunnel would have used cannot drift apart.
@@ -1666,24 +1726,66 @@ tunnel_address = "10.8.0.1"
     }
 
     #[test]
-    fn asking_the_path_to_fragment_is_refused_with_the_reason() {
-        // Not an unknown field: it is the value somebody will reach for, and
-        // clearing Don't Fragment without reassembly loses every fragmented
-        // packet with nothing anywhere to say so. The message has to explain
-        // that, or the refusal reads as a typo.
-        let err = with_interface("fragment = \"path\"").expect_err("should refuse");
-        let text = err.to_string();
-        assert!(text.contains("reassembly"), "{text}");
-        assert!(
-            text.contains("silently") || text.contains("fragments"),
-            "{text}"
+    fn clearing_dont_fragment_caps_the_mtu_it_is_safe_at() {
+        // Nothing reassembles: the capture socket sees fragments before the
+        // kernel joins them, and the filter passes only the first. So the only
+        // safe way to clear the bit is to stay under a size no hop needs to
+        // split, and an mtu above that is refused rather than accepted into a
+        // tunnel that loses packets whenever the path narrows.
+        let c = with_interface("fragment = \"path\"").expect("parse");
+        assert_eq!(c.interface.fragment, Fragment::Path);
+        assert_eq!(c.interface.mtu, c.interface.shape.fragment_free_mtu());
+        assert_eq!(
+            c.interface.mtu as usize
+                + c.interface.shape.overhead()
+                + paqetz_core::framing::OVERHEAD,
+            FRAGMENT_FREE_OUTER,
+            "the whole outer packet, at the cap"
         );
 
-        assert!(with_interface("fragment = \"never\"").is_ok());
+        // An mtu above the cap is lowered to it rather than refused: a file
+        // that worked yesterday should not stop the tunnel starting today
+        // because a second setting narrowed what the first may be.
+        let cap = c.interface.mtu;
+        let over = with_interface(&format!("fragment = \"path\"\nmtu = {}", cap + 500))
+            .expect("should be accepted, not refused");
+        assert_eq!(over.interface.mtu, cap, "lowered to what can be carried");
+        assert_eq!(
+            with_interface(&format!("fragment = \"path\"\nmtu = {cap}"))
+                .expect("at the cap")
+                .interface
+                .mtu,
+            cap
+        );
+        // Below it is left alone: someone who measured their own path keeps
+        // what they measured.
+        assert_eq!(
+            with_interface("fragment = \"path\"\nmtu = 900")
+                .expect("under the cap")
+                .interface
+                .mtu,
+            900
+        );
+        // And the cap does not apply to the shape that sets the bit.
+        assert_eq!(
+            with_interface("mtu = 1400").expect("parse").interface.mtu,
+            1400
+        );
+
+        // A smaller header leaves more room under the same cap.
+        let gre = with_interface("fragment = \"path\"\ncarrier = \"gre\"").expect("parse");
+        assert!(gre.interface.mtu > cap, "GRE pays 24 bytes, fake-TCP 60");
+
+        // And the default is untouched: setting Don't Fragment is what lets a
+        // small hop report itself, which is worth more than the bit costs.
+        let tcp = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert_eq!(tcp.interface.fragment, Fragment::Never);
+        assert_eq!(tcp.interface.mtu, paqetz_dp::tun::DEFAULT_MTU);
+
         assert!(with_interface("fragment = \"sometimes\"").is_err());
-        // And unset is the same as never, which is what the carrier has always
-        // done -- this setting named an existing behaviour, it did not add one.
-        assert!(Config::parse(CLIENT).is_ok());
     }
 
     #[test]

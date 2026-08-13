@@ -967,6 +967,7 @@ impl Tunnel {
         remote: (Ipv4Addr, u16),
         numbers: (u32, u32, u32),
     ) -> Wire {
+        let df = self.cfg.interface.fragment == crate::config::Fragment::Never;
         match self.cfg.interface.shape {
             crate::config::Shape::Tcp(carrier) => {
                 Wire::Tcp(Box::new(Carrier::new(paqetz_tcpwire::Config {
@@ -979,6 +980,7 @@ impl Tunnel {
                     peer_isn: numbers.1,
                     ts_base: numbers.2,
                     sequencing: self.cfg.interface.sequencing,
+                    dont_fragment: df,
                 })))
             }
             crate::config::Shape::Raw(shell) => Wire::Raw(paqetz_tcpwire::rawip::Carrier::new(
@@ -987,6 +989,7 @@ impl Tunnel {
                     remote: remote.0,
                     profile: self.cfg.interface.profile,
                     shell,
+                    dont_fragment: df,
                 },
             )),
         }
