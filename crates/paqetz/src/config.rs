@@ -68,8 +68,8 @@ pub(crate) struct Interface {
     pub(crate) device: String,
     /// Which operating system the carrier should look like.
     pub(crate) profile: paqetz_tcpwire::OsProfile,
-    /// Whether the carrier performs a synthetic handshake (D14).
-    pub(crate) carrier: paqetz_tcpwire::Carrier,
+    /// What the tunnel's packets look like on the wire.
+    pub(crate) shape: Shape,
     /// How the carrier numbers its segments.
     ///
     /// `opaque` by default. Numbering by payload bytes is truthful, and
@@ -217,6 +217,83 @@ pub(crate) enum TransmitPath {
     /// the other path simply does not have. Worth switching to on a host where
     /// the gateway is stable and the throughput matters.
     AfPacket,
+}
+
+/// What the outer packets are.
+///
+/// One choice, not a preference: which of these a path carries is a property of
+/// the path, and the only way to know is to try. Neither is better in general.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shape {
+    /// Hand-built TCP segments, with the mode deciding how the conversation
+    /// begins.
+    ///
+    /// The default. Ports mean it survives NAT, and a port is a thing to move
+    /// when one stops being carried.
+    Tcp(paqetz_tcpwire::Carrier),
+    /// GRE, IP protocol 47.
+    ///
+    /// Half the outer header, no ports, and no per-packet state. No ports also
+    /// means no NAT traversal and nothing to rotate, and a network that filters
+    /// by protocol drops it outright -- so this is worth trying where the other
+    /// has stopped working, and pointless where it has not.
+    Gre,
+}
+
+impl Shape {
+    /// Bytes of outer header before the tunnel's own framing.
+    pub(crate) const fn overhead(self) -> usize {
+        match self {
+            Self::Tcp(_) => paqetz_tcpwire::segment::MAX_OVERHEAD,
+            Self::Gre => paqetz_tcpwire::gre::OVERHEAD,
+        }
+    }
+
+    /// What the capture socket should be filtered to.
+    pub(crate) const fn matching(self, ports: &[u16]) -> paqetz_dp::bpf::Match<'_> {
+        match self {
+            Self::Tcp(_) => paqetz_dp::bpf::Match::Ports(ports),
+            Self::Gre => paqetz_dp::bpf::Match::Protocol(paqetz_tcpwire::gre::PROTO_GRE),
+        }
+    }
+
+    /// Whether moving between outer ports means anything here.
+    pub(crate) const fn has_ports(self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
+
+    /// The IP protocol number these packets carry.
+    pub(crate) const fn protocol(self) -> u8 {
+        match self {
+            Self::Tcp(_) => paqetz_tcpwire::segment::PROTO_TCP,
+            Self::Gre => paqetz_tcpwire::gre::PROTO_GRE,
+        }
+    }
+
+    /// The largest inner packet to use when nothing says otherwise.
+    ///
+    /// Expressed as a difference from the fake-TCP default rather than derived
+    /// from 1500, so that default is left exactly where it is: computing it
+    /// afresh would raise it by the twelve bytes of slack it deliberately
+    /// carries, and quietly enlarge the packets of every tunnel already
+    /// running. GRE's header is thirty-six bytes smaller, so the same slack
+    /// leaves that much more room for payload.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both operands are outer header lengths, tens of bytes"
+    )]
+    pub(crate) const fn default_mtu(self) -> u32 {
+        match self {
+            Self::Tcp(_) => paqetz_dp::tun::DEFAULT_MTU,
+            Self::Gre => {
+                let saved = paqetz_tcpwire::segment::MAX_OVERHEAD - Self::Gre.overhead();
+                // Both are outer header lengths, tens of bytes; the conversion
+                // cannot fail, and a fallback of zero would only mean the
+                // fake-TCP default rather than a wrong one.
+                paqetz_dp::tun::DEFAULT_MTU + saved as u32
+            }
+        }
+    }
 }
 
 /// The other end.
@@ -756,6 +833,32 @@ impl Config {
                 if a.peer.public_key == b.peer.public_key {
                     return Err(clash("peer key", a.peer.public_key.to_string()));
                 }
+                // The firewall rules are written once for the whole process,
+                // and what they name depends on the shape: ports for one,
+                // a protocol number for the other. Rules for either say nothing
+                // about the other, so a process carrying both would run one
+                // tunnel with the kernel free to answer its packets -- which is
+                // the leak the rules exist to close.
+                if a.interface.shape.has_ports() != b.interface.shape.has_ports() {
+                    return Err(invalid(
+                        "interface.carrier",
+                        format!(
+                            "{:?} and {:?} are different shapes on the wire, and one process \
+                             installs one set of firewall rules. Run them as separate services.",
+                            a.name, b.name
+                        ),
+                    ));
+                }
+                // Without ports there is nothing in the outer header but two
+                // addresses and a protocol number, so two tunnels to one peer
+                // address cannot be told apart at all -- not even by the
+                // firewall rules, which would be identical.
+                if !a.interface.shape.has_ports()
+                    && let (Some(x), Some(y)) = (a.peer.endpoint, b.peer.endpoint)
+                    && x.ip() == y.ip()
+                {
+                    return Err(clash("peer address", x.ip().to_string()));
+                }
                 // Zero is "pick one at start-up", and two tunnels both doing
                 // that will pick differently. Only a port written down twice
                 // is a clash.
@@ -783,14 +886,6 @@ impl Config {
             parse_cidr(&iface.address).map_err(|p| invalid("interface.address", p))?;
         let netmask = mask_from_prefix(prefix);
 
-        let mtu = iface.mtu.unwrap_or(paqetz_dp::tun::DEFAULT_MTU);
-        if !(576..=9000).contains(&mtu) {
-            return Err(invalid(
-                "interface.mtu",
-                format!("{mtu} is outside the usable range 576-9000"),
-            ));
-        }
-
         let profile_name = iface.profile.as_deref().unwrap_or("linux-6");
         let profile = paqetz_tcpwire::profile::by_name(profile_name).ok_or_else(|| {
             let known: Vec<&str> = paqetz_tcpwire::profile::ALL
@@ -803,16 +898,27 @@ impl Config {
             )
         })?;
 
-        let carrier = match iface.carrier.as_deref().unwrap_or("midstream") {
-            "midstream" => paqetz_tcpwire::Carrier::Midstream,
-            "handshake" => paqetz_tcpwire::Carrier::Handshake,
+        let shape = match iface.carrier.as_deref().unwrap_or("midstream") {
+            "midstream" => Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
+            "handshake" => Shape::Tcp(paqetz_tcpwire::Carrier::Handshake),
+            "gre" => Shape::Gre,
             other => {
                 return Err(invalid(
                     "interface.carrier",
-                    format!("expected \"midstream\" or \"handshake\", got {other:?}"),
+                    format!("expected \"midstream\", \"handshake\" or \"gre\", got {other:?}"),
                 ));
             }
         };
+
+        // After the carrier, because the room left for an inner packet is
+        // whatever its outer header does not take.
+        let mtu = iface.mtu.unwrap_or_else(|| shape.default_mtu());
+        if !(576..=9000).contains(&mtu) {
+            return Err(invalid(
+                "interface.mtu",
+                format!("{mtu} is outside the usable range 576-9000"),
+            ));
+        }
 
         let sequencing = match iface.sequencing.as_deref().unwrap_or("opaque") {
             "opaque" => paqetz_tcpwire::Sequencing::Opaque,
@@ -984,7 +1090,7 @@ impl Config {
                     name
                 },
                 profile,
-                carrier,
+                shape,
                 sequencing,
                 datapath,
                 transmit,
@@ -1295,6 +1401,113 @@ mod tests {
         assert_eq!(on.interface.repeat.capacity, 1200);
         assert_eq!(on.interface.repeat.deadline, 700);
         assert_eq!(on.interface.repeat.asks, 3);
+    }
+
+    #[test]
+    fn a_carrier_without_ports_is_sized_and_filtered_for_its_own_header() {
+        let c = with_interface("carrier = \"gre\"").expect("parse");
+        assert_eq!(c.interface.shape, Shape::Gre);
+        assert!(!c.interface.shape.has_ports(), "nothing to rotate between");
+        assert_eq!(c.interface.shape.protocol(), 47);
+
+        // The same twelve bytes of slack against a 1500-byte path as the
+        // fake-TCP default, over a header thirty-six bytes smaller.
+        assert_eq!(c.interface.mtu, 1436);
+        assert_eq!(
+            c.interface.mtu as usize
+                + c.interface.shape.overhead()
+                + paqetz_core::framing::OVERHEAD,
+            1488,
+        );
+        // And the default for the other shape is untouched: recomputing it
+        // would have raised it by that slack and enlarged every packet of
+        // every tunnel already running.
+        let tcp = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert_eq!(tcp.interface.mtu, paqetz_dp::tun::DEFAULT_MTU);
+
+        // An MTU written down still wins over either.
+        let set = with_interface("carrier = \"gre\"\nmtu = 1200").expect("parse");
+        assert_eq!(set.interface.mtu, 1200);
+    }
+
+    /// Two tunnels, with the carrier line and peer endpoint of each supplied.
+    fn pair(a_carrier: &str, a_endpoint: &str, b_carrier: &str, b_endpoint: &str) -> String {
+        format!(
+            r#"
+[[tunnel]]
+name = "one"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.7.0.2/24"
+device = "paqetz0"
+{a_carrier}
+[tunnel.peer]
+public_key = "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo="
+endpoint = "{a_endpoint}"
+tunnel_address = "10.7.0.1"
+
+[[tunnel]]
+name = "two"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.8.0.2/24"
+device = "paqetz1"
+{b_carrier}
+[tunnel.peer]
+public_key = "TmwuUmwHVDe4Q0z0PmVEZ0wYyBIDN0kUq5xkQzk0T3E="
+endpoint = "{b_endpoint}"
+tunnel_address = "10.8.0.1"
+"#
+        )
+    }
+
+    #[test]
+    fn two_shapes_in_one_process_are_refused() {
+        // One process installs one set of firewall rules, and rules naming
+        // ports say nothing about a protocol number. Carrying both would leave
+        // one tunnel with the kernel free to answer its packets, which is the
+        // leak the rules exist to close.
+        let mixed = pair(
+            "carrier = \"gre\"",
+            "203.0.113.5:8443",
+            "",
+            "198.51.100.7:8443",
+        );
+        let err = Config::parse(&mixed).expect_err("should refuse");
+        assert!(err.to_string().contains("different shapes"), "{err}");
+
+        // Either shape twice over is fine.
+        for line in ["carrier = \"gre\"", ""] {
+            assert!(
+                Config::parse(&pair(line, "203.0.113.5:8443", line, "198.51.100.7:8443")).is_ok(),
+                "two of one shape should be allowed: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_ports_two_tunnels_to_one_address_are_refused() {
+        // Two addresses and a protocol number is the whole outer header, so
+        // two tunnels to one peer address have nothing to tell their traffic
+        // apart by -- and their firewall rules would be identical too.
+        let same = pair(
+            "carrier = \"gre\"",
+            "203.0.113.5:8443",
+            "carrier = \"gre\"",
+            "203.0.113.5:9443",
+        );
+        let err = Config::parse(&same).expect_err("should refuse");
+        assert!(err.to_string().contains("peer address"), "{err}");
+
+        // The port differs and that is enough for the shape that has ports.
+        let ok = pair("", "203.0.113.5:8443", "", "203.0.113.5:9443");
+        assert!(
+            Config::parse(&ok).is_ok(),
+            "with ports, one address serves two tunnels"
+        );
     }
 
     #[test]
@@ -1658,7 +1871,10 @@ tunnel_address = "10.7.0.2"
         assert_eq!(c.interface.mtu, paqetz_dp::tun::DEFAULT_MTU);
         assert_eq!(c.interface.device, "paqetz0");
         assert_eq!(c.interface.profile.name, "linux-6");
-        assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Midstream);
+        assert_eq!(
+            c.interface.shape,
+            Shape::Tcp(paqetz_tcpwire::Carrier::Midstream)
+        );
     }
 
     #[test]
@@ -2104,7 +2320,10 @@ tunnel_address = "10.7.0.2"
             .expect("parse")
             .into_only()
             .expect("one tunnel");
-        assert_eq!(c.interface.carrier, paqetz_tcpwire::Carrier::Handshake);
+        assert_eq!(
+            c.interface.shape,
+            Shape::Tcp(paqetz_tcpwire::Carrier::Handshake)
+        );
     }
 
     #[test]

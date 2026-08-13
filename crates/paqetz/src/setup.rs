@@ -127,6 +127,16 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         "# paqetz — SERVER. This file belongs on the host with the"
     )?;
     writeln!(s, "# stable address, the one the client connects to.\n")?;
+    // Written into both files, commented out, and not offered as a question.
+    // Which of these a path carries is a property of that path and cannot be
+    // discovered from here -- so the value is left where someone who has
+    // measured their own path can find it, and nowhere more prominent.
+    let carrier_note = |t: &mut String| -> std::fmt::Result {
+        writeln!(t, "\n# carrier = \"midstream\"   # or \"gre\"")?;
+        writeln!(t, "# Both ends must agree. Change one and the other stops")?;
+        writeln!(t, "# hearing anything at all.")
+    };
+
     // The form that can hold several tunnels, written even for one. A file that
     // grows a second destination later should not have to change shape first,
     // and one shape means one thing for everyone to learn.
@@ -151,6 +161,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(s, "# Bringing it up is not paqetz's job.")?;
         writeln!(s, "egress = \"{iface}\"")?;
     }
+    carrier_note(&mut s)?;
     writeln!(s, "\n[tunnel.peer]")?;
     writeln!(s, "# The client's public key.")?;
     writeln!(s, "public_key = \"{}\"", client.public.to_base64())?;
@@ -182,6 +193,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(c, "route_marked = {mark}")?;
         writeln!(c, "route_table  = {mark}")?;
     }
+    carrier_note(&mut c)?;
     writeln!(c, "\n[tunnel.peer]")?;
     writeln!(c, "# The server's public key.")?;
     writeln!(c, "public_key = \"{}\"", server.public.to_base64())?;

@@ -424,12 +424,22 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // between them while it runs, and a rule that named only the current one
     // would stop covering the flow the moment it moved -- leaving the kernel
     // free to reset the very traffic the rules exist to protect.
-    let ports: Vec<u16> = tunnels.iter().flat_map(Tunnel::ports).copied().collect();
+    //
+    // A carrier with no ports names its protocol number instead, and the two
+    // cannot be mixed: the rules for one say nothing about the other, so a
+    // process carrying both shapes at once is refused when the configuration is
+    // read rather than half-protected here.
+    let guard = match tunnels.first().map(Tunnel::shape) {
+        Some(shape) if !shape.has_ports() => paqetz_fw::rules::Guard::Protocol(shape.protocol()),
+        _ => paqetz_fw::rules::Guard::Ports(
+            tunnels.iter().flat_map(Tunnel::ports).copied().collect(),
+        ),
+    };
 
     // The rules are load-bearing, not advisory (D9): without them the kernel
     // resets the flow. One table names every port, in one transaction.
     let fw = if process.manage_firewall {
-        match Firewall::detect(&ports) {
+        match Firewall::detect(guard) {
             Ok(fw) => {
                 fw.apply()?;
                 Some(fw)
@@ -1195,15 +1205,16 @@ fn firewall(
     // `plan` must work on a host with neither tool installed — printing what to
     // run by hand is exactly what it is for.
     if matches!(action, FirewallAction::Plan) {
-        let fw = Firewall::detect(&[port])
-            .unwrap_or_else(|_| Firewall::with_backend(paqetz_fw::Backend::Nft, &[port]));
+        let guard = paqetz_fw::rules::Guard::Ports(vec![port]);
+        let fw = Firewall::detect(guard.clone())
+            .unwrap_or_else(|_| Firewall::with_backend(paqetz_fw::Backend::Nft, guard));
         for line in fw.plan() {
             println!("{line}");
         }
         return Ok(());
     }
 
-    let fw = Firewall::detect(&[port])?;
+    let fw = Firewall::detect(paqetz_fw::rules::Guard::Ports(vec![port]))?;
     match action {
         FirewallAction::Plan => unreachable!("handled above"),
         FirewallAction::Apply => fw.apply()?,

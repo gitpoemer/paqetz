@@ -109,7 +109,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug, Clone)]
 pub struct Firewall {
     backend: Backend,
-    ports: Vec<u16>,
+    guard: rules::Guard,
 }
 
 impl Firewall {
@@ -117,13 +117,10 @@ impl Firewall {
     ///
     /// # Errors
     /// Returns [`Error::NoBackend`] if neither tool can be run.
-    pub fn detect(ports: &[u16]) -> Result<Self> {
+    pub fn detect(guard: rules::Guard) -> Result<Self> {
         for backend in [Backend::Nft, Backend::Iptables] {
             if probe(backend) {
-                return Ok(Self {
-                    backend,
-                    ports: ports.to_vec(),
-                });
+                return Ok(Self { backend, guard });
             }
         }
         Err(Error::NoBackend)
@@ -131,11 +128,8 @@ impl Firewall {
 
     /// Uses a specific backend, without probing.
     #[must_use]
-    pub fn with_backend(backend: Backend, ports: &[u16]) -> Self {
-        Self {
-            backend,
-            ports: ports.to_vec(),
-        }
+    pub fn with_backend(backend: Backend, guard: rules::Guard) -> Self {
+        Self { backend, guard }
     }
 
     /// The backend in use.
@@ -154,9 +148,9 @@ impl Firewall {
         match self.backend {
             Backend::Nft => vec![format!(
                 "nft -f - <<'EOF'\n{}EOF",
-                rules::nft_apply(&self.ports)
+                rules::nft_apply(&self.guard)
             )],
-            Backend::Iptables => rules::iptables_rules(&self.ports)
+            Backend::Iptables => rules::iptables_rules(&self.guard)
                 .iter()
                 .map(|r| format!("iptables {}", r.args(Op::Append).join(" ")))
                 .collect(),
@@ -169,9 +163,9 @@ impl Firewall {
     /// Returns the backend's failure.
     pub fn apply(&self) -> Result<()> {
         match self.backend {
-            Backend::Nft => nft_script(&rules::nft_apply(&self.ports)),
+            Backend::Nft => nft_script(&rules::nft_apply(&self.guard)),
             Backend::Iptables => {
-                for rule in rules::iptables_rules(&self.ports) {
+                for rule in rules::iptables_rules(&self.guard) {
                     // Checking first is what makes this idempotent: `iptables`
                     // will happily append a duplicate of a rule that is already
                     // there, and duplicates then survive one revert each.
@@ -193,7 +187,7 @@ impl Firewall {
         match self.backend {
             Backend::Nft => nft_script(&rules::nft_revert()),
             Backend::Iptables => {
-                for rule in rules::iptables_rules(&self.ports) {
+                for rule in rules::iptables_rules(&self.guard) {
                     // Delete repeatedly: a crashed earlier run may have left
                     // duplicates, and one delete removes only one copy.
                     while run(Backend::Iptables, &rule.args(Op::Delete)).is_ok() {}
@@ -221,7 +215,7 @@ impl Firewall {
                 })
             }
             Backend::Iptables => {
-                let all = rules::iptables_rules(&self.ports);
+                let all = rules::iptables_rules(&self.guard);
                 let present = all
                     .iter()
                     .filter(|r| run(Backend::Iptables, &r.args(Op::Check)).is_ok())
@@ -338,7 +332,7 @@ mod tests {
 
     #[test]
     fn the_nft_plan_is_a_single_transaction() {
-        let fw = Firewall::with_backend(Backend::Nft, &[9999]);
+        let fw = Firewall::with_backend(Backend::Nft, rules::Guard::Ports(vec![9999]));
         let plan = fw.plan();
         assert_eq!(plan.len(), 1, "nft applies the whole ruleset atomically");
         assert!(plan[0].contains("nft -f -"));
@@ -347,7 +341,7 @@ mod tests {
 
     #[test]
     fn the_iptables_plan_lists_every_rule_verbatim() {
-        let fw = Firewall::with_backend(Backend::Iptables, &[9999]);
+        let fw = Firewall::with_backend(Backend::Iptables, rules::Guard::Ports(vec![9999]));
         let plan = fw.plan();
         assert_eq!(plan.len(), 3);
         for line in &plan {
@@ -362,7 +356,7 @@ mod tests {
         // The plan is documentation an operator may paste into a shell, so it
         // must not contain anything that needs further substitution.
         for backend in [Backend::Nft, Backend::Iptables] {
-            for line in Firewall::with_backend(backend, &[9999]).plan() {
+            for line in Firewall::with_backend(backend, rules::Guard::Ports(vec![9999])).plan() {
                 assert!(!line.contains("{}"), "unsubstituted placeholder: {line}");
                 assert!(!line.contains("PORT"), "unsubstituted port: {line}");
             }
@@ -386,7 +380,7 @@ mod tests {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
 
-        let script = rules::nft_apply(&[9999]);
+        let script = rules::nft_apply(&rules::Guard::Ports(vec![9999]));
         let mut child = Command::new("nft")
             .arg("-c")
             .arg("-f")
@@ -412,7 +406,7 @@ mod tests {
     #[test]
     #[ignore = "invokes nft; run with --ignored in a throwaway namespace"]
     fn apply_is_idempotent_and_revert_is_complete() {
-        let fw = Firewall::with_backend(Backend::Nft, &[9999]);
+        let fw = Firewall::with_backend(Backend::Nft, rules::Guard::Ports(vec![9999]));
         assert_eq!(fw.status().expect("status"), Status::Absent);
 
         fw.apply().expect("apply");

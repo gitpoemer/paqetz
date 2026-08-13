@@ -4,6 +4,8 @@
 # virtual Ethernet pair.
 #
 #   ./scripts/test-e2e.sh
+#   CARRIER=gre ./scripts/test-e2e.sh      # the same suite, other wire shape
+#   DATAPATH=simple ./scripts/test-e2e.sh
 #
 # Everything happens inside two namespaces created for the run and deleted
 # afterwards. No route, address, device, or firewall rule is created in the
@@ -67,12 +69,15 @@ SRV_PUB=$(echo "${srv_keys}"  | awk -F'"' '/public/  {print $2}')
 CLI_PRIV=$(echo "${cli_keys}" | awk -F'"' '/private/ {print $2}')
 CLI_PUB=$(echo "${cli_keys}"  | awk -F'"' '/public/  {print $2}')
 
+CARRIER=${CARRIER:-midstream}
+
 cat > "${WORK}/server.toml" <<EOF
 [interface]
 private_key = "${SRV_PRIV}"
 address = "${SRV_INNER}/24"
 listen_port = ${PORT}
 device = "pq-srv"
+carrier = "${CARRIER}"
 datapath = "${DATAPATH:-batched}"
 health_interval = 2
 
@@ -82,7 +87,10 @@ tunnel_address = "${CLI_INNER}"
 EOF
 
 # DATAPATH lets the whole suite be re-run against the simple path, so the
-# batched one is never the only thing that has been exercised.
+# batched one is never the only thing that has been exercised. CARRIER does the
+# same for the shape on the wire: everything below is carrier-independent
+# except the block that inspects the wire itself, which checks whichever was
+# asked for.
 DATAPATH=${DATAPATH:-batched}
 
 cat > "${WORK}/client.toml" <<EOF
@@ -91,6 +99,7 @@ private_key = "${CLI_PRIV}"
 address = "${CLI_INNER}/24"
 listen_port = $((PORT + 1))
 device = "pq-cli"
+carrier = "${CARRIER}"
 datapath = "${DATAPATH}"
 health_interval = 2
 
@@ -356,10 +365,19 @@ else
     bad "the policy route was not installed"
 fi
 
-# --- the wire looks like TCP ------------------------------------------------
+# --- the wire looks like what was asked for ---------------------------------
 log "what the wire looks like"
+
+if [[ ${CARRIER} == gre ]]; then
+    FILTER="ip proto 47"
+    WHAT="GRE"
+else
+    FILTER="tcp port ${PORT}"
+    WHAT="TCP on port ${PORT}"
+fi
+
 sudo ip netns exec "${SRV_NS}" timeout 4 \
-    tcpdump -i veth-srv -c 20 -w "${WORK}/wire.pcap" "tcp port ${PORT}" >/dev/null 2>&1 &
+    tcpdump -i veth-srv -c 20 -w "${WORK}/wire.pcap" "${FILTER}" >/dev/null 2>&1 &
 DUMP=$!
 sleep 1
 sudo ip netns exec "${CLI_NS}" ping -c4 -i0.3 -W2 "${SRV_INNER}" >/dev/null 2>&1
@@ -368,27 +386,50 @@ wait "${DUMP}" 2>/dev/null
 if [[ -s ${WORK}/wire.pcap ]]; then
     captured=$(sudo tcpdump -r "${WORK}/wire.pcap" 2>/dev/null | wc -l)
     if [[ ${captured} -gt 0 ]]; then
-        ok "outer traffic is TCP on port ${PORT} (${captured} segments)"
+        ok "outer traffic is ${WHAT} (${captured} packets)"
     else
-        bad "no outer TCP segments were captured"
+        bad "no outer ${WHAT} packets were captured"
     fi
 
-    # Every segment must carry a correct TCP checksum. tcpdump verifies them
-    # when asked, and reports "cksum ... (incorrect" when they do not match.
+    # Checksums, of whichever header the carrier owns. tcpdump reports
+    # "incorrect ->" when one does not match what it computes.
     bad_cksum=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null |
         grep -c "incorrect ->" || true)
     if [[ ${bad_cksum} -eq 0 ]]; then
-        ok "every segment has a valid TCP checksum"
+        ok "every packet has valid checksums"
     else
-        bad "${bad_cksum} segments have an invalid TCP checksum"
+        bad "${bad_cksum} packets have an invalid checksum"
     fi
 
-    # No SYN should ever appear: the carrier is mid-stream by default (D14).
-    syns=$(sudo tcpdump -r "${WORK}/wire.pcap" "tcp[tcpflags] & tcp-syn != 0" 2>/dev/null | wc -l)
-    if [[ ${syns} -eq 0 ]]; then
-        ok "no SYN was emitted, as mid-stream mode requires"
+    if [[ ${CARRIER} == gre ]]; then
+        # The minimal RFC 2784 header, every optional field absent. The path
+        # this carrier exists for drops GRE it cannot parse, so a well-formed
+        # header is load-bearing rather than cosmetic.
+        malformed=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null |
+            grep -c "GREv1\|unknown-gre\|invalid" || true)
+        if [[ ${malformed} -eq 0 ]]; then
+            ok "every packet is well-formed GREv0"
+        else
+            bad "${malformed} packets are not well-formed GREv0"
+        fi
+
+        # Nothing should be numbering these. A sequence or key field would mean
+        # per-packet state this carrier deliberately does not keep.
+        flagged=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null |
+            grep -c "seq [0-9]\|key=" || true)
+        if [[ ${flagged} -eq 0 ]]; then
+            ok "no GRE sequence or key field is emitted"
+        else
+            bad "${flagged} packets carry optional GRE fields"
+        fi
     else
-        bad "${syns} SYN segments were emitted in mid-stream mode"
+        # No SYN should ever appear: the carrier is mid-stream by default (D14).
+        syns=$(sudo tcpdump -r "${WORK}/wire.pcap" "tcp[tcpflags] & tcp-syn != 0" 2>/dev/null | wc -l)
+        if [[ ${syns} -eq 0 ]]; then
+            ok "no SYN was emitted, as mid-stream mode requires"
+        else
+            bad "${syns} SYN segments were emitted in mid-stream mode"
+        fi
     fi
 else
     bad "no packets were captured on the wire"

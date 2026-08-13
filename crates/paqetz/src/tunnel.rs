@@ -274,8 +274,8 @@ struct PeerState {
     previous: Option<Session>,
     /// A handshake we have sent and are awaiting a reply to.
     pending: Option<Initiator>,
-    /// The synthetic TCP conversation with this peer.
-    carrier: Option<Carrier>,
+    /// The outer packets exchanged with this peer.
+    carrier: Option<Wire>,
     /// Recently sent packets, in case the peer asks for one again.
     outbox: crate::repeat::Outbox,
     /// Counters the peer has not delivered.
@@ -661,6 +661,68 @@ impl PeerState {
     }
 }
 
+/// The carrier in use, whichever shape it has.
+///
+/// One seam, so that everything above it -- the handshake, the replay window,
+/// rekeying, roaming, the repeat machinery -- never learns which of these put
+/// its bytes on the wire. That is what makes a second shape cheap: it is a
+/// different twenty-four or fifty-odd bytes in front of the same payload, not a
+/// different tunnel.
+enum Wire {
+    /// Hand-built TCP segments.
+    Tcp(Box<Carrier>),
+    /// GRE, IP protocol 47.
+    Gre(paqetz_tcpwire::gre::Carrier),
+}
+
+impl Wire {
+    /// Writes one packet, returning how many bytes it used.
+    fn data(
+        &mut self,
+        payload: &[u8],
+        out: &mut [u8],
+        now: Millis,
+    ) -> core::result::Result<usize, paqetz_tcpwire::Error> {
+        match self {
+            Self::Tcp(c) => c.data(payload, out, now),
+            // No clock: nothing in a GRE header is a function of time. The
+            // fake-TCP carrier needs one for its timestamp option.
+            Self::Gre(c) => c.data(payload, out),
+        }
+    }
+
+    /// The peer's address as this carrier currently addresses it.
+    fn remote(&self) -> SocketAddrV4 {
+        match self {
+            Self::Tcp(c) => {
+                let (ip, port) = c.remote();
+                SocketAddrV4::new(ip, port)
+            }
+            Self::Gre(c) => SocketAddrV4::new(c.remote(), 0),
+        }
+    }
+
+    /// Follows the peer to a new address.
+    fn set_remote(&mut self, remote: SocketAddrV4) {
+        match self {
+            Self::Tcp(c) => c.set_remote((*remote.ip(), remote.port())),
+            // The port is not dropped here so much as never existing: GRE has
+            // no ports, and `remote` reports zero for the same reason.
+            Self::Gre(c) => c.set_remote(*remote.ip()),
+        }
+    }
+
+    /// Folds an inbound packet into whatever state the carrier keeps.
+    ///
+    /// Nothing at all for GRE, which is the point of it: no sequence space, no
+    /// acknowledgement, no timestamp to echo, no connection phase.
+    fn on_receive(&mut self, seg: &segment::Segment<'_>) {
+        if let Self::Tcp(c) = self {
+            c.on_receive(seg);
+        }
+    }
+}
+
 /// A running tunnel.
 pub(crate) struct Tunnel {
     cfg: TunnelConfig,
@@ -726,7 +788,10 @@ impl Tunnel {
     /// # Errors
     /// Returns the first failure, with context describing what was attempted.
     pub(crate) fn start(cfg: TunnelConfig, health_interval: u64) -> Result<Self> {
-        if matches!(cfg.interface.carrier, paqetz_tcpwire::Carrier::Handshake) {
+        if matches!(
+            cfg.interface.shape,
+            crate::config::Shape::Tcp(paqetz_tcpwire::Carrier::Handshake)
+        ) {
             // The carrier can emit SYN/SYN+ACK/ACK, but nothing here drives that
             // exchange or retries a lost SYN yet. Refusing is better than
             // starting a tunnel whose first data segment fails with
@@ -735,6 +800,18 @@ impl Tunnel {
                 "carrier = \"handshake\" is not implemented yet; \
                  use the default \"midstream\"",
             ));
+        }
+
+        // Said once, at start-up, rather than left for someone to infer from a
+        // rotation line that never appears. `rotate` defaults to on, so most
+        // configurations that reach here are asking for something this carrier
+        // cannot do, and silently not doing it is the worse answer.
+        if cfg.interface.rotation.enabled && !cfg.interface.shape.has_ports() {
+            warn_!(
+                "this carrier has no ports, so `rotate` does nothing: its outer \
+                 packets are addresses and a protocol number, and none of those \
+                 can be varied"
+            );
         }
 
         let local_public =
@@ -796,7 +873,7 @@ impl Tunnel {
 
         let rx = os(
             format!("opening a capture socket on {interface}"),
-            PacketRx::open(&interface, paqetz_dp::bpf::Match::Ports(&ports)),
+            PacketRx::open(&interface, cfg.interface.shape.matching(&ports)),
         )?;
         let _ = rx.set_recv_buffer(8 * 1024 * 1024);
 
@@ -871,6 +948,47 @@ impl Tunnel {
     /// Milliseconds since the tunnel started.
     fn now(&self) -> Millis {
         Millis::try_from(self.started.elapsed().as_millis()).unwrap_or(Millis::MAX)
+    }
+
+    /// What this tunnel's packets look like on the wire.
+    pub(crate) const fn shape(&self) -> crate::config::Shape {
+        self.cfg.interface.shape
+    }
+
+    /// Builds a carrier of whichever shape the configuration asked for.
+    ///
+    /// `numbers` are the sequence bases and timestamp base derived from the
+    /// handshake. GRE has nowhere to put them and ignores all three -- there is
+    /// no sequence space to align and no timestamp to echo.
+    fn wire(
+        &self,
+        role: Role,
+        local: (Ipv4Addr, u16),
+        remote: (Ipv4Addr, u16),
+        numbers: (u32, u32, u32),
+    ) -> Wire {
+        match self.cfg.interface.shape {
+            crate::config::Shape::Tcp(carrier) => {
+                Wire::Tcp(Box::new(Carrier::new(paqetz_tcpwire::Config {
+                    local,
+                    remote,
+                    profile: self.cfg.interface.profile,
+                    role,
+                    carrier,
+                    isn: numbers.0,
+                    peer_isn: numbers.1,
+                    ts_base: numbers.2,
+                    sequencing: self.cfg.interface.sequencing,
+                })))
+            }
+            crate::config::Shape::Gre => Wire::Gre(paqetz_tcpwire::gre::Carrier::new(
+                paqetz_tcpwire::gre::Config {
+                    local: local.0,
+                    remote: remote.0,
+                    profile: self.cfg.interface.profile,
+                },
+            )),
+        }
     }
 
     /// Whether this end initiates handshakes.
@@ -1333,7 +1451,7 @@ impl Tunnel {
             return Ok(None);
         };
         let written = carrier.data(payload, frame, now)?;
-        let dst = carrier.remote().0;
+        let dst = *carrier.remote().ip();
 
         // Half of the liveness question -- but only for a packet carrying data.
         //
@@ -1393,7 +1511,7 @@ impl Tunnel {
                 else {
                     continue;
                 };
-                let Some(seg) = segment::parse_ethernet(bytes) else {
+                let Some(seg) = self.parse(bytes) else {
                     // Counted here as well as on the unbatched path. It was
                     // not, so which datapath was in use decided whether an
                     // unrecognised frame was a number or nothing at all.
@@ -1403,6 +1521,32 @@ impl Tunnel {
                 if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
                     self.note_inbound(&e);
                 }
+            }
+        }
+    }
+
+    /// Reads one captured frame as this carrier's, whichever shape it has.
+    ///
+    /// GRE has no ports, no sequence numbers and no flags, so the segment this
+    /// yields carries zero in those fields. Nothing reads them: dispatch to
+    /// msg1, msg2 or transport is by keyed `mac1` and by role, neither of which
+    /// is a property of the carrier, and `Wire::on_receive` folds them in only
+    /// for the shape that has them.
+    fn parse<'a>(&self, bytes: &'a [u8]) -> Option<segment::Segment<'a>> {
+        match self.cfg.interface.shape {
+            crate::config::Shape::Tcp(_) => segment::parse_ethernet(bytes),
+            crate::config::Shape::Gre => {
+                let got = paqetz_tcpwire::gre::parse_ethernet(bytes)?;
+                Some(segment::Segment {
+                    src: (got.src, 0),
+                    dst: (got.dst, 0),
+                    seq: 0,
+                    ack: 0,
+                    flags: 0,
+                    window: 0,
+                    ts_val: None,
+                    payload: got.payload,
+                })
             }
         }
     }
@@ -1445,7 +1589,7 @@ impl Tunnel {
         if !report.describes(
             local,
             (*peer.ip(), peer.port()),
-            paqetz_tcpwire::segment::PROTO_TCP,
+            self.cfg.interface.shape.protocol(),
         ) {
             // Not ours. Someone else's flow, or a forgery that did not know
             // where to aim -- either way it says nothing about this tunnel.
@@ -1512,7 +1656,7 @@ impl Tunnel {
             let Some(bytes) = frame.get(..n) else {
                 continue;
             };
-            let Some(seg) = segment::parse_ethernet(bytes) else {
+            let Some(seg) = self.parse(bytes) else {
                 self.handle_unparsed(bytes);
                 continue;
             };
@@ -1605,23 +1749,18 @@ impl Tunnel {
         // underneath it, so the carrier is built once and then kept.
         if state.carrier.is_none() {
             // We learn our own outer address from where the peer sent to.
-            state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
-                local: (seg.dst.0, seg.dst.1),
-                remote: seg.src,
-                profile: self.cfg.interface.profile,
-                role: Role::Responder,
-                carrier: self.cfg.interface.carrier,
-                isn: isn_r,
-                peer_isn: isn_i,
-                ts_base,
-                sequencing: self.cfg.interface.sequencing,
-            }));
+            state.carrier = Some(self.wire(
+                Role::Responder,
+                (seg.dst.0, seg.dst.1),
+                seg.src,
+                (isn_r, isn_i, ts_base),
+            ));
         }
 
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(());
         };
-        carrier.set_remote(seg.src);
+        carrier.set_remote(SocketAddrV4::new(seg.src.0, seg.src.1));
         // Fold in the segment that carried msg1, so our acknowledgement counts
         // the bytes the peer actually sent.
         carrier.on_receive(seg);
@@ -1718,7 +1857,7 @@ impl Tunnel {
             let was = state.endpoint;
             state.endpoint = Some(from);
             if let Some(carrier) = state.carrier.as_mut() {
-                carrier.set_remote((from.ip().to_owned(), from.port()));
+                carrier.set_remote(from);
             }
             Stats::bump(&self.stats.roams);
             // The single most useful line when a link is flapping: it says the
@@ -1928,7 +2067,7 @@ impl Tunnel {
     /// dropped and no session will exist until it changes.
     fn maybe_rotate(&self) {
         let rotation = self.cfg.interface.rotation;
-        if !rotation.enabled {
+        if !rotation.enabled || !self.cfg.interface.shape.has_ports() {
             return;
         }
         let now = self.now();
@@ -1980,17 +2119,12 @@ impl Tunnel {
         };
         let (isn, peer_isn, ts_base) =
             noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
-        state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
-            local: (ip, next),
-            remote: (*peer.ip(), peer.port()),
-            profile: self.cfg.interface.profile,
-            role: Role::Initiator,
-            carrier: self.cfg.interface.carrier,
-            isn,
-            peer_isn,
-            ts_base,
-            sequencing: self.cfg.interface.sequencing,
-        }));
+        state.carrier = Some(self.wire(
+            Role::Initiator,
+            (ip, next),
+            (*peer.ip(), peer.port()),
+            (isn, peer_isn, ts_base),
+        ));
         if stuck {
             // The point of moving was to try a tuple that might work. Leaving
             // the retry deadline where it was makes the new port wait out the
@@ -2132,17 +2266,12 @@ impl Tunnel {
         if state.carrier.is_none() {
             let (isn_i, isn_r, ts_base) =
                 noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
-            state.carrier = Some(Carrier::new(paqetz_tcpwire::Config {
-                local: self.local(),
-                remote: (*peer.ip(), peer.port()),
-                profile: self.cfg.interface.profile,
-                role: Role::Initiator,
-                carrier: self.cfg.interface.carrier,
-                isn: isn_i,
-                peer_isn: isn_r,
-                ts_base,
-                sequencing: self.cfg.interface.sequencing,
-            }));
+            state.carrier = Some(self.wire(
+                Role::Initiator,
+                self.local(),
+                (*peer.ip(), peer.port()),
+                (isn_i, isn_r, ts_base),
+            ));
         }
 
         let Some(carrier) = state.carrier.as_mut() else {
