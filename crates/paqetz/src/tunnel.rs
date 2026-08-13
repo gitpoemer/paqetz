@@ -136,6 +136,23 @@ const ROTATE_AFTER: Millis = 30 * 60 * 1_000;
 /// Random spread applied to each rotation, either side of the interval.
 const ROTATE_JITTER: Millis = 10 * 60 * 1_000;
 
+/// How many unanswered handshakes mean the five-tuple itself is the problem.
+///
+/// Rotation guards a *healthy* session against accumulating attention, and used
+/// to run only while one existed -- which switched it off at the one moment it
+/// was the cure. A path that swallows a flow does not announce it: packets keep
+/// leaving, nothing comes back, and because a handshake reuses the carrier it
+/// already has, every retry goes out of the same five-tuple that is being
+/// dropped. That is a deadlock with no exit but a restart, which recovers only
+/// because start-up picks the first port again.
+///
+/// Four tries is about twenty seconds, so the whole pool is tried inside
+/// [`REKEY_ATTEMPT_TIME`] -- a blocked port is ruled out before the peer would
+/// be called gone. Rotating when the peer is merely down costs nothing: the
+/// next port is as good as this one, and a responder learns where we are from
+/// the handshake itself.
+const ROTATE_AFTER_UNANSWERED: u32 = 4;
+
 /// The port after `current`, wrapping.
 ///
 /// Returns `current` when there is nowhere to go, so the caller can tell that
@@ -256,6 +273,15 @@ struct PeerState {
     confirm_tries: u8,
     /// When the carrier should move to the next port.
     rotate_at: Millis,
+    /// Handshakes sent since the last one that was answered.
+    ///
+    /// Distinct from `attempt_started`, which offered traffic clears, so it
+    /// cannot say how long a handshake has gone unanswered on a busy tunnel:
+    /// a client whose peer has stopped answering still has an application
+    /// handing it packets, and every one of those resets that clock. This
+    /// counts what actually matters -- tries with no reply -- and only a reply
+    /// resets it.
+    unanswered: u32,
     /// When a packet carrying actual data last arrived.
     ///
     /// Separate from `last_receive` so a keepalive cannot arm another one. Both
@@ -286,6 +312,7 @@ impl PeerState {
             confirm_tries: 0,
             last_data_receive: None,
             rotate_at: Millis::MAX,
+            unanswered: 0,
         }
     }
 
@@ -430,6 +457,15 @@ impl PeerState {
             && now.saturating_sub(self.last_handshake) >= RETRY_WHEN_GONE
     }
 
+    /// Whether the carrier, rather than the peer, is what is not working.
+    ///
+    /// Indistinguishable from a peer that is down, and deliberately so: the
+    /// answer is the same either way, and the one that is cheap to be wrong
+    /// about is moving.
+    fn stuck(&self) -> bool {
+        self.session.is_none() && self.unanswered >= ROTATE_AFTER_UNANSWERED
+    }
+
     /// Whether a handshake should be sent now.
     ///
     /// The whole decision, in one place a test can reach. It used to live
@@ -492,6 +528,9 @@ impl PeerState {
         self.last_keepalive = None;
         self.last_data_receive = None;
         self.attempt_started = None;
+        // A reply is the only thing that proves this five-tuple still reaches
+        // the peer, so it is the only thing that clears the count.
+        self.unanswered = 0;
     }
 
     /// Whether the peer has spoken and we owe it a word back.
@@ -1440,7 +1479,12 @@ impl Tunnel {
         let Some(out) = reply.get(..written) else {
             return Ok(());
         };
-        os("transmitting handshake reply", self.tx.send(out, dst)).map(|_| ())
+        os("transmitting handshake reply", self.tx.send(out, dst))?;
+        // A responder sends handshakes too, and counting only the initiator's
+        // meant its health line read "0 sent" no matter what it had done --
+        // a number that cannot change says nothing about the run it describes.
+        Stats::bump(&self.stats.handshakes_sent);
+        Ok(())
     }
 
     /// Completes our own handshake.
@@ -1710,26 +1754,36 @@ impl Tunnel {
     /// which is what a new connection looks like. Nothing is torn down: the
     /// capture filter already accepts every port in the pool, so replies still
     /// arriving for the one just left are received as normal.
+    ///
+    /// Two things ask for a move: the interval, which only a live session
+    /// counts down, and [`PeerState::stuck`], which says the tuple is being
+    /// dropped and no session will exist until it changes.
     fn maybe_rotate(&self) {
         if !self.cfg.interface.rotate {
             return;
         }
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.session.is_none() {
-            return;
-        }
-        // Armed once, when there is first a session to carry -- not in
-        // `established`, which runs on every rekey and would push the deadline
-        // out every two minutes so it never arrived.
-        if state.rotate_at == Millis::MAX {
-            state.rotate_at = now.saturating_add(self.rotation_interval());
-            return;
-        }
-        if now < state.rotate_at {
-            return;
+        let stuck = state.stuck();
+        if !stuck {
+            if state.session.is_none() {
+                return;
+            }
+            // Armed once, when there is first a session to carry -- not in
+            // `established`, which runs on every rekey and would push the
+            // deadline out every two minutes so it never arrived.
+            if state.rotate_at == Millis::MAX {
+                state.rotate_at = now.saturating_add(self.rotation_interval());
+                return;
+            }
+            if now < state.rotate_at {
+                return;
+            }
         }
         state.rotate_at = now.saturating_add(self.rotation_interval());
+        // Zeroed whether or not a move follows. Left standing, `stuck` holds on
+        // a single-port pool and this runs on every tick for ever.
+        state.unanswered = 0;
 
         if self.ports.len() < 2 {
             return;
@@ -1768,11 +1822,25 @@ impl Tunnel {
             ts_base,
             sequencing: self.cfg.interface.sequencing,
         }));
+        if stuck {
+            // The point of moving was to try a tuple that might work. Leaving
+            // the retry deadline where it was makes the new port wait out the
+            // old one's timer before anything is sent from it.
+            state.retry_at = now;
+        }
         if let Ok(mut local) = self.local.lock() {
             local.1 = next;
         }
         drop(state);
-        info!("{}carrier moved from port {current} to {next}", self.tag());
+        let why = if stuck {
+            "nothing came back"
+        } else {
+            "time on this one is up"
+        };
+        info!(
+            "{}carrier moved from port {current} to {next}: {why}",
+            self.tag()
+        );
     }
 
     /// How long the next five-tuple should last.
@@ -1924,15 +1992,19 @@ impl Tunnel {
         state.last_handshake = now;
         state.retry_at = now.saturating_add(Self::rekey_interval());
         state.attempt_started.get_or_insert(now);
+        state.unanswered = state.unanswered.saturating_add(1);
         drop(state);
-
-        Stats::bump(&self.stats.handshakes_sent);
-        debug!("handshake sent to {peer}");
 
         let Some(out) = frame.get(..written) else {
             return Ok(());
         };
-        os("transmitting handshake", self.tx.send(out, dst)).map(|_| ())
+        os("transmitting handshake", self.tx.send(out, dst))?;
+        // Counted here rather than above, so the number says what reached the
+        // wire. Bumped before the send it reported attempts, which is the one
+        // thing already visible from the tunnel being down.
+        Stats::bump(&self.stats.handshakes_sent);
+        debug!("handshake sent to {peer}");
+        Ok(())
     }
 }
 
@@ -2081,6 +2153,63 @@ mod tests {
             "a packet with nowhere to go is not a packet that was sent"
         );
         assert_eq!(stats.tx_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_tuple_nothing_answers_is_left_behind() {
+        // The failure this exists for: a client sent 3381 handshakes over four
+        // and a half hours, every one of them onto a port the path had stopped
+        // carrying, while the server's counters -- every one of them, including
+        // the ones that count packets it cannot make sense of -- stood still.
+        // Rotation was the cure and ran only while a session existed, so it was
+        // off exactly when it was needed. Only a restart recovered it, and the
+        // one thing a restart changes is the port.
+        let mut state = spoke(None, None);
+        assert!(!state.stuck(), "a fresh state has not tried anything yet");
+
+        for _ in 0..ROTATE_AFTER_UNANSWERED - 1 {
+            state.unanswered += 1;
+            assert!(
+                !state.stuck(),
+                "a handful of losses is a lossy path, not a dead tuple"
+            );
+        }
+        state.unanswered += 1;
+        assert!(state.stuck(), "past the threshold the tuple is the suspect");
+
+        // Traffic offered by the application clears `attempt_started`, which is
+        // why that clock could not be used here: on a busy tunnel it never runs
+        // out. This count answers to replies alone.
+        state.wants_to_send();
+        assert!(
+            state.stuck(),
+            "offered traffic is not an answer from the peer"
+        );
+
+        state.established(1_000, 120_000);
+        assert!(!state.stuck(), "a reply proves the tuple still reaches");
+    }
+
+    #[test]
+    fn a_live_session_is_never_stuck() {
+        // `stuck` asks whether the carrier is the problem. A rekey that goes
+        // unanswered raises the same count while a perfectly good session is
+        // still carrying traffic, and moving the port under it would turn a
+        // routine retry into a five-tuple change on a working tunnel.
+        let client = paqetz_core::KeyPair::generate().expect("client");
+        let server = paqetz_core::KeyPair::generate().expect("server");
+        let (session, _) = session_pair(&client, &server, 1);
+
+        let mut state = spoke(Some(0), Some(0));
+        state.session = Some(session);
+        state.unanswered = ROTATE_AFTER_UNANSWERED * 10;
+        assert!(
+            !state.stuck(),
+            "an unanswered rekey is not a reason to move a working carrier"
+        );
+
+        state.session = None;
+        assert!(state.stuck(), "with nothing left to carry it, it is");
     }
 
     #[test]
