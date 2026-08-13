@@ -411,12 +411,23 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             tunnel.set_label(cfg.name.clone());
         }
         tunnel.watch_config(path.to_path_buf());
-        log::info!(
-            "{}: outer port {}, log level {}",
-            cfg.name,
-            tunnel.local_port(),
-            level.name()
-        );
+        // A carrier with no ports has none to report, and naming one anyway
+        // sends whoever reads this looking for it on the wire.
+        if tunnel.shape().has_ports() {
+            log::info!(
+                "{}: outer port {}, log level {}",
+                cfg.name,
+                tunnel.local_port(),
+                level.name()
+            );
+        } else {
+            log::info!(
+                "{}: outer protocol {}, log level {}",
+                cfg.name,
+                tunnel.shape().protocol(),
+                level.name()
+            );
+        }
         tunnels.push(tunnel);
     }
 

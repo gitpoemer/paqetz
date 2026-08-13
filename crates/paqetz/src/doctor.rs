@@ -111,8 +111,12 @@ pub(crate) fn run(path: &Path) -> bool {
     // that is wrong is not necessarily the first.
     for t in cfg.iter().flat_map(|c| c.tunnels.iter()) {
         findings.push(check_device_free(&t.interface.device));
-        findings.push(check_port_free(t.interface.listen_port));
-        findings.push(check_standard_port(t.interface.listen_port));
+        // Both are about a port, and a carrier that has none would be told
+        // about one nothing uses.
+        if t.interface.shape.has_ports() {
+            findings.push(check_port_free(t.interface.listen_port));
+            findings.push(check_standard_port(t.interface.listen_port));
+        }
         findings.push(check_mtu(t.interface.mtu));
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));

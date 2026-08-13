@@ -1538,6 +1538,17 @@ impl Tunnel {
             crate::config::Shape::Tcp(_) => segment::parse_ethernet(bytes),
             crate::config::Shape::Raw(shell) => {
                 let got = paqetz_tcpwire::rawip::parse_ethernet(bytes, shell)?;
+                // Our own transmissions, on a kernel without
+                // PACKET_IGNORE_OUTGOING. The fake-TCP filter excludes them for
+                // free, because an outbound segment carries the peer's port
+                // where the filter looks; a filter matching only a protocol
+                // number cannot, so every packet sent would come straight back
+                // to be decrypted, fail, and be counted as a rejection -- at
+                // the full sending rate, and burying any real one.
+                let (ours, _) = self.local();
+                if got.src == ours && !ours.is_unspecified() {
+                    return None;
+                }
                 Some(segment::Segment {
                     src: (got.src, 0),
                     dst: (got.dst, 0),

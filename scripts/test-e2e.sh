@@ -438,12 +438,16 @@ if [[ -s ${WORK}/wire.pcap ]]; then
         # sequence field. The path this carrier exists for drops GRE it cannot
         # parse, so a well-formed header is load-bearing rather than cosmetic,
         # and optional fields would mean per-packet state it does not keep.
-        greted=$(sudo tcpdump -r "${WORK}/wire.pcap" 2>/dev/null | grep -c "GREv0, Flags \[none\]" || true)
-        grebad=$(sudo tcpdump -r "${WORK}/wire.pcap" 2>/dev/null | grep -c "GREv1\|GREv0, Flags \[[^]]" || true)
-        if [[ ${greted} -gt 0 && ${grebad} -eq 0 ]]; then
-            ok "every packet is GREv0 with no optional fields (${greted})"
+        # -v is required: without it tcpdump does not print the GRE header at
+        # all for a packet whose payload it cannot descend into, so both counts
+        # came back zero and the check reported a failure that was its own.
+        gre_all=$(sudo tcpdump -r "${WORK}/wire.pcap" -v 2>/dev/null | grep -c "GREv" || true)
+        gre_plain=$(sudo tcpdump -r "${WORK}/wire.pcap" -v 2>/dev/null |
+            grep -c "GREv0, Flags \[none\]" || true)
+        if [[ ${gre_all} -gt 0 && ${gre_plain} -eq ${gre_all} ]]; then
+            ok "all ${gre_all} packets are GREv0 with no optional fields"
         else
-            bad "${greted} plain GREv0 packets, ${grebad} with a version or flag set"
+            bad "${gre_plain} of ${gre_all} GRE packets are plain GREv0"
         fi
     else
         # No SYN should ever appear: the carrier is mid-stream by default (D14).

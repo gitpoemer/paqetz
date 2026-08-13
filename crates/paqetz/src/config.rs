@@ -1062,6 +1062,18 @@ impl Config {
                     .map_err(|e| invalid("peer.endpoint", format!("{s:?}: {e}")))?,
             ),
         };
+        // A carrier with no ports has none to record, and inbound packets
+        // arrive with zero where a port would be. Left as written, the first
+        // authenticated packet would differ from the configured endpoint,
+        // count as a roam, and rewrite it to this anyway -- reporting a peer
+        // that had moved on a tunnel that had done nothing of the kind.
+        let endpoint = endpoint.map(|e| {
+            if shape.has_ports() {
+                e
+            } else {
+                SocketAddrV4::new(*e.ip(), 0)
+            }
+        });
 
         let tunnel_address: Ipv4Addr = peer_raw
             .tunnel_address
@@ -1565,6 +1577,34 @@ tunnel_address = "10.8.0.1"
             // Twenty bytes of outer header, so four more than GRE for payload.
             assert_eq!(c.interface.mtu, 1440);
         }
+    }
+
+    #[test]
+    fn a_portless_carrier_records_no_port_for_its_peer() {
+        // Inbound packets carry zero where a port would be, so an endpoint
+        // written with one would differ from every packet that ever arrives:
+        // the first authenticated one counts as a roam and rewrites it to this
+        // anyway, reporting a peer that moved on a tunnel that did not.
+        for line in [
+            "carrier = \"gre\"",
+            "carrier = \"rawip\"\ncarrier_protocol = 143",
+        ] {
+            let c = with_interface(line).expect("parse");
+            let endpoint = c.peer.endpoint.expect("a client has one");
+            assert_eq!(endpoint.port(), 0, "{line}");
+            assert_eq!(
+                endpoint.ip().to_string(),
+                "203.0.113.5",
+                "the address is untouched"
+            );
+        }
+
+        // The shape that has ports keeps the one that was written down.
+        let tcp = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert_eq!(tcp.peer.endpoint.expect("endpoint").port(), 9999);
     }
 
     #[test]

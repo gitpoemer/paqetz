@@ -37,10 +37,15 @@ impl RawTx {
     /// Returns the underlying OS error, with a clearer message when the failure
     /// is simply a lack of privilege.
     pub fn open() -> io::Result<Self> {
+        // IPPROTO_RAW rather than a particular protocol: with IP_HDRINCL the
+        // kernel takes the protocol from the header we write, so the socket's
+        // own number only ever mattered for receiving -- which this never
+        // does. Naming TCP here was harmless and became untrue the moment a
+        // carrier emitted something else.
         let fd = sys::socket(
             libc::AF_INET,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::IPPROTO_TCP,
+            libc::IPPROTO_RAW,
         )
         .map_err(|e| sys::explain_privilege(e, "opening a raw transmit socket", "CAP_NET_RAW"))?;
 
