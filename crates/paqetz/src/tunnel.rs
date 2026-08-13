@@ -671,8 +671,8 @@ impl PeerState {
 enum Wire {
     /// Hand-built TCP segments.
     Tcp(Box<Carrier>),
-    /// GRE, IP protocol 47.
-    Gre(paqetz_tcpwire::gre::Carrier),
+    /// An IPv4 header, an optional small shell, and the payload.
+    Raw(paqetz_tcpwire::rawip::Carrier),
 }
 
 impl Wire {
@@ -687,7 +687,7 @@ impl Wire {
             Self::Tcp(c) => c.data(payload, out, now),
             // No clock: nothing in a GRE header is a function of time. The
             // fake-TCP carrier needs one for its timestamp option.
-            Self::Gre(c) => c.data(payload, out),
+            Self::Raw(c) => c.data(payload, out),
         }
     }
 
@@ -698,7 +698,7 @@ impl Wire {
                 let (ip, port) = c.remote();
                 SocketAddrV4::new(ip, port)
             }
-            Self::Gre(c) => SocketAddrV4::new(c.remote(), 0),
+            Self::Raw(c) => SocketAddrV4::new(c.remote(), 0),
         }
     }
 
@@ -708,7 +708,7 @@ impl Wire {
             Self::Tcp(c) => c.set_remote((*remote.ip(), remote.port())),
             // The port is not dropped here so much as never existing: GRE has
             // no ports, and `remote` reports zero for the same reason.
-            Self::Gre(c) => c.set_remote(*remote.ip()),
+            Self::Raw(c) => c.set_remote(*remote.ip()),
         }
     }
 
@@ -981,11 +981,12 @@ impl Tunnel {
                     sequencing: self.cfg.interface.sequencing,
                 })))
             }
-            crate::config::Shape::Gre => Wire::Gre(paqetz_tcpwire::gre::Carrier::new(
-                paqetz_tcpwire::gre::Config {
+            crate::config::Shape::Raw(shell) => Wire::Raw(paqetz_tcpwire::rawip::Carrier::new(
+                paqetz_tcpwire::rawip::Config {
                     local: local.0,
                     remote: remote.0,
                     profile: self.cfg.interface.profile,
+                    shell,
                 },
             )),
         }
@@ -1535,8 +1536,8 @@ impl Tunnel {
     fn parse<'a>(&self, bytes: &'a [u8]) -> Option<segment::Segment<'a>> {
         match self.cfg.interface.shape {
             crate::config::Shape::Tcp(_) => segment::parse_ethernet(bytes),
-            crate::config::Shape::Gre => {
-                let got = paqetz_tcpwire::gre::parse_ethernet(bytes)?;
+            crate::config::Shape::Raw(shell) => {
+                let got = paqetz_tcpwire::rawip::parse_ethernet(bytes, shell)?;
                 Some(segment::Segment {
                     src: (got.src, 0),
                     dst: (got.dst, 0),

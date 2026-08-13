@@ -132,7 +132,14 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     // discovered from here -- so the value is left where someone who has
     // measured their own path can find it, and nowhere more prominent.
     let carrier_note = |t: &mut String| -> std::fmt::Result {
-        writeln!(t, "\n# carrier = \"midstream\"   # or \"gre\"")?;
+        writeln!(
+            t,
+            "\n# carrier = \"midstream\"   # or \"gre\", or \"rawip\""
+        )?;
+        writeln!(
+            t,
+            "# carrier_protocol = 143   # required by \"rawip\", ignored by the rest"
+        )?;
         writeln!(t, "# Both ends must agree. Change one and the other stops")?;
         writeln!(t, "# hearing anything at all.")
     };

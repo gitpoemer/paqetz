@@ -1,16 +1,24 @@
-//! GRE carrier: RFC 2784, IP protocol 47.
+//! Raw-IP carriers: an IPv4 header, an optional small shell, and the payload.
 //!
 //! An alternative to the fake-TCP carrier for a path that refuses it. Measured
 //! on a censored route where a TCP five-tuple stopped being carried after
-//! hours while GRE went through untouched in both directions -- and where a
-//! *malformed* GRE packet was dropped, so something on that path parses this
-//! header even though nothing needs to.
+//! hours while both shapes here went through untouched in both directions --
+//! and where a *malformed* GRE packet was dropped, so something on that path
+//! parses that header even though nothing needs to.
+//!
+//! Two shells, because one path answered to each and neither is discoverable
+//! from anywhere but the path itself. [`Shell::Gre`] is RFC 2784 on protocol
+//! 47: a real protocol with a legitimate meaning, four bytes, and the more
+//! likely of the two to survive a change of provider. [`Shell::Bare`] is
+//! nothing at all under a protocol number of the operator's choosing -- twenty
+//! bytes total, the least an IP-routable tunnel can pay, and as conspicuous as
+//! whatever number is chosen makes it.
 //!
 //! Twenty-four bytes of outer header against fake-TCP's fifty-odd, no ports, no
 //! sequence numbers, no per-packet state at all. What it costs is reachability:
-//! protocol 47 has no ports, so it does not survive NAT, and plenty of networks
-//! drop it. That is a property of the path, not a setting, which is why this is
-//! a choice rather than a default.
+//! neither has ports, so neither survives NAT, and plenty of networks drop
+//! everything that is not TCP, UDP or ICMP. That is a property of the path, not
+//! a setting, which is why this is a choice rather than a default.
 //!
 //! Everything above the wire is unchanged. This produces and consumes the same
 //! opaque byte slices the fake-TCP carrier does, and the tunnel's handshake,
@@ -33,6 +41,51 @@ pub const GRE_LEN: usize = 4;
 /// Bytes of outer header a GRE-carried packet pays.
 pub const OVERHEAD: usize = IPV4_LEN + GRE_LEN;
 
+/// What sits between the IPv4 header and the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    /// A four-byte RFC 2784 header on protocol 47.
+    Gre,
+    /// Nothing, under this protocol number.
+    ///
+    /// The number is the operator's, because which one a path carries is only
+    /// discoverable by trying. It is also the entire signature of the traffic:
+    /// there is nothing else in the outer header to vary.
+    Bare(u8),
+}
+
+impl Shell {
+    /// The IP protocol number these packets declare.
+    #[must_use]
+    pub const fn protocol(self) -> u8 {
+        match self {
+            Self::Gre => PROTO_GRE,
+            Self::Bare(proto) => proto,
+        }
+    }
+
+    /// Bytes between the IPv4 header and the payload, as emitted.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        match self {
+            Self::Gre => GRE_LEN,
+            Self::Bare(_) => 0,
+        }
+    }
+
+    /// Whether this shell adds nothing at all.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Bytes of outer header a packet in this shell pays.
+    #[must_use]
+    pub const fn overhead(self) -> usize {
+        IPV4_LEN + self.len()
+    }
+}
+
 /// GRE protocol type for IPv4, matching the EtherType.
 const GRE_PROTO_IPV4: u16 = ETHERTYPE_IPV4;
 
@@ -54,6 +107,8 @@ pub struct Config {
     pub remote: Ipv4Addr,
     /// Which stack to resemble, for the TTL.
     pub profile: OsProfile,
+    /// What goes between the IPv4 header and the payload.
+    pub shell: Shell,
 }
 
 /// A GRE carrier for one peer.
@@ -67,6 +122,7 @@ pub struct Carrier {
     local: Ipv4Addr,
     remote: Ipv4Addr,
     profile: OsProfile,
+    shell: Shell,
     /// Packets sent, feeding the IP Identification.
     ///
     /// Deliberately `u32`: the hash below multiplies and then shifts down
@@ -86,6 +142,7 @@ impl Carrier {
             local: cfg.local,
             remote: cfg.remote,
             profile: cfg.profile,
+            shell: cfg.shell,
             counter: 0,
         }
     }
@@ -107,7 +164,8 @@ impl Carrier {
     /// Returns [`Error::Short`] if `out` cannot hold it, or [`Error::TooLong`]
     /// if the result would not fit an IPv4 length field.
     pub fn data(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize> {
-        let total = OVERHEAD + payload.len();
+        let overhead = self.shell.overhead();
+        let total = overhead + payload.len();
         if out.len() < total {
             return Err(Error::Short {
                 need: total,
@@ -134,18 +192,20 @@ impl Carrier {
             // pieces before the kernel joins them.
             c.u16(0x4000)?;
             c.u8(self.profile.ttl)?;
-            c.u8(PROTO_GRE)?;
+            c.u8(self.shell.protocol())?;
             c.u16(0)?; // checksum, filled below
             c.put(&self.local.octets())?;
             c.put(&self.remote.octets())?;
 
-            // The minimal RFC 2784 header, every optional field absent.
-            // Emitted in full rather than zeroed and forgotten: the path this
-            // was measured on drops GRE it cannot parse, so a well-formed
-            // header is load-bearing.
-            c.u16(0)?;
-            c.u16(GRE_PROTO_IPV4)?;
-            debug_assert_eq!(c.pos, OVERHEAD);
+            if self.shell == Shell::Gre {
+                // The minimal RFC 2784 header, every optional field absent.
+                // Emitted in full rather than zeroed and forgotten: the path
+                // this was measured on drops GRE it cannot parse, so a
+                // well-formed header is load-bearing.
+                c.u16(0)?;
+                c.u16(GRE_PROTO_IPV4)?;
+            }
+            debug_assert_eq!(c.pos, overhead);
             c.put(payload)?;
         }
 
@@ -174,19 +234,19 @@ pub struct Received<'a> {
     pub payload: &'a [u8],
 }
 
-/// Reads a GRE packet out of a captured Ethernet frame.
+/// Reads one of these packets out of a captured Ethernet frame.
 #[must_use]
-pub fn parse_ethernet(frame: &[u8]) -> Option<Received<'_>> {
+pub fn parse_ethernet(frame: &[u8], shell: Shell) -> Option<Received<'_>> {
     let ethertype = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
     if ethertype != ETHERTYPE_IPV4 {
         return None;
     }
-    parse_ipv4(frame.get(ETH_LEN..)?)
+    parse_ipv4(frame.get(ETH_LEN..)?, shell)
 }
 
 /// As above, starting at the IPv4 header.
 #[must_use]
-pub fn parse_ipv4(packet: &[u8]) -> Option<Received<'_>> {
+pub fn parse_ipv4(packet: &[u8], shell: Shell) -> Option<Received<'_>> {
     let ver_ihl = *packet.first()?;
     if ver_ihl >> 4 != 4 {
         return None;
@@ -197,7 +257,7 @@ pub fn parse_ipv4(packet: &[u8]) -> Option<Received<'_>> {
     }
     let ip_header_len = ihl_words * 4;
 
-    if *packet.get(9)? != PROTO_GRE {
+    if *packet.get(9)? != shell.protocol() {
         return None;
     }
 
@@ -216,10 +276,17 @@ pub fn parse_ipv4(packet: &[u8]) -> Option<Received<'_>> {
     let src = address(packet, 12)?;
     let dst = address(packet, 16)?;
 
-    let gre = packet.get(ip_header_len..total_len)?;
-    let flags = u16::from_be_bytes([*gre.first()?, *gre.get(1)?]);
-    let protocol = u16::from_be_bytes([*gre.get(2)?, *gre.get(3)?]);
-    let payload = gre.get(payload_offset(flags)?..)?;
+    let rest = packet.get(ip_header_len..total_len)?;
+    let (protocol, payload) = match shell {
+        Shell::Gre => {
+            let flags = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
+            let protocol = u16::from_be_bytes([*rest.get(2)?, *rest.get(3)?]);
+            (protocol, rest.get(payload_offset(flags)?..)?)
+        }
+        // Nothing to read and nothing to skip. What the payload is has to be
+        // known from configuration, because the wire does not say.
+        Shell::Bare(_) => (GRE_PROTO_IPV4, rest),
+    };
 
     Some(Received {
         src,
@@ -277,10 +344,15 @@ mod tests {
     use super::*;
 
     fn carrier() -> Carrier {
+        shelled(Shell::Gre)
+    }
+
+    fn shelled(shell: Shell) -> Carrier {
         Carrier::new(Config {
             local: Ipv4Addr::new(10, 0, 0, 1),
             remote: Ipv4Addr::new(203, 0, 113, 5),
             profile: crate::profile::LINUX_6,
+            shell,
         })
     }
 
@@ -321,6 +393,74 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_shell_is_an_ipv4_header_and_nothing_else() {
+        let mut out = vec![0u8; 200];
+        let n = shelled(Shell::Bare(143))
+            .data(b"payload", &mut out)
+            .expect("emit");
+        assert_eq!(n, IPV4_LEN + 7, "twenty bytes, the least an IP tunnel pays");
+        assert_eq!(out[9], 143, "the protocol number is the whole signature");
+        assert_eq!(u16::from_be_bytes([out[2], out[3]]), 27);
+        assert_eq!(
+            &out[IPV4_LEN..27],
+            b"payload",
+            "the payload begins where the IPv4 header ends"
+        );
+        assert_eq!(
+            u16::from_be_bytes([out[6], out[7]]),
+            0x4000,
+            "Don't Fragment, as every shape here sets"
+        );
+        assert_eq!(
+            checksum::of(&out[..IPV4_LEN]),
+            0,
+            "a correct header sums to zero over itself"
+        );
+    }
+
+    #[test]
+    fn a_bare_packet_survives_its_own_round_trip() {
+        let shell = Shell::Bare(143);
+        let mut out = vec![0u8; 2000];
+        let n = shelled(shell)
+            .data(b"the inner packet", &mut out)
+            .expect("emit");
+        let frame = captured(&out[..n]);
+        let got = parse_ethernet(&frame, shell).expect("parse");
+        assert_eq!(got.src, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(got.dst, Ipv4Addr::new(203, 0, 113, 5));
+        assert_eq!(got.payload, b"the inner packet");
+    }
+
+    #[test]
+    fn a_shell_only_reads_its_own_protocol_number() {
+        // Two shapes on one wire would each read the other's packets as their
+        // own and hand ciphertext to a parser expecting a header.
+        let mut out = vec![0u8; 200];
+        let n = shelled(Shell::Bare(143))
+            .data(b"payload", &mut out)
+            .expect("emit");
+        let frame = captured(&out[..n]);
+        assert!(parse_ethernet(&frame, Shell::Bare(143)).is_some());
+        for other in [Shell::Gre, Shell::Bare(4), Shell::Bare(142)] {
+            assert!(
+                parse_ethernet(&frame, other).is_none(),
+                "{other:?} should not read a protocol 143 packet"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_shell_costs_four_bytes_less_than_gre() {
+        assert_eq!(Shell::Gre.overhead(), 24);
+        assert_eq!(Shell::Bare(143).overhead(), 20);
+        assert!(Shell::Bare(143).is_empty());
+        assert!(!Shell::Gre.is_empty());
+        assert_eq!(Shell::Gre.protocol(), PROTO_GRE);
+        assert_eq!(Shell::Bare(143).protocol(), 143);
+    }
+
+    #[test]
     fn the_header_checksum_is_computed_rather_than_left_to_the_kernel() {
         // The AF_PACKET transmit path does not fill it in, and a zero IPv4
         // checksum is not legal anywhere.
@@ -340,7 +480,7 @@ mod tests {
         let mut out = vec![0u8; 2000];
         let n = carrier().data(b"the inner packet", &mut out).expect("emit");
         let frame = captured(&out[..n]);
-        let got = parse_ethernet(&frame).expect("parse");
+        let got = parse_ethernet(&frame, Shell::Gre).expect("parse");
         assert_eq!(got.src, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(got.dst, Ipv4Addr::new(203, 0, 113, 5));
         assert_eq!(got.protocol, 0x0800);
@@ -404,7 +544,7 @@ mod tests {
         packet[2..4].copy_from_slice(&total.to_be_bytes());
 
         let frame = captured(&packet);
-        let got = parse_ethernet(&frame).expect("parse");
+        let got = parse_ethernet(&frame, Shell::Gre).expect("parse");
         assert_eq!(
             got.payload, b"payload",
             "the key must be skipped, not read as payload"
@@ -418,11 +558,11 @@ mod tests {
 
         let mut packet = out[..n].to_vec();
         packet[9] = 6; // TCP
-        assert!(parse_ethernet(&captured(&packet)).is_none());
+        assert!(parse_ethernet(&captured(&packet), Shell::Gre).is_none());
 
         let mut frame = captured(&out[..n]);
         frame[12..14].copy_from_slice(&0x86DDu16.to_be_bytes());
-        assert!(parse_ethernet(&frame).is_none());
+        assert!(parse_ethernet(&frame, Shell::Gre).is_none());
     }
 
     #[test]
@@ -433,7 +573,7 @@ mod tests {
             let mut packet = out[..n].to_vec();
             packet[6..8].copy_from_slice(&flags.to_be_bytes());
             assert!(
-                parse_ethernet(&captured(&packet)).is_none(),
+                parse_ethernet(&captured(&packet), Shell::Gre).is_none(),
                 "flags {flags:#x} should not parse"
             );
         }
@@ -446,7 +586,7 @@ mod tests {
         let n = carrier().data(b"payload", &mut out).expect("emit");
         let mut packet = out[..n].to_vec();
         packet[2..4].copy_from_slice(&9000u16.to_be_bytes());
-        assert!(parse_ethernet(&captured(&packet)).is_none());
+        assert!(parse_ethernet(&captured(&packet), Shell::Gre).is_none());
     }
 
     #[test]
@@ -456,7 +596,7 @@ mod tests {
         let frame = captured(&out[..n]);
         for i in 0..frame.len() {
             let short = &frame[..i];
-            let _ = parse_ethernet(short);
+            let _ = parse_ethernet(short, Shell::Gre);
         }
     }
 

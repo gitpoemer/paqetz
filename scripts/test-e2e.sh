@@ -5,6 +5,7 @@
 #
 #   ./scripts/test-e2e.sh
 #   CARRIER=gre ./scripts/test-e2e.sh      # the same suite, other wire shape
+#   CARRIER=rawip PROTO=143 ./scripts/test-e2e.sh
 #   DATAPATH=simple ./scripts/test-e2e.sh
 #
 # Everything happens inside two namespaces created for the run and deleted
@@ -70,6 +71,13 @@ CLI_PRIV=$(echo "${cli_keys}" | awk -F'"' '/private/ {print $2}')
 CLI_PUB=$(echo "${cli_keys}"  | awk -F'"' '/public/  {print $2}')
 
 CARRIER=${CARRIER:-midstream}
+PROTO=${PROTO:-143}
+
+# Written only where it means something; every other carrier refuses it.
+CARRIER_PROTO=""
+if [[ ${CARRIER} == rawip ]]; then
+    CARRIER_PROTO="carrier_protocol = ${PROTO}"
+fi
 
 cat > "${WORK}/server.toml" <<EOF
 [interface]
@@ -78,6 +86,7 @@ address = "${SRV_INNER}/24"
 listen_port = ${PORT}
 device = "pq-srv"
 carrier = "${CARRIER}"
+${CARRIER_PROTO}
 datapath = "${DATAPATH:-batched}"
 health_interval = 2
 
@@ -100,6 +109,7 @@ address = "${CLI_INNER}/24"
 listen_port = $((PORT + 1))
 device = "pq-cli"
 carrier = "${CARRIER}"
+${CARRIER_PROTO}
 datapath = "${DATAPATH}"
 health_interval = 2
 
@@ -368,13 +378,20 @@ fi
 # --- the wire looks like what was asked for ---------------------------------
 log "what the wire looks like"
 
-if [[ ${CARRIER} == gre ]]; then
+case ${CARRIER} in
+gre)
     FILTER="ip proto 47"
     WHAT="GRE"
-else
+    ;;
+rawip)
+    FILTER="ip proto ${PROTO}"
+    WHAT="IP protocol ${PROTO}"
+    ;;
+*)
     FILTER="tcp port ${PORT}"
     WHAT="TCP on port ${PORT}"
-fi
+    ;;
+esac
 
 sudo ip netns exec "${SRV_NS}" timeout 4 \
     tcpdump -i veth-srv -c 20 -w "${WORK}/wire.pcap" "${FILTER}" >/dev/null 2>&1 &
@@ -393,8 +410,18 @@ if [[ -s ${WORK}/wire.pcap ]]; then
 
     # Checksums, of whichever header the carrier owns. tcpdump reports
     # "incorrect ->" when one does not match what it computes.
-    bad_cksum=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null |
-        grep -c "incorrect ->" || true)
+    #
+    # For GRE only the outer header is ours: the GRE protocol type says IPv4,
+    # which is what a real GRE tunnel carries, but the bytes after it are
+    # ciphertext. tcpdump duly parses them as IPv4 and duly finds nonsense, on
+    # the indented continuation lines. Only the unindented outer line is a
+    # claim about anything paqetz built.
+    if [[ ${CARRIER} == midstream || ${CARRIER} == handshake ]]; then
+        cksum_lines=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null)
+    else
+        cksum_lines=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null | grep -v "^[[:space:]]")
+    fi
+    bad_cksum=$(printf '%s\n' "${cksum_lines}" | grep -c "incorrect ->" || true)
     if [[ ${bad_cksum} -eq 0 ]]; then
         ok "every packet has valid checksums"
     else
@@ -402,25 +429,21 @@ if [[ -s ${WORK}/wire.pcap ]]; then
     fi
 
     if [[ ${CARRIER} == gre ]]; then
-        # The minimal RFC 2784 header, every optional field absent. The path
-        # this carrier exists for drops GRE it cannot parse, so a well-formed
-        # header is load-bearing rather than cosmetic.
-        malformed=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null |
-            grep -c "GREv1\|unknown-gre\|invalid" || true)
-        if [[ ${malformed} -eq 0 ]]; then
-            ok "every packet is well-formed GREv0"
+        # Asserted positively, on the GRE header alone. Grepping for words that
+        # mean trouble caught tcpdump failing to parse the *payload* as the
+        # IPv4 the GRE protocol type promises -- which is exactly what
+        # ciphertext looks like, and says nothing about the header.
+        #
+        # "Flags [none]" is the whole check: version 0, and no checksum, key or
+        # sequence field. The path this carrier exists for drops GRE it cannot
+        # parse, so a well-formed header is load-bearing rather than cosmetic,
+        # and optional fields would mean per-packet state it does not keep.
+        greted=$(sudo tcpdump -r "${WORK}/wire.pcap" 2>/dev/null | grep -c "GREv0, Flags \[none\]" || true)
+        grebad=$(sudo tcpdump -r "${WORK}/wire.pcap" 2>/dev/null | grep -c "GREv1\|GREv0, Flags \[[^]]" || true)
+        if [[ ${greted} -gt 0 && ${grebad} -eq 0 ]]; then
+            ok "every packet is GREv0 with no optional fields (${greted})"
         else
-            bad "${malformed} packets are not well-formed GREv0"
-        fi
-
-        # Nothing should be numbering these. A sequence or key field would mean
-        # per-packet state this carrier deliberately does not keep.
-        flagged=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null |
-            grep -c "seq [0-9]\|key=" || true)
-        if [[ ${flagged} -eq 0 ]]; then
-            ok "no GRE sequence or key field is emitted"
-        else
-            bad "${flagged} packets carry optional GRE fields"
+            bad "${greted} plain GREv0 packets, ${grebad} with a version or flag set"
         fi
     else
         # No SYN should ever appear: the carrier is mid-stream by default (D14).

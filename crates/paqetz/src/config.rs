@@ -231,13 +231,13 @@ pub(crate) enum Shape {
     /// The default. Ports mean it survives NAT, and a port is a thing to move
     /// when one stops being carried.
     Tcp(paqetz_tcpwire::Carrier),
-    /// GRE, IP protocol 47.
+    /// An IPv4 header, an optional small shell, and the payload.
     ///
     /// Half the outer header, no ports, and no per-packet state. No ports also
     /// means no NAT traversal and nothing to rotate, and a network that filters
     /// by protocol drops it outright -- so this is worth trying where the other
     /// has stopped working, and pointless where it has not.
-    Gre,
+    Raw(paqetz_tcpwire::rawip::Shell),
 }
 
 impl Shape {
@@ -245,7 +245,7 @@ impl Shape {
     pub(crate) const fn overhead(self) -> usize {
         match self {
             Self::Tcp(_) => paqetz_tcpwire::segment::MAX_OVERHEAD,
-            Self::Gre => paqetz_tcpwire::gre::OVERHEAD,
+            Self::Raw(shell) => shell.overhead(),
         }
     }
 
@@ -253,7 +253,7 @@ impl Shape {
     pub(crate) const fn matching(self, ports: &[u16]) -> paqetz_dp::bpf::Match<'_> {
         match self {
             Self::Tcp(_) => paqetz_dp::bpf::Match::Ports(ports),
-            Self::Gre => paqetz_dp::bpf::Match::Protocol(paqetz_tcpwire::gre::PROTO_GRE),
+            Self::Raw(shell) => paqetz_dp::bpf::Match::Protocol(shell.protocol()),
         }
     }
 
@@ -266,7 +266,7 @@ impl Shape {
     pub(crate) const fn protocol(self) -> u8 {
         match self {
             Self::Tcp(_) => paqetz_tcpwire::segment::PROTO_TCP,
-            Self::Gre => paqetz_tcpwire::gre::PROTO_GRE,
+            Self::Raw(shell) => shell.protocol(),
         }
     }
 
@@ -285,8 +285,8 @@ impl Shape {
     pub(crate) const fn default_mtu(self) -> u32 {
         match self {
             Self::Tcp(_) => paqetz_dp::tun::DEFAULT_MTU,
-            Self::Gre => {
-                let saved = paqetz_tcpwire::segment::MAX_OVERHEAD - Self::Gre.overhead();
+            Self::Raw(_) => {
+                let saved = paqetz_tcpwire::segment::MAX_OVERHEAD - self.overhead();
                 // Both are outer header lengths, tens of bytes; the conversion
                 // cannot fail, and a fallback of zero would only mean the
                 // fake-TCP default rather than a wrong one.
@@ -502,6 +502,7 @@ struct RawInterface {
     retransmit_deadline: Option<u64>,
     retransmit_asks: Option<u8>,
     retransmit_reorder: Option<u64>,
+    carrier_protocol: Option<u8>,
     #[serde(default)]
     fragment: Option<String>,
     #[serde(default)]
@@ -619,6 +620,49 @@ const MIN_REORDER: u64 = 1;
 
 /// The most. Past this the wait before asking outlasts the repeat's usefulness.
 const MAX_REORDER: u64 = 16;
+
+/// Whether a protocol number is one this carrier may take.
+///
+/// The refusals are not taste. Each of these is a number the host's own stack
+/// owns, and the firewall rules this carrier installs exempt its protocol from
+/// connection tracking in both directions -- so choosing one of them would
+/// quietly stop tracking the host's ordinary traffic, which is a far larger
+/// change than a tunnel setting has any business making. ICMP is worse still:
+/// the capture filter accepts fragmentation-needed reports on it, so the
+/// tunnel's own packets would be read as path-MTU messages.
+///
+/// Everything else is allowed. Most of it will be dropped by most networks,
+/// and which numbers are not is exactly what cannot be known from here.
+fn carrier_protocol(proto: u8) -> Result<()> {
+    let taken = |what: &str| {
+        Err(invalid(
+            "interface.carrier_protocol",
+            format!(
+                "{proto} is {what}, which this host's own stack handles. The rules this carrier \
+                 installs would exempt it from connection tracking for every program on the \
+                 machine, not just this tunnel."
+            ),
+        ))
+    };
+    match proto {
+        0 => Err(invalid(
+            "interface.carrier_protocol",
+            "0 is reserved and is not a protocol anything routes",
+        )),
+        1 => Err(invalid(
+            "interface.carrier_protocol",
+            "1 is ICMP, and the capture filter accepts path-MTU reports on it -- this tunnel's \
+             own packets would be read as those",
+        )),
+        6 => taken("TCP"),
+        17 => taken("UDP"),
+        47 => Err(invalid(
+            "interface.carrier_protocol",
+            "47 is GRE; write carrier = \"gre\" instead, which emits the header that goes with it",
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// The shortest a five-tuple may live, in seconds.
 ///
@@ -901,14 +945,38 @@ impl Config {
         let shape = match iface.carrier.as_deref().unwrap_or("midstream") {
             "midstream" => Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
             "handshake" => Shape::Tcp(paqetz_tcpwire::Carrier::Handshake),
-            "gre" => Shape::Gre,
+            "gre" => Shape::Raw(paqetz_tcpwire::rawip::Shell::Gre),
+            "rawip" => {
+                let Some(proto) = iface.carrier_protocol else {
+                    return Err(invalid(
+                        "interface.carrier_protocol",
+                        "required with carrier = \"rawip\": the packets are an IPv4 header and \
+                         the payload, so this number is the only thing identifying them. Which \
+                         one a path carries can only be found by trying.",
+                    ));
+                };
+                carrier_protocol(proto)?;
+                Shape::Raw(paqetz_tcpwire::rawip::Shell::Bare(proto))
+            }
             other => {
                 return Err(invalid(
                     "interface.carrier",
-                    format!("expected \"midstream\", \"handshake\" or \"gre\", got {other:?}"),
+                    format!(
+                        "expected \"midstream\", \"handshake\", \"gre\" or \"rawip\", \
+                         got {other:?}"
+                    ),
                 ));
             }
         };
+        if iface.carrier_protocol.is_some()
+            && !matches!(shape, Shape::Raw(paqetz_tcpwire::rawip::Shell::Bare(_)))
+        {
+            return Err(invalid(
+                "interface.carrier_protocol",
+                "only means something with carrier = \"rawip\"; every other carrier's protocol \
+                 number follows from what it is",
+            ));
+        }
 
         // After the carrier, because the room left for an inner packet is
         // whatever its outer header does not take.
@@ -1406,7 +1474,10 @@ mod tests {
     #[test]
     fn a_carrier_without_ports_is_sized_and_filtered_for_its_own_header() {
         let c = with_interface("carrier = \"gre\"").expect("parse");
-        assert_eq!(c.interface.shape, Shape::Gre);
+        assert_eq!(
+            c.interface.shape,
+            Shape::Raw(paqetz_tcpwire::rawip::Shell::Gre)
+        );
         assert!(!c.interface.shape.has_ports(), "nothing to rotate between");
         assert_eq!(c.interface.shape.protocol(), 47);
 
@@ -1462,6 +1533,50 @@ endpoint = "{b_endpoint}"
 tunnel_address = "10.8.0.1"
 "#
         )
+    }
+
+    #[test]
+    fn a_bare_carrier_needs_a_protocol_number_and_refuses_the_taken_ones() {
+        let err = with_interface("carrier = \"rawip\"").expect_err("should refuse");
+        assert!(err.to_string().contains("required"), "{err}");
+
+        // Each refusal is about the host, not taste: the rules this carrier
+        // installs exempt its protocol from connection tracking in both
+        // directions, so taking one the stack owns would stop tracking every
+        // program's traffic.
+        for (proto, why) in [
+            (0u8, "reserved"),
+            (1, "path-MTU"),
+            (6, "TCP"),
+            (17, "UDP"),
+            (47, "carrier = \"gre\""),
+        ] {
+            let err = with_interface(&format!("carrier = \"rawip\"\ncarrier_protocol = {proto}"))
+                .expect_err("should refuse {proto}");
+            assert!(err.to_string().contains(why), "{proto}: {err}");
+        }
+
+        // And the numbers measured on a real path are accepted.
+        for proto in [4u8, 58, 143, 253, 254] {
+            let c = with_interface(&format!("carrier = \"rawip\"\ncarrier_protocol = {proto}"))
+                .unwrap_or_else(|e| panic!("{proto} should be allowed: {e}"));
+            assert_eq!(c.interface.shape.protocol(), proto);
+            assert!(!c.interface.shape.has_ports());
+            // Twenty bytes of outer header, so four more than GRE for payload.
+            assert_eq!(c.interface.mtu, 1440);
+        }
+    }
+
+    #[test]
+    fn a_protocol_number_without_a_bare_carrier_is_refused() {
+        // Silently ignoring it would let someone believe they had changed the
+        // wire when they had not -- and the other end would agree, because it
+        // would ignore the same line.
+        for carrier in ["midstream", "gre"] {
+            let err = with_interface(&format!("carrier = {carrier:?}\ncarrier_protocol = 143"))
+                .expect_err("should refuse");
+            assert!(err.to_string().contains("rawip"), "{carrier}: {err}");
+        }
     }
 
     #[test]
