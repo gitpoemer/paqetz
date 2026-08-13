@@ -119,9 +119,20 @@ const MAX_INNER: usize = 9000;
 /// How many outer ports the carrier moves between.
 ///
 /// The filter covers all of them from the start, so moving costs nothing at
-/// run time. Four is enough for a day at the interval below, and each one is a
-/// single extra instruction in the capture filter.
-const PORT_POOL: usize = 4;
+/// run time, and each one is a single extra instruction in it. The firewall
+/// rules are generated from this same list when the tunnel starts, so the size
+/// is not something an operator has to keep in step by hand.
+///
+/// Twenty rather than four because the pool is also what a blocked port is
+/// escaped into, and a small pool returns to one sooner: at the interval below,
+/// four ports come back around in an hour, which turns a single long outage
+/// into a short one every hour. Twenty stretch that cycle to about five, so a
+/// port that stopped working gets a long rest before it is tried again.
+///
+/// The ceiling is the capture filter, whose jump offsets are single bytes: the
+/// program stays correct to roughly two hundred ports, so twenty is not near
+/// anything.
+const PORT_POOL: usize = 20;
 
 /// How long a carrier keeps one five-tuple before moving to the next.
 ///
@@ -131,10 +142,20 @@ const PORT_POOL: usize = 4;
 /// close them; one that never does is unusual whatever its packets look like.
 ///
 /// Jittered, because a fixed period is itself a pattern.
-const ROTATE_AFTER: Millis = 30 * 60 * 1_000;
+///
+/// Halved from thirty minutes on field evidence: a tunnel that had run eleven
+/// hours and carried nearly three gigabytes had its five-tuple stopped dead,
+/// and the only thing that ever brought it back was a restart -- which changes
+/// the port and nothing else. Whatever notices a flow here notices it well
+/// inside half an hour, so the flow should not last that long.
+const ROTATE_AFTER: Millis = 15 * 60 * 1_000;
 
 /// Random spread applied to each rotation, either side of the interval.
-const ROTATE_JITTER: Millis = 10 * 60 * 1_000;
+///
+/// A third of the interval, as before. Kept proportional rather than fixed: at
+/// the old ten minutes it would now reach from five minutes to twenty-five,
+/// which is less a jittered interval than an unpredictable one.
+const ROTATE_JITTER: Millis = 5 * 60 * 1_000;
 
 /// How many unanswered handshakes mean the five-tuple itself is the problem.
 ///

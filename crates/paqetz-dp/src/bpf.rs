@@ -293,6 +293,30 @@ mod tests {
     }
 
     #[test]
+    fn a_full_pool_still_matches_every_one_of_its_ports() {
+        // Four ports were the pool when the test above was written, and it kept
+        // testing four after the pool grew to twenty -- so the widths actually
+        // in use went unexercised. Run every port of a full-sized pool through
+        // the interpreter, and one either side of it.
+        let ports: Vec<u16> = (0..20u16).map(|i| 61_000 + i * 7).collect();
+        let prog = program(&ports);
+        for p in &ports {
+            assert_eq!(
+                run(&prog, &frame(0x0800, 6, 0, *p, 5)),
+                ACCEPT,
+                "port {p} of a full pool should be accepted"
+            );
+        }
+        for p in [60_999u16, 61_001, 61_134, 443] {
+            assert_eq!(
+                run(&prog, &frame(0x0800, 6, 0, p, 5)),
+                0,
+                "port {p} is not in the pool and should be dropped"
+            );
+        }
+    }
+
+    #[test]
     fn one_port_still_produces_what_it_always_did() {
         let prog = program(&[9999]);
         assert_eq!(prog.len(), program_len(1));
@@ -305,7 +329,7 @@ mod tests {
 
     #[test]
     fn the_program_grows_by_one_instruction_per_port() {
-        for n in 1..=8 {
+        for n in 1..=64 {
             let ports: Vec<u16> = (0..n)
                 .map(|i| 61_000 + u16::try_from(i).expect("small"))
                 .collect();
@@ -318,7 +342,11 @@ mod tests {
         // Checked for each width, because the offsets to `fail` are computed
         // from the number of ports and an off-by-one there is a filter that
         // silently drops everything.
-        for n in 1..=8usize {
+        // Well past any pool the tunnel builds, because the offsets are single
+        // bytes and `try_from` falls back to `u8::MAX` rather than failing --
+        // so growing the pool too far would not break loudly, it would build a
+        // filter whose jumps land past the end.
+        for n in 1..=64usize {
             let ports: Vec<u16> = (0..n)
                 .map(|i| 61_000 + u16::try_from(i).expect("small"))
                 .collect();
