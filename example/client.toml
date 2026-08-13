@@ -58,6 +58,39 @@ tunnel_address = "10.7.0.1"
 # output of `paqetz firewall plan` yourself.
 #manage_firewall = true
 
+# --- Moving the outer five-tuple ---
+#
+# On by default, and the initiating side only: the side that waits has to be
+# findable, so it keeps its configured port.
+#
+# A five-tuple that lives for hours and carries gigabytes stops working. What
+# that looks like from here is throughput collapsing with no loss at all, or the
+# flow going silent altogether -- packets keep leaving and nothing comes back --
+# and a restart curing it, because a restart is a new source port. Moving on a
+# timer is the same cure without the outage.
+#
+# The defaults below are what one censored path wanted when it was measured.
+# They are guesses about someone else's timers, so they are settings.
+#rotate = true
+
+# Seconds one port is kept, before jitter, and the random spread either side of
+# it. Jitter defaults to a third of the interval and must stay under it; 0 gives
+# a fixed period, which is itself a pattern.
+#rotate_after = 900
+#rotate_jitter = 300
+
+# How many ports to move between, 2 to 64. The pool is also what a blocked port
+# is escaped into, so it decides how long one rests before being tried again:
+# ports x rotate_after. The capture filter and the firewall rules are both
+# generated from this at start-up, so there is nothing to keep in step by hand.
+#rotate_ports = 20
+
+# How many unanswered handshakes mean the five-tuple itself is the problem
+# rather than the peer. Each attempt is about five seconds, so the default gives
+# up on a port after roughly twenty. Lower recovers faster and will sometimes
+# move away from a port that was merely unlucky on a lossy path.
+#rotate_after_unanswered = 4
+
 # --- Optional SOCKS5 front end (debugging) ---
 #
 # Off unless this section is present. It lets one program be pointed at the

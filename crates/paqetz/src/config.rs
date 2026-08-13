@@ -10,7 +10,7 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 
-use paqetz_core::{PrivateKey, PublicKey};
+use paqetz_core::{Millis, PrivateKey, PublicKey};
 use serde::Deserialize;
 
 /// Everything one process runs.
@@ -131,13 +131,20 @@ pub(crate) struct Interface {
     /// seconds, which is a metronome — a real trade, and the wrong side of it is
     /// losing the first click after a pause.
     pub(crate) keepalive: bool,
-    /// Whether the carrier moves between outer ports while it runs.
+    /// Whether the carrier moves between outer ports, and how.
     ///
     /// On by default. A five-tuple that lives for hours and carries gigabytes
     /// gets classified and then shaped: throughput collapses with no loss at
     /// all, and a restart cures it, because a restart is a new five-tuple.
     /// Moving on a timer is the same cure without the outage.
-    pub(crate) rotate: bool,
+    ///
+    /// `rotate` turns it on. The rest are guesses about a remote adversary's
+    /// timers, which is exactly the kind of guess that should be a setting:
+    /// `rotate_after` and `rotate_jitter` for how long one tuple lives,
+    /// `rotate_ports` for how many it moves between, and
+    /// `rotate_after_unanswered` for how quickly a tuple nothing answers on is
+    /// abandoned. They keep their values while it is off.
+    pub(crate) rotation: crate::tunnel::Rotation,
 }
 
 /// The SOCKS5 debugging front end.
@@ -420,6 +427,10 @@ struct RawInterface {
     retransmit_reorder: Option<u64>,
     #[serde(default)]
     rotate: Option<bool>,
+    rotate_after: Option<u64>,
+    rotate_jitter: Option<u64>,
+    rotate_ports: Option<usize>,
+    rotate_after_unanswered: Option<u32>,
     #[serde(default)]
     log: Option<String>,
     #[serde(default)]
@@ -529,6 +540,38 @@ const MIN_REORDER: u64 = 1;
 
 /// The most. Past this the wait before asking outlasts the repeat's usefulness.
 const MAX_REORDER: u64 = 16;
+
+/// The shortest a five-tuple may live, in seconds.
+///
+/// Below this the carrier is opening a new mid-stream flow every minute, which
+/// is not what a real host does either -- and every one of them has to be
+/// accepted afresh by whatever tracks connections on the path.
+const MIN_ROTATE_AFTER: u64 = 60;
+
+/// The longest, in seconds. A day is already far past the point where moving
+/// is what the setting is for.
+const MAX_ROTATE_AFTER: u64 = 24 * 60 * 60;
+
+/// The fewest ports worth moving between: one is nowhere to go.
+const MIN_ROTATE_PORTS: usize = 2;
+
+/// The most.
+///
+/// The hard ceiling is the capture filter, whose jump offsets are single bytes
+/// and stop being correct somewhere past two hundred. This is well under it,
+/// and is the width the filter is tested to. At the default interval sixty-four
+/// ports take most of a day to come around, so a larger pool holds ports that
+/// will not be reached before the process is restarted anyway.
+const MAX_ROTATE_PORTS: usize = 64;
+
+/// The most unanswered handshakes worth waiting through.
+///
+/// Past this the wait outlasts [`REKEY_ATTEMPT_TIME`], so the peer is called
+/// gone before the carrier is ever suspected -- which is the failure the
+/// setting exists to avoid.
+///
+/// [`REKEY_ATTEMPT_TIME`]: crate::tunnel
+const MAX_ROTATE_UNANSWERED: u32 = 16;
 
 /// The longest name Linux accepts for an interface, `IFNAMSIZ` less its NUL.
 const IFNAME_MAX: usize = 15;
@@ -1008,7 +1051,89 @@ impl Config {
                     }
                 },
                 keepalive: iface.keepalive.unwrap_or(true),
-                rotate: iface.rotate.unwrap_or(true),
+                rotation: {
+                    // One source for the defaults, as above, so "unset" and
+                    // what the tunnel would have used cannot drift apart.
+                    let defaults = crate::tunnel::Rotation::default();
+                    let seconds = |field, given: Option<u64>, fallback: Millis| match given {
+                        Some(s) if !(MIN_ROTATE_AFTER..=MAX_ROTATE_AFTER).contains(&s) => {
+                            Err(invalid(
+                                field,
+                                format!(
+                                    "expected {MIN_ROTATE_AFTER} to {MAX_ROTATE_AFTER} seconds"
+                                ),
+                            ))
+                        }
+                        Some(s) => Ok(Millis::from(s).saturating_mul(1_000)),
+                        None => Ok(fallback),
+                    };
+                    let after =
+                        seconds("interface.rotate_after", iface.rotate_after, defaults.after)?;
+                    // Jitter is subtracted from `after` to get the low end of
+                    // the band, so one at least as large as the interval puts
+                    // that end at or below zero -- rotating on every tick, which
+                    // is a tunnel that never holds a five-tuple long enough to
+                    // carry anything.
+                    //
+                    // Unset, it follows the interval rather than holding the
+                    // default's absolute value: a third, which is the ratio the
+                    // defaults have always had. Kept absolute, shortening only
+                    // `rotate_after` to anything under the default jitter would
+                    // be refused for a field the operator never wrote.
+                    let jitter = match iface.rotate_jitter {
+                        Some(0) => 0,
+                        None => after / 3,
+                        given => {
+                            let j = seconds("interface.rotate_jitter", given, defaults.jitter)?;
+                            if j >= after {
+                                return Err(invalid(
+                                    "interface.rotate_jitter",
+                                    "at least as long as `rotate_after`, which would let a \
+                                     five-tuple be replaced the moment it is made",
+                                ));
+                            }
+                            j
+                        }
+                    };
+                    let ports = match iface.rotate_ports {
+                        Some(n) if !(MIN_ROTATE_PORTS..=MAX_ROTATE_PORTS).contains(&n) => {
+                            return Err(invalid(
+                                "interface.rotate_ports",
+                                format!(
+                                    "expected {MIN_ROTATE_PORTS} to {MAX_ROTATE_PORTS}: one port \
+                                     is nowhere to move to, and past {MAX_ROTATE_PORTS} the pool \
+                                     holds ports that will not come around before a restart"
+                                ),
+                            ));
+                        }
+                        other => other.unwrap_or(defaults.ports),
+                    };
+                    let unanswered = match iface.rotate_after_unanswered {
+                        Some(0) => {
+                            return Err(invalid(
+                                "interface.rotate_after_unanswered",
+                                "zero abandons a five-tuple before anything has been asked of it",
+                            ));
+                        }
+                        Some(n) if n > MAX_ROTATE_UNANSWERED => {
+                            return Err(invalid(
+                                "interface.rotate_after_unanswered",
+                                format!(
+                                    "more than {MAX_ROTATE_UNANSWERED} waits longer than the peer \
+                                     takes to be called gone, so the carrier is never suspected"
+                                ),
+                            ));
+                        }
+                        other => other.unwrap_or(defaults.unanswered),
+                    };
+                    crate::tunnel::Rotation {
+                        enabled: iface.rotate.unwrap_or(defaults.enabled),
+                        after,
+                        jitter,
+                        ports,
+                        unanswered,
+                    }
+                },
                 gateway: iface.gateway.unwrap_or(false),
                 route_all: iface.route_all.unwrap_or(false),
                 route_marked: match iface.route_marked {
@@ -1137,6 +1262,86 @@ mod tests {
         assert_eq!(on.interface.repeat.capacity, 1200);
         assert_eq!(on.interface.repeat.deadline, 700);
         assert_eq!(on.interface.repeat.asks, 3);
+    }
+
+    #[test]
+    fn the_rotation_settings_are_read_and_kept_while_it_is_off() {
+        let c = with_interface(
+            "rotate = false\n\
+             rotate_after = 300\n\
+             rotate_jitter = 90\n\
+             rotate_ports = 32\n\
+             rotate_after_unanswered = 2",
+        )
+        .expect("parse");
+        // Off, and every measured value still there -- so it can be turned back
+        // on without rediscovering what this path wanted.
+        assert!(!c.interface.rotation.enabled);
+        assert_eq!(c.interface.rotation.after, 300_000);
+        assert_eq!(c.interface.rotation.jitter, 90_000);
+        assert_eq!(c.interface.rotation.ports, 32);
+        assert_eq!(c.interface.rotation.unanswered, 2);
+    }
+
+    #[test]
+    fn unset_rotation_settings_are_what_the_tunnel_would_have_used() {
+        // Two sources for one default is two things to keep in step, and the
+        // one that drifts is the one nobody is looking at.
+        let c = with_interface("rotate = true").expect("parse");
+        assert_eq!(c.interface.rotation, crate::tunnel::Rotation::default());
+    }
+
+    #[test]
+    fn each_rotation_setting_refuses_what_it_cannot_honour() {
+        for line in [
+            "rotate_after = 59",
+            "rotate_after = 86401",
+            "rotate_jitter = 86401",
+            "rotate_ports = 1",
+            "rotate_ports = 65",
+            "rotate_after_unanswered = 0",
+            "rotate_after_unanswered = 17",
+            // Jitter is subtracted from the interval, so one that reaches it
+            // puts the low end of the band at zero: a five-tuple replaced the
+            // moment it is made.
+            "rotate_after = 600\nrotate_jitter = 600",
+            "rotate_after = 600\nrotate_jitter = 900",
+        ] {
+            assert!(with_interface(line).is_err(), "{line} was accepted");
+        }
+        for line in [
+            "rotate_after = 60",
+            "rotate_after = 86400",
+            "rotate_ports = 2",
+            "rotate_ports = 64",
+            "rotate_after_unanswered = 1",
+            "rotate_after_unanswered = 16",
+            "rotate_after = 600\nrotate_jitter = 599",
+            // Zero is a deliberate choice -- a fixed period, for someone who
+            // wants one -- and is below the floor the others share.
+            "rotate_jitter = 0",
+        ] {
+            assert!(with_interface(line).is_ok(), "{line} was refused");
+        }
+    }
+
+    #[test]
+    fn a_jittered_interval_stays_inside_its_band() {
+        // The low end is `after - jitter`, and computing it by subtraction is
+        // one edit away from going under zero. Drawn repeatedly because the
+        // spread is random and a single draw proves nothing about the edges.
+        let r = crate::tunnel::Rotation {
+            after: 600_000,
+            jitter: 599_000,
+            ..crate::tunnel::Rotation::default()
+        };
+        for _ in 0..2_000 {
+            let drawn = r.interval();
+            assert!(
+                (1_000..=1_199_000).contains(&drawn),
+                "{drawn} is outside after +/- jitter"
+            );
+        }
     }
 
     #[test]
@@ -1763,7 +1968,7 @@ tunnel_address = "10.7.0.2"
             .into_only()
             .expect("one tunnel");
         assert!(c.interface.keepalive);
-        assert!(c.interface.rotate);
+        assert!(c.interface.rotation.enabled);
     }
 
     #[test]
@@ -1777,7 +1982,7 @@ tunnel_address = "10.7.0.2"
             let off = if keepalive {
                 c.interface.keepalive
             } else {
-                c.interface.rotate
+                c.interface.rotation.enabled
             };
             assert!(!off, "{line} should have taken effect");
         }
@@ -1794,7 +1999,7 @@ tunnel_address = "10.7.0.2"
             let on = if get {
                 c.interface.keepalive
             } else {
-                c.interface.rotate
+                c.interface.rotation.enabled
             };
             assert!(on, "{line} should have taken effect");
         }

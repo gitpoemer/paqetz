@@ -174,6 +174,54 @@ const ROTATE_JITTER: Millis = 5 * 60 * 1_000;
 /// the handshake itself.
 const ROTATE_AFTER_UNANSWERED: u32 = 4;
 
+/// What this end will spend on moving its five-tuple around.
+///
+/// The defaults above are what a censored path wanted when they were measured,
+/// which is not a claim about anyone else's path. Every one of them is a guess
+/// about a remote adversary's timers, so each is a setting rather than a
+/// constant -- and they keep their values while `rotate` is off, so it can be
+/// turned off and on again without losing what was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rotation {
+    /// Whether the carrier moves at all.
+    pub(crate) enabled: bool,
+    /// How long one five-tuple is kept, before jitter.
+    pub(crate) after: Millis,
+    /// Random spread applied either side of `after`.
+    pub(crate) jitter: Millis,
+    /// How many outer ports to move between.
+    pub(crate) ports: usize,
+    /// Unanswered handshakes that mean the tuple itself is the problem.
+    pub(crate) unanswered: u32,
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            after: ROTATE_AFTER,
+            jitter: ROTATE_JITTER,
+            ports: PORT_POOL,
+            unanswered: ROTATE_AFTER_UNANSWERED,
+        }
+    }
+}
+
+impl Rotation {
+    /// How long the next five-tuple should last.
+    ///
+    /// `jitter` is bounded below `after` when the configuration is read, so the
+    /// subtraction cannot go under zero -- and it is saturating anyway, because
+    /// a constant that is only safe because of a check somewhere else is one
+    /// edit away from not being.
+    pub(crate) fn interval(self) -> Millis {
+        let spread = random_u32().map_or(0, |r| Millis::from(r) % (2 * self.jitter + 1));
+        self.after
+            .saturating_add(spread)
+            .saturating_sub(self.jitter)
+    }
+}
+
 /// The port after `current`, wrapping.
 ///
 /// Returns `current` when there is nowhere to go, so the caller can tell that
@@ -496,8 +544,8 @@ impl PeerState {
     /// lossy path that is otherwise carrying traffic, where a rekey can lose
     /// four messages in a row while data flows the whole time -- and moving the
     /// carrier under a working tunnel is a cost with nothing bought.
-    fn stuck(&self, now: Millis) -> bool {
-        self.unanswered >= ROTATE_AFTER_UNANSWERED
+    fn stuck(&self, now: Millis, after: u32) -> bool {
+        self.unanswered >= after
             && self
                 .last_receive
                 .is_none_or(|heard| now.saturating_sub(heard) >= PRESUMED_DEAD)
@@ -692,8 +740,9 @@ impl Tunnel {
         // takes several and moves between them, which is what stops a single
         // five-tuple living for hours.
         let ports: Vec<u16> = if cfg.interface.listen_port == 0 {
-            let mut v = Vec::with_capacity(PORT_POOL);
-            while v.len() < PORT_POOL {
+            let pool = cfg.interface.rotation.ports;
+            let mut v = Vec::with_capacity(pool);
+            while v.len() < pool {
                 let r = os("choosing an outer port", random_u32())?;
                 let port = 61_000 + u16::try_from(r % 4_000).unwrap_or(0);
                 if !v.contains(&port) {
@@ -1796,12 +1845,13 @@ impl Tunnel {
     /// counts down, and [`PeerState::stuck`], which says the tuple is being
     /// dropped and no session will exist until it changes.
     fn maybe_rotate(&self) {
-        if !self.cfg.interface.rotate {
+        let rotation = self.cfg.interface.rotation;
+        if !rotation.enabled {
             return;
         }
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let stuck = state.stuck(now);
+        let stuck = state.stuck(now, rotation.unanswered);
         if !stuck {
             if state.session.is_none() {
                 return;
@@ -1810,14 +1860,14 @@ impl Tunnel {
             // `established`, which runs on every rekey and would push the
             // deadline out every two minutes so it never arrived.
             if state.rotate_at == Millis::MAX {
-                state.rotate_at = now.saturating_add(self.rotation_interval());
+                state.rotate_at = now.saturating_add(rotation.interval());
                 return;
             }
             if now < state.rotate_at {
                 return;
             }
         }
-        state.rotate_at = now.saturating_add(self.rotation_interval());
+        state.rotate_at = now.saturating_add(rotation.interval());
         // Zeroed whether or not a move follows. Left standing, `stuck` holds on
         // a single-port pool and this runs on every tick for ever.
         state.unanswered = 0;
@@ -1878,12 +1928,6 @@ impl Tunnel {
             "{}carrier moved from port {current} to {next}: {why}",
             self.tag()
         );
-    }
-
-    /// How long the next five-tuple should last.
-    fn rotation_interval(&self) -> Millis {
-        let spread = random_u32().map_or(0, |r| Millis::from(r) % (2 * ROTATE_JITTER + 1));
-        ROTATE_AFTER + spread - ROTATE_JITTER
     }
 
     /// Sends an empty packet when the peer has spoken and we have not answered.
@@ -2204,20 +2248,20 @@ mod tests {
         let now = 10 * PRESUMED_DEAD;
         let mut state = spoke(None, None);
         assert!(
-            !state.stuck(now),
+            !state.stuck(now, ROTATE_AFTER_UNANSWERED),
             "a fresh state has not tried anything yet"
         );
 
         for _ in 0..ROTATE_AFTER_UNANSWERED - 1 {
             state.unanswered += 1;
             assert!(
-                !state.stuck(now),
+                !state.stuck(now, ROTATE_AFTER_UNANSWERED),
                 "a handful of losses is a lossy path, not a dead tuple"
             );
         }
         state.unanswered += 1;
         assert!(
-            state.stuck(now),
+            state.stuck(now, ROTATE_AFTER_UNANSWERED),
             "past the threshold the tuple is the suspect"
         );
 
@@ -2226,12 +2270,15 @@ mod tests {
         // out. This count answers to replies alone.
         state.wants_to_send();
         assert!(
-            state.stuck(now),
+            state.stuck(now, ROTATE_AFTER_UNANSWERED),
             "offered traffic is not an answer from the peer"
         );
 
         state.established(now, 120_000);
-        assert!(!state.stuck(now), "a reply proves the tuple still reaches");
+        assert!(
+            !state.stuck(now, ROTATE_AFTER_UNANSWERED),
+            "a reply proves the tuple still reaches"
+        );
     }
 
     #[test]
@@ -2252,11 +2299,11 @@ mod tests {
         state.unanswered = ROTATE_AFTER_UNANSWERED;
 
         assert!(
-            !state.stuck(heard + PRESUMED_DEAD - 1),
+            !state.stuck(heard + PRESUMED_DEAD - 1, ROTATE_AFTER_UNANSWERED),
             "a peer heard from this recently is answering something"
         );
         assert!(
-            state.stuck(heard + PRESUMED_DEAD),
+            state.stuck(heard + PRESUMED_DEAD, ROTATE_AFTER_UNANSWERED),
             "silence for a liveness interval is the signal, not expiry"
         );
         assert!(
@@ -2284,7 +2331,7 @@ mod tests {
         state.session = Some(session);
         state.unanswered = ROTATE_AFTER_UNANSWERED * 10;
         assert!(
-            !state.stuck(heard + 1),
+            !state.stuck(heard + 1, ROTATE_AFTER_UNANSWERED),
             "no count of unanswered rekeys outweighs a peer that is answering"
         );
 
@@ -2292,7 +2339,7 @@ mod tests {
         // decides, and here there has not been any.
         state.session = None;
         assert!(
-            !state.stuck(heard + 1),
+            !state.stuck(heard + 1, ROTATE_AFTER_UNANSWERED),
             "a missing session is not evidence about the path"
         );
     }
