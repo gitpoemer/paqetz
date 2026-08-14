@@ -444,6 +444,15 @@ fn check_standard_port(port: u16) -> Finding {
     }
 }
 
+/// The MTU of the interface the default route leaves by, if it can be read.
+pub(crate) fn outbound_mtu() -> Option<u32> {
+    std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|t| default_route_interface(&t))
+        .and_then(|iface| std::fs::read_to_string(format!("/sys/class/net/{iface}/mtu")).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
 /// Whether the inner MTU leaves room for the tunnel's overhead.
 ///
 /// The overhead is the carrier's, not a number written down here. Fixed at the
@@ -455,21 +464,20 @@ fn check_mtu(inner: u32, shape: crate::config::Shape) -> Finding {
     // cannot drift into disagreeing about the same packet.
     let overhead =
         u32::try_from(shape.overhead() + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
-    let path = std::fs::read_to_string("/proc/net/route")
-        .ok()
-        .and_then(|t| default_route_interface(&t))
-        .and_then(|iface| std::fs::read_to_string(format!("/sys/class/net/{iface}/mtu")).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok());
-
-    match path {
-        Some(path_mtu) if inner + overhead > path_mtu => Finding::fail(
+    match outbound_mtu() {
+        Some(path_mtu) if inner + overhead > path_mtu => Finding::warn(
             "MTU",
             format!(
-                "inner {inner} + {overhead} overhead = {} exceeds the path's {path_mtu}",
+                "inner {inner} + {overhead} overhead = {} exceeds the link's {path_mtu}",
                 inner + overhead
             ),
+            // A warning, not a failure. `run` lowers it to fit and says so, so
+            // the tunnel comes up either way -- and this check is what a
+            // systemd `ExecStartPre` runs, where a failure is a service that
+            // does not start. A diagnostic being wrong should not be able to
+            // do that, and this one has been.
             format!(
-                "set interface.mtu to {} or less",
+                "run will use {}; set interface.mtu to that to make it explicit",
                 path_mtu.saturating_sub(overhead)
             ),
         ),
@@ -577,7 +585,7 @@ fn missing_caps(eff: u64) -> Vec<&'static str> {
 }
 
 /// Names the interface carrying the default route, given `/proc/net/route`.
-fn default_route_interface(table: &str) -> Option<String> {
+pub(crate) fn default_route_interface(table: &str) -> Option<String> {
     for line in table.lines().skip(1) {
         let mut fields = line.split_whitespace();
         let (Some(iface), Some(dest), Some(_gw), Some(flags)) =

@@ -868,13 +868,26 @@ impl Tunnel {
             context: format!("creating TUN device {}", cfg.interface.device),
             source,
         })?;
+        // Lowered to what the link can actually carry, rather than refused.
+        // An inner packet larger than this cannot leave the host at all --
+        // with Don't Fragment set the send fails outright -- so the choice is
+        // between a tunnel at a smaller MTU and no tunnel. Said out loud,
+        // because a silently different MTU is a thing to discover from a
+        // packet capture.
+        let mtu = fitted_mtu(
+            cfg.interface.mtu,
+            cfg.interface.shape,
+            crate::doctor::outbound_mtu(),
+        );
+        if mtu != cfg.interface.mtu {
+            warn_!(
+                "interface.mtu {} does not fit this host's outbound link; using {mtu}",
+                cfg.interface.mtu
+            );
+        }
         os(
             "configuring the TUN device",
-            tun.configure(
-                cfg.interface.address,
-                cfg.interface.netmask,
-                cfg.interface.mtu,
-            ),
+            tun.configure(cfg.interface.address, cfg.interface.netmask, mtu),
         )?;
 
         let rx = os(
@@ -2321,6 +2334,31 @@ impl Tunnel {
     }
 }
 
+/// The largest inner MTU this host's outbound link can carry.
+///
+/// `link` is `None` when it cannot be read, in which case the configured value
+/// stands: guessing a smaller one from nothing would shrink every tunnel on a
+/// host whose routing table this cannot parse.
+///
+/// The whole decision, in one place a test can reach, and away from the
+/// syscalls around it.
+fn fitted_mtu(configured: u32, shape: crate::config::Shape, link: Option<u32>) -> u32 {
+    let Some(link) = link else {
+        return configured;
+    };
+    let overhead =
+        u32::try_from(shape.overhead() + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
+    let room = link.saturating_sub(overhead);
+    // A link too small to carry anything leaves the configuration alone: there
+    // is no useful MTU to fall back to, and the failure should be the send
+    // saying so rather than a device configured to a nonsense size.
+    if room == 0 {
+        configured
+    } else {
+        configured.min(room)
+    }
+}
+
 /// Reads the source address of an inner IPv4 packet.
 fn inner_source(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.first().map(|b| b >> 4) != Some(4) {
@@ -2466,6 +2504,56 @@ mod tests {
             "a packet with nowhere to go is not a packet that was sent"
         );
         assert_eq!(stats.tx_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn an_mtu_too_large_for_the_link_is_lowered_rather_than_refused() {
+        // The failure this exists for: a carrier changed, the MTU that follows
+        // from it was checked against another carrier's overhead, and the
+        // service would not start -- because the check runs as a systemd
+        // ExecStartPre, where a non-zero exit is a service that stays down.
+        // An inner packet larger than the link cannot leave the host at all,
+        // so the choice is between a smaller MTU and no tunnel.
+        use crate::config::Shape;
+        use paqetz_tcpwire::rawip::Shell;
+
+        let gre = Shape::Raw(Shell::Gre);
+        let over = u32::try_from(gre.overhead() + paqetz_core::framing::OVERHEAD)
+            .expect("an outer header is tens of bytes");
+
+        // Its own default fits an ordinary link and is left alone.
+        assert_eq!(
+            fitted_mtu(gre.default_mtu(), gre, Some(1500)),
+            gre.default_mtu()
+        );
+        // A smaller link lowers it to exactly what fits, and no further.
+        assert_eq!(fitted_mtu(gre.default_mtu(), gre, Some(1400)), 1400 - over);
+        assert_eq!(
+            fitted_mtu(gre.default_mtu(), gre, Some(1400)) + over,
+            1400,
+            "the whole outer packet, at the link"
+        );
+        // Already small enough is untouched: someone who measured their path
+        // keeps what they measured.
+        assert_eq!(fitted_mtu(900, gre, Some(1500)), 900);
+
+        // Unreadable link, unchanged configuration. Guessing smaller from
+        // nothing would shrink every tunnel on a host this cannot parse.
+        assert_eq!(fitted_mtu(gre.default_mtu(), gre, None), gre.default_mtu());
+
+        // A link too small to carry any payload leaves it alone as well: there
+        // is no useful size to fall back to, and the send saying so is a better
+        // failure than a device configured to nonsense.
+        assert_eq!(fitted_mtu(1400, gre, Some(over)), 1400);
+        assert_eq!(fitted_mtu(1400, gre, Some(8)), 1400);
+
+        // Each shape is measured by its own header, which is the bug in one
+        // line: fake-TCP pays more, so it is lowered further on the same link.
+        let tcp = Shape::Tcp(paqetz_tcpwire::Carrier::Midstream);
+        assert!(
+            fitted_mtu(9000, tcp, Some(1500)) < fitted_mtu(9000, gre, Some(1500)),
+            "a bigger outer header must leave less room, not the same"
+        );
     }
 
     #[test]
