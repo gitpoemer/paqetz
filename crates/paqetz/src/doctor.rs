@@ -117,7 +117,7 @@ pub(crate) fn run(path: &Path) -> bool {
             findings.push(check_port_free(t.interface.listen_port));
             findings.push(check_standard_port(t.interface.listen_port));
         }
-        findings.push(check_mtu(t.interface.mtu));
+        findings.push(check_mtu(t.interface.mtu, t.interface.shape));
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));
         if t.interface.gateway {
@@ -445,9 +445,16 @@ fn check_standard_port(port: u16) -> Finding {
 }
 
 /// Whether the inner MTU leaves room for the tunnel's overhead.
-fn check_mtu(inner: u32) -> Finding {
-    // Outer IPv4 (20) + TCP (20) + TCP options (12) + framing (28).
-    const OVERHEAD: u32 = 80;
+///
+/// The overhead is the carrier's, not a number written down here. Fixed at the
+/// fake-TCP figure, this called a correctly-sized GRE tunnel too large by the
+/// difference between the two headers and told the operator to shrink an MTU
+/// that already fit -- a check reporting a fault it had invented.
+fn check_mtu(inner: u32, shape: crate::config::Shape) -> Finding {
+    // One source, shared with the default this compares against, so the two
+    // cannot drift into disagreeing about the same packet.
+    let overhead =
+        u32::try_from(shape.overhead() + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
     let path = std::fs::read_to_string("/proc/net/route")
         .ok()
         .and_then(|t| default_route_interface(&t))
@@ -455,25 +462,31 @@ fn check_mtu(inner: u32) -> Finding {
         .and_then(|s| s.trim().parse::<u32>().ok());
 
     match path {
-        Some(path_mtu) if inner + OVERHEAD > path_mtu => Finding::fail(
+        Some(path_mtu) if inner + overhead > path_mtu => Finding::fail(
             "MTU",
             format!(
-                "inner {inner} + {OVERHEAD} overhead = {} exceeds the path's {path_mtu}",
-                inner + OVERHEAD
+                "inner {inner} + {overhead} overhead = {} exceeds the path's {path_mtu}",
+                inner + overhead
             ),
             format!(
                 "set interface.mtu to {} or less",
-                path_mtu.saturating_sub(OVERHEAD)
+                path_mtu.saturating_sub(overhead)
             ),
         ),
         Some(path_mtu) => Finding::pass(
             "MTU",
-            format!("inner {inner} + {OVERHEAD} overhead fits the path's {path_mtu}"),
+            format!("inner {inner} + {overhead} overhead fits the path's {path_mtu}"),
         ),
         None => Finding::warn(
             "MTU",
             format!("inner {inner}; could not read the path MTU"),
-            "check that the outbound interface's MTU is at least {inner} + 80".to_owned(),
+            // Was a literal: the braces were never interpolated, so this
+            // printed the placeholder and a number belonging to another
+            // carrier.
+            format!(
+                "check that the outbound interface's MTU is at least {}",
+                inner + overhead
+            ),
         ),
     }
 }
@@ -768,6 +781,42 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
     }
 
     #[test]
+    fn every_carriers_own_default_mtu_passes_its_own_check() {
+        // The failure this exists for: the check held the fake-TCP overhead as
+        // a constant, so a GRE tunnel at the size paqetz itself had chosen was
+        // reported as 28 bytes too large for a 1500-byte path, with advice to
+        // shrink an MTU that already fit. A check and a default that disagree
+        // about the same packet is worse than no check.
+        use crate::config::Shape;
+        use paqetz_tcpwire::rawip::Shell;
+
+        for shape in [
+            Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
+            Shape::Raw(Shell::Gre),
+            Shape::Raw(Shell::Bare(143)),
+        ] {
+            let total =
+                shape.default_mtu() as usize + shape.overhead() + paqetz_core::framing::OVERHEAD;
+            assert!(
+                total <= 1500,
+                "{shape:?}: its own default is {total} bytes on a 1500-byte path"
+            );
+        }
+
+        // And the capped default, for the shape that clears Don't Fragment.
+        for shape in [
+            Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
+            Shape::Raw(Shell::Gre),
+            Shape::Raw(Shell::Bare(143)),
+        ] {
+            let total = shape.fragment_free_mtu() as usize
+                + shape.overhead()
+                + paqetz_core::framing::OVERHEAD;
+            assert!(total <= 1280, "{shape:?}: capped default is {total} bytes");
+        }
+    }
+
+    #[test]
     fn every_failure_carries_a_remedy() {
         // A diagnostic that says something is wrong without saying what to do
         // is barely better than the symptom it replaces.
@@ -777,7 +826,10 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
             check_tun_device(),
             check_firewall_backend(),
             check_capabilities(),
-            check_mtu(1400),
+            check_mtu(
+                1400,
+                crate::config::Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
+            ),
         ];
         for f in findings {
             if f.verdict != Verdict::Pass {
