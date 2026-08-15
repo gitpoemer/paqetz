@@ -50,7 +50,8 @@ tunnel_address = "10.7.0.1"
 #                          and the netfilter OUTPUT chain. Consistently ~5-10%
 #                          faster, but it needs the next hop's hardware address,
 #                          which goes stale if a gateway fails over. Needs a
-#                          peer endpoint, so only the initiating side can use it.
+#                          peer endpoint to resolve that hop, so the waiting
+#                          side falls back to "raw" and says so.
 #transmit = "raw"
 
 # Whether to install and remove the kernel firewall rules automatically. These

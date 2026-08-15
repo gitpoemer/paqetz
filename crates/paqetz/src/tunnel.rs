@@ -909,17 +909,26 @@ impl Tunnel {
             crate::config::TransmitPath::AfPacket => {
                 // Needs a peer address to resolve the next hop toward, which
                 // only the initiating side has at start-up.
+                //
+                // The waiting side falls back rather than refusing, for the
+                // same reason `rotate` on a port-less carrier warns and carries
+                // on: a setting that cannot apply to this end is not a reason
+                // to have no tunnel, and one file is often copied to both. It
+                // is said out loud, because a transmit path quietly other than
+                // the one asked for is a thing to discover from a benchmark.
                 let peer = cfg.peer.endpoint.map_or(Ipv4Addr::UNSPECIFIED, |e| *e.ip());
                 if peer.is_unspecified() {
-                    return Err(Error::Unsupported(
-                        "transmit = \"afpacket\" needs a peer endpoint to resolve \
-                         the next hop toward; the waiting side must use \"raw\"",
-                    ));
+                    warn_!(
+                        "transmit = \"afpacket\" needs a peer endpoint to resolve the next hop \
+                         toward, and this end waits to be contacted; using \"raw\""
+                    );
+                    Transmit::Raw(os("opening the transmit socket", RawTx::open())?)
+                } else {
+                    Transmit::AfPacket(os(
+                        "opening the AF_PACKET transmit socket",
+                        AfPacketTx::open(&interface, peer),
+                    )?)
                 }
-                Transmit::AfPacket(os(
-                    "opening the AF_PACKET transmit socket",
-                    AfPacketTx::open(&interface, peer),
-                )?)
             }
         };
         let _ = tx.set_send_buffer(4 * 1024 * 1024);
