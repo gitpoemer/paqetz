@@ -257,6 +257,16 @@ impl Outbox {
     }
 
     /// Records a packet that has just gone out under `counter`.
+    /// Forgets everything held.
+    ///
+    /// For a rekey: the counters restart, so a request for one of them would be
+    /// answered with whatever the previous session had put in that slot.
+    pub(crate) fn clear(&mut self) {
+        for slot in &mut self.slots {
+            slot.counter = None;
+        }
+    }
+
     pub(crate) fn record(&mut self, counter: u64, packet: &[u8], now: Millis) {
         let Some(index) = self.slot(counter) else {
             return;
@@ -316,6 +326,15 @@ struct Gap {
 
 /// The receiving side: which counters are missing, and when to ask.
 pub(crate) struct Inbox {
+    /// The session these counters belong to.
+    ///
+    /// Counters are per-session and restart at zero on every rekey, so they
+    /// only mean anything alongside the session that issued them. Tracked
+    /// across a rekey as if they were one space, the high-water mark keeps the
+    /// old session's maximum: every counter the new session issues is below it,
+    /// no gap is ever recorded again, and repeating quietly stops working --
+    /// with the counters still showing whatever they reached before it did.
+    index: Option<u32>,
     /// Highest counter seen, once anything has been.
     highest: Option<u64>,
     gaps: BTreeMap<u64, Gap>,
@@ -327,6 +346,7 @@ pub(crate) struct Inbox {
 impl Inbox {
     pub(crate) const fn new(limits: Limits) -> Self {
         Self {
+            index: None,
             highest: None,
             gaps: BTreeMap::new(),
             deadline: limits.deadline,
@@ -340,7 +360,15 @@ impl Inbox {
     /// A gap is only reported once [`Limits::reorder`] later packets have
     /// arrived, so a path that delivers out of order is not asked to repeat
     /// what is already on its way.
-    pub(crate) fn arrived(&mut self, counter: u64, now: Millis) -> Vec<u64> {
+    pub(crate) fn arrived(&mut self, index: u32, counter: u64, now: Millis) -> Vec<u64> {
+        if self.index != Some(index) {
+            // A different session, so a different counter space. Whatever was
+            // outstanding belonged to the old one and can never be filled from
+            // the new: the peer no longer has those counters to send.
+            self.index = Some(index);
+            self.highest = None;
+            self.gaps.clear();
+        }
         self.gaps.remove(&counter);
 
         match self.highest {
@@ -436,6 +464,92 @@ mod tests {
     }
 
     #[test]
+    fn a_rekey_starts_the_counter_space_over() {
+        // The failure this exists for, seen on a tunnel nine hours up: the
+        // server had asked ninety thousand times for packets while only
+        // twenty-three had actually gone missing, and then every repeat
+        // counter froze while traffic kept flowing.
+        //
+        // Counters are per-session and restart at zero on every rekey. Tracked
+        // as one space, the high-water mark keeps the tallest session's
+        // maximum; every counter afterwards is below it, so no gap is ever
+        // recorded again and repeating stops -- silently, with the totals still
+        // reading whatever they reached before it did.
+        let mut inbox = Inbox::new(Limits {
+            capacity: 64,
+            deadline: 400,
+            asks: 2,
+            reorder: 1,
+        });
+
+        // A busy session climbs.
+        for counter in 0..5_000 {
+            inbox.arrived(1, counter, 0);
+        }
+        assert_eq!(inbox.highest, Some(4_999));
+
+        // Rekey. The peer's counters start again at zero, and this is a
+        // different space -- not a peer that has gone backwards.
+        inbox.arrived(2, 0, 1_000);
+        assert_eq!(inbox.highest, Some(0), "the new session's own high mark");
+        assert!(
+            inbox.gaps.is_empty(),
+            "nothing outstanding survives a rekey"
+        );
+
+        // And gap tracking works in the new session rather than being deaf
+        // until it climbs past the old one's total.
+        inbox.arrived(2, 1, 1_000);
+        inbox.arrived(2, 3, 1_000);
+        let asking = inbox.arrived(2, 4, 1_000);
+        assert_eq!(asking, vec![2], "the one that is genuinely missing");
+    }
+
+    #[test]
+    fn what_a_rekey_leaves_outstanding_is_dropped_rather_than_asked_for() {
+        // Gaps from the old session can never be filled: the peer has moved to
+        // a counter space in which those numbers mean different packets. Asking
+        // anyway spends a request and a full-sized repeat on each, in the
+        // direction that is usually the narrow one.
+        let mut inbox = Inbox::new(Limits {
+            capacity: 64,
+            deadline: 400,
+            asks: 2,
+            reorder: 1,
+        });
+        inbox.arrived(1, 0, 0);
+        inbox.arrived(1, 5, 0);
+        assert_eq!(inbox.gaps.len(), 4, "1 through 4 are missing");
+
+        inbox.arrived(2, 0, 0);
+        assert!(inbox.gaps.is_empty());
+    }
+
+    #[test]
+    fn what_was_held_for_repeating_does_not_survive_a_rekey() {
+        // Our own send counters restart too, so a request for counter 5 after a
+        // rekey would be answered with the previous session's counter 5. The
+        // deadline hides most of it; correctness should not rest on a packet
+        // being too old to be wrong.
+        let mut outbox = Outbox::new(Limits {
+            capacity: 64,
+            deadline: 400,
+            asks: 2,
+            reorder: 1,
+        });
+        outbox.record(5, b"from the old session", 0);
+        assert_eq!(outbox.get(5, 0), Some(&b"from the old session"[..]));
+
+        outbox.clear();
+        assert_eq!(outbox.get(5, 0), None);
+
+        // And it still works afterwards, rather than being cleared into
+        // uselessness.
+        outbox.record(5, b"from the new one", 0);
+        assert_eq!(outbox.get(5, 0), Some(&b"from the new one"[..]));
+    }
+
+    #[test]
     fn a_control_message_cannot_be_mistaken_for_a_packet() {
         // Inner packets are IPv4, so their first nibble is 4. Nothing that
         // starts with a zero byte can be one, which is the whole basis for
@@ -493,34 +607,37 @@ mod tests {
         // a packet that is already on its way costs bandwidth on a link that
         // has none to spare, and arrives as a duplicate.
         let mut inbox = Inbox::new(on());
-        assert!(inbox.arrived(1, 0).is_empty());
-        assert!(inbox.arrived(3, 0).is_empty());
-        assert!(inbox.arrived(2, 0).is_empty(), "2 turned up on its own");
+        assert!(inbox.arrived(7, 1, 0).is_empty());
+        assert!(inbox.arrived(7, 3, 0).is_empty());
+        assert!(inbox.arrived(7, 2, 0).is_empty(), "2 turned up on its own");
         assert_eq!(inbox.outstanding(), 0);
     }
 
     #[test]
     fn a_gap_is_asked_for_once_enough_has_gone_past_it() {
         let mut inbox = Inbox::new(on());
-        assert!(inbox.arrived(1, 0).is_empty());
+        assert!(inbox.arrived(7, 1, 0).is_empty());
         // 2 is missing. 3, 4 arrive -- still within reordering tolerance.
-        assert!(inbox.arrived(3, 0).is_empty());
-        assert!(inbox.arrived(4, 0).is_empty());
+        assert!(inbox.arrived(7, 3, 0).is_empty());
+        assert!(inbox.arrived(7, 4, 0).is_empty());
         // The third packet past it settles the question.
-        assert_eq!(inbox.arrived(5, 0), vec![2]);
+        assert_eq!(inbox.arrived(7, 5, 0), vec![2]);
     }
 
     #[test]
     fn a_repeat_stops_the_asking() {
         let mut inbox = Inbox::new(on());
-        inbox.arrived(1, 0);
-        inbox.arrived(3, 0);
-        inbox.arrived(4, 0);
-        assert_eq!(inbox.arrived(5, 0), vec![2]);
+        inbox.arrived(7, 1, 0);
+        inbox.arrived(7, 3, 0);
+        inbox.arrived(7, 4, 0);
+        assert_eq!(inbox.arrived(7, 5, 0), vec![2]);
         inbox.satisfied(2);
         assert_eq!(inbox.outstanding(), 0);
         for c in 6..12 {
-            assert!(inbox.arrived(c, 0).is_empty(), "asked again after a repeat");
+            assert!(
+                inbox.arrived(7, c, 0).is_empty(),
+                "asked again after a repeat"
+            );
         }
     }
 
@@ -529,10 +646,10 @@ mod tests {
         // A link that has swallowed a packet twice is not going to produce it,
         // and inner protocols own it from here.
         let mut inbox = Inbox::new(on());
-        inbox.arrived(1, 0);
+        inbox.arrived(7, 1, 0);
         let mut asks = 0;
         for c in 3..40 {
-            asks += inbox.arrived(c, 0).len();
+            asks += inbox.arrived(7, c, 0).len();
         }
         assert_eq!(asks, usize::from(DEFAULT_ASKS), "asked {asks} times");
         assert_eq!(inbox.outstanding(), 0, "and then let it go");
@@ -541,20 +658,20 @@ mod tests {
     #[test]
     fn a_gap_older_than_the_deadline_is_abandoned() {
         let mut inbox = Inbox::new(on());
-        inbox.arrived(1, 0);
-        inbox.arrived(3, 0);
+        inbox.arrived(7, 1, 0);
+        inbox.arrived(7, 3, 0);
         // Past the deadline, the packet is no longer worth repeating: inner TCP
         // has noticed by now, and two recoveries for one loss is waste on a
         // link that is already losing.
-        assert!(inbox.arrived(4, DEFAULT_DEADLINE + 1).is_empty());
+        assert!(inbox.arrived(7, 4, DEFAULT_DEADLINE + 1).is_empty());
         assert_eq!(inbox.outstanding(), 0);
     }
 
     #[test]
     fn a_peer_inventing_gaps_cannot_grow_this_without_bound() {
         let mut inbox = Inbox::new(on());
-        inbox.arrived(0, 0);
-        inbox.arrived(u64::from(u32::MAX), 0);
+        inbox.arrived(7, 0, 0);
+        inbox.arrived(7, u64::from(u32::MAX), 0);
         assert!(inbox.outstanding() <= MAX_OUTSTANDING);
     }
 
@@ -653,15 +770,15 @@ mod tests {
         // this worth having is a link where it costs the most. With hundreds
         // outstanding, one arrival must not walk them all.
         let mut inbox = Inbox::new(on());
-        inbox.arrived(0, 0);
+        inbox.arrived(7, 0, 0);
         // One enormous jump: 400 counters missing at once.
-        inbox.arrived(400, 0);
+        inbox.arrived(7, 400, 0);
         assert_eq!(inbox.outstanding(), 399);
 
         // Every subsequent arrival asks about at most a handful.
         for c in 401..410u64 {
             assert!(
-                inbox.arrived(c, 0).len() <= ASK_SCAN,
+                inbox.arrived(7, c, 0).len() <= ASK_SCAN,
                 "one arrival asked about more than {ASK_SCAN} gaps"
             );
         }
@@ -672,13 +789,13 @@ mod tests {
         // Once asked, it waits as far again before being asked a second time,
         // or a single loss would produce a request per arriving packet.
         let mut inbox = Inbox::new(on());
-        inbox.arrived(1, 0);
-        inbox.arrived(3, 0);
-        inbox.arrived(4, 0);
-        assert_eq!(inbox.arrived(5, 0), vec![2], "asked once");
-        assert!(inbox.arrived(6, 0).is_empty(), "not again immediately");
-        assert!(inbox.arrived(7, 0).is_empty());
-        assert_eq!(inbox.arrived(8, 0), vec![2], "and once more, later");
+        inbox.arrived(7, 1, 0);
+        inbox.arrived(7, 3, 0);
+        inbox.arrived(7, 4, 0);
+        assert_eq!(inbox.arrived(7, 5, 0), vec![2], "asked once");
+        assert!(inbox.arrived(7, 6, 0).is_empty(), "not again immediately");
+        assert!(inbox.arrived(7, 7, 0).is_empty());
+        assert_eq!(inbox.arrived(7, 8, 0), vec![2], "and once more, later");
         assert_eq!(inbox.outstanding(), 0, "then left to inner protocols");
     }
 
@@ -702,10 +819,10 @@ mod tests {
         assert!(outbox.get(1, 1_001).is_none(), "and refused past that");
 
         let mut inbox = Inbox::new(limits);
-        inbox.arrived(1, 0);
+        inbox.arrived(7, 1, 0);
         let mut asks = 0;
         for c in 3..80u64 {
-            asks += inbox.arrived(c, 0).len();
+            asks += inbox.arrived(7, c, 0).len();
         }
         assert_eq!(asks, usize::from(limits.asks), "asked {asks} times");
         assert_eq!(inbox.outstanding(), 0, "and then let it go");
@@ -723,9 +840,9 @@ mod tests {
             ..Limits::off()
         };
         let mut inbox = Inbox::new(eager);
-        inbox.arrived(1, 0);
+        inbox.arrived(7, 1, 0);
         // 2 is missing, and the very next packet settles it.
-        assert_eq!(inbox.arrived(3, 0), vec![2], "asked at once");
+        assert_eq!(inbox.arrived(7, 3, 0), vec![2], "asked at once");
 
         let patient = Limits {
             capacity: 8,
@@ -733,12 +850,12 @@ mod tests {
             ..Limits::off()
         };
         let mut inbox = Inbox::new(patient);
-        inbox.arrived(1, 0);
+        inbox.arrived(7, 1, 0);
         for c in 3..9u64 {
-            assert!(inbox.arrived(c, 0).is_empty(), "still waiting at {c}");
+            assert!(inbox.arrived(7, c, 0).is_empty(), "still waiting at {c}");
         }
         assert_eq!(
-            inbox.arrived(10, 0),
+            inbox.arrived(7, 10, 0),
             vec![2],
             "and asked once far enough past"
         );

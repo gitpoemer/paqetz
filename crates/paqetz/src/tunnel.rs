@@ -411,6 +411,11 @@ impl PeerState {
     /// For the initiating side, which asked for this session and therefore
     /// knows the peer holds it: the handshake reply is itself the proof.
     fn install(&mut self, session: Session) {
+        // Held packets are named by a counter this session restarts at zero, so
+        // a request for one would be answered with whatever the last session
+        // put in that slot. The deadline hides most of it; correctness should
+        // not rest on a packet being too old to be wrong.
+        self.outbox.clear();
         self.previous = self.session.replace(session);
         // A session that arrives by rekey supersedes anything still waiting to
         // be confirmed; keeping it would be a third set of keys nobody has used.
@@ -431,6 +436,7 @@ impl PeerState {
     /// Promotes the waiting session, now that the peer has used it.
     fn confirm(&mut self) {
         if let Some(session) = self.next.take() {
+            self.outbox.clear();
             self.previous = self.session.replace(session);
         }
     }
@@ -1874,10 +1880,12 @@ impl Tunnel {
 
         // Read before opening, because which session the packet belongs to is
         // not yet known and the mask does not depend on the answer.
-        let counter = state
+        // The index as well as the counter: counters are per-session and
+        // restart at zero on every rekey, so one without the other is a number
+        // whose meaning changed underneath it.
+        let header = state
             .mask()
-            .and_then(|mask| noise::peek_header(&mask, seg.payload).ok())
-            .map(|header| header.counter);
+            .and_then(|mask| noise::peek_header(&mask, seg.payload).ok());
 
         let Some(opened) = state.open(seg.payload, inner, now) else {
             return Ok(());
@@ -1916,8 +1924,10 @@ impl Tunnel {
         }
         // Only once the packet has authenticated: a gap claimed by anyone else
         // would have this end asking its peer for packets nobody sent.
-        let asking = match counter {
-            Some(c) if self.cfg.interface.repeat.capacity > 0 => state.inbox.arrived(c, now),
+        let asking = match header {
+            Some(h) if self.cfg.interface.repeat.capacity > 0 => {
+                state.inbox.arrived(h.index, h.counter, now)
+            }
             _ => Vec::new(),
         };
 
