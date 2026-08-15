@@ -1947,9 +1947,20 @@ impl Tunnel {
                 }
             }
             Some(crate::repeat::Control::Repeat { original, packet }) => {
-                state.inbox.satisfied(original);
-                repeated = Some(packet.to_vec());
-                Stats::bump(&self.stats.repaired);
+                // Only if it is still wanted. The original may have turned up
+                // while the request was in flight, or a second ask may be
+                // answering after the first already was -- and delivering
+                // either puts the same inner packet on the device twice. Inner
+                // UDP has no defence against that, and inner TCP reads the
+                // duplicate acknowledgements it provokes as congestion, so a
+                // mechanism meant to hide loss ends up manufacturing the signal
+                // for it.
+                if state.inbox.satisfied(original) {
+                    repeated = Some(packet.to_vec());
+                    Stats::bump(&self.stats.repaired);
+                } else {
+                    Stats::bump(&self.stats.duplicate);
+                }
             }
             None => {}
         }

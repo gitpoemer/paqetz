@@ -432,8 +432,16 @@ impl Inbox {
     }
 
     /// Records that a repeat satisfied `counter`.
-    pub(crate) fn satisfied(&mut self, counter: u64) {
-        self.gaps.remove(&counter);
+    /// Records a repeat's arrival, and says whether it was still wanted.
+    ///
+    /// `false` means the packet is a second copy: the original turned up while
+    /// the request was in flight, or a second ask was answered after the first
+    /// already had been. Delivering it would put the same inner packet on the
+    /// device twice -- which inner UDP has no defence against at all, and which
+    /// inner TCP pays for in duplicate acknowledgements that look to it like
+    /// loss.
+    pub(crate) fn satisfied(&mut self, counter: u64) -> bool {
+        self.gaps.remove(&counter).is_some()
     }
 
     /// How many counters are outstanding.
@@ -461,6 +469,45 @@ mod tests {
             capacity,
             ..Limits::off()
         }
+    }
+
+    #[test]
+    fn a_repeat_for_a_gap_already_filled_is_not_wanted_twice() {
+        // Measured through a live tunnel: UDP arriving at twice the rate it
+        // was sent, with iperf3 reporting negative loss because it received
+        // more datagrams than existed. Every repeat was delivered whether or
+        // not the original had turned up, so a mechanism meant to hide loss
+        // was manufacturing duplicates instead -- and inner TCP reads the
+        // duplicate acknowledgements those provoke as congestion.
+        let mut inbox = Inbox::new(Limits {
+            capacity: 64,
+            deadline: 400,
+            asks: 2,
+            reorder: 1,
+        });
+        inbox.arrived(1, 0, 0);
+        inbox.arrived(1, 2, 0);
+        assert_eq!(inbox.outstanding(), 1, "counter 1 is missing");
+
+        assert!(inbox.satisfied(1), "the repeat fills the gap and is wanted");
+        // Asking twice is deliberate, so the second answer arriving is normal
+        // -- and is a second copy of a packet already on the device.
+        assert!(!inbox.satisfied(1), "the same repeat again is not");
+
+        // The other race: the original turns up while the request is in
+        // flight, and the repeat follows it.
+        inbox.arrived(1, 4, 0);
+        assert_eq!(inbox.outstanding(), 1, "counter 3 is missing");
+        inbox.arrived(1, 3, 0);
+        assert_eq!(inbox.outstanding(), 0, "and then arrives on its own");
+        assert!(
+            !inbox.satisfied(3),
+            "the repeat chasing it is a duplicate, not a repair"
+        );
+
+        // A repeat for something never asked for is refused as well: it can
+        // only be a peer sending what nobody wanted.
+        assert!(!inbox.satisfied(9_999));
     }
 
     #[test]

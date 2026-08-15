@@ -77,6 +77,13 @@ pub(crate) struct Stats {
     pub(crate) handshakes_done: AtomicU64,
     /// Times the peer's endpoint changed under an authenticated packet.
     pub(crate) roams: AtomicU64,
+    /// Repeats that arrived for a gap that had already been filled.
+    ///
+    /// A second copy of a packet already delivered. Some is normal -- a repeat
+    /// and the original racing is exactly what asking twice is for -- but a
+    /// count near the repair count means the requests are going out too eagerly
+    /// for the path's reordering, and `retransmit_reorder` is the knob.
+    pub(crate) duplicate: AtomicU64,
     /// Reports from the path that a packet was too large to forward.
     ///
     /// Non-zero means the tunnel's MTU is above what some hop will carry, and
@@ -156,6 +163,7 @@ impl Stats {
             ("device-full", get(&self.device_full)),
             ("unparsed", get(&self.unparsed)),
             ("too-big", get(&self.too_big)),
+            ("duplicate", get(&self.duplicate)),
             ("asked", get(&self.asked)),
             ("repeated", get(&self.repeated)),
             ("repaired", get(&self.repaired)),
