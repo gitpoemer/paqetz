@@ -122,6 +122,12 @@ pub(crate) fn parse_relays(body: &str) -> BTreeSet<Ipv4Addr> {
 
 /// The nftables script that installs the table, its set, and its rules.
 ///
+/// Both rules carry a counter. Without one there is no way to answer "is this
+/// working", which on a feature whose whole job is to send *some* traffic
+/// elsewhere is the only question anyone will ask: a zero on the mark rule says
+/// nothing is being selected, and a zero on the translation says nothing is
+/// leaving that way.
+///
 /// `add` then `delete` then define, which is how every ruleset here is written:
 /// one transaction, the same result whether or not anything was there before,
 /// and a refresh is the identical script with different elements rather than a
@@ -148,11 +154,11 @@ table inet {NFT_TABLE} {{
 {elements}    }}
     chain paqetz_mark {{
         type filter hook prerouting priority mangle; policy accept;
-        iifname \"{device}\" ip daddr @dest4 meta mark set {MARK:#x}
+        iifname \"{device}\" ip daddr @dest4 counter meta mark set {MARK:#x}
     }}
     chain paqetz_nat {{
         type nat hook postrouting priority srcnat; policy accept;
-        oifname \"{IFACE}\" masquerade
+        oifname \"{IFACE}\" counter masquerade
     }}
 }}
 "
@@ -901,10 +907,17 @@ mod tests {
         // Only what the tunnel forwards: the host's own traffic to the same
         // destination is not this feature's business.
         assert!(
-            script.contains("iifname \"paqetz0\" ip daddr @dest4 meta mark set 0x57"),
+            script.contains("iifname \"paqetz0\" ip daddr @dest4 counter meta mark set 0x57"),
             "{script}"
         );
-        assert!(script.contains("oifname \"warp\" masquerade"), "{script}");
+        assert!(
+            script.contains("oifname \"warp\" counter masquerade"),
+            "{script}"
+        );
+        // The counters are the only way to answer "is this working", which is
+        // the only question anyone asks of a feature that sends some traffic
+        // elsewhere.
+        assert_eq!(script.matches("counter").count(), 2, "{script}");
         // Add then delete then define: the same result whether or not anything
         // was there, in one transaction.
         assert!(
