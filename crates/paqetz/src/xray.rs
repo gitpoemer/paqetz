@@ -277,7 +277,8 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
       }},
       "sniffing": {{
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": true
       }}
     }}
   ],
@@ -479,6 +480,38 @@ mod tests {
             return Err(format!("{depth} unclosed"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn what_is_sniffed_decides_routing_and_never_the_destination() {
+        // Measured through a live chain: Tor stalled at 10% -- TCP connected,
+        // link handshake never finished -- everywhere xray sat in the path,
+        // and bootstrapped in a second everywhere it did not.
+        //
+        // Tor's link handshake sends a *randomised* SNI. Sniffing without this
+        // flag replaces the destination with whatever name it read, so xray
+        // then tries to resolve a domain nobody registered, and the connection
+        // dies with the client's TCP already open and waiting. Anything else
+        // presenting an SNI that is not a real host meets the same fate.
+        //
+        // `routeOnly` keeps the sniffed name for routing -- so the domestic
+        // rules below still match on it -- and leaves the destination as the
+        // address the client actually asked for.
+        let generated = generate(&plan()).expect("generate");
+        let config = &generated.config;
+        assert!(config.contains("\"routeOnly\": true"), "{config}");
+        assert!(config.contains("\"destOverride\""), "{config}");
+
+        // The two belong together: destOverride without routeOnly is the bug,
+        // so a future edit that drops one has to drop the other.
+        let sniff = config
+            .split_once("\"sniffing\"")
+            .expect("a sniffing block")
+            .1
+            .split_once('}')
+            .expect("its end")
+            .0;
+        assert!(sniff.contains("routeOnly"), "{sniff}");
     }
 
     #[test]
