@@ -15,6 +15,7 @@ mod setup;
 mod stats;
 mod tunnel;
 mod update;
+mod warp;
 mod xray;
 
 use std::path::PathBuf;
@@ -118,6 +119,17 @@ enum Command {
         action: XrayAction,
     },
 
+    /// Set up Cloudflare WARP as a second way out for the server.
+    ///
+    /// Destinations that refuse datacentre addresses -- Tor relays being the
+    /// case this exists for -- see WARP's address instead. Server side only:
+    /// the client already reaches the internet through the server, so what any
+    /// destination sees is decided there.
+    Warp {
+        #[command(subcommand)]
+        action: WarpAction,
+    },
+
     /// Install or remove the system service that keeps the tunnel running.
     Service {
         #[command(subcommand)]
@@ -185,6 +197,31 @@ enum Command {
     Firewall {
         #[command(subcommand)]
         action: FirewallAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WarpAction {
+    /// Install WARP and the routing, one question at a time.
+    ///
+    /// Every step checks whether it has already been done, so running this
+    /// again after a failure resumes rather than starting over. Nothing is
+    /// rolled back on failure -- `revert` undoes it deliberately.
+    Setup,
+    /// Re-fetch the relay list and reload the destination set.
+    ///
+    /// What the daily timer runs. The whole table is replaced in one
+    /// transaction, so the kernel is never matching against a half-built set.
+    Refresh,
+    /// Show what is in place.
+    Status,
+    /// Take the routing, interface and timer out again.
+    Revert {
+        /// Also discard the WARP account and remove wgcf.
+        ///
+        /// The account is an identity that cannot be recovered once discarded.
+        #[arg(long)]
+        purge: bool,
     },
 }
 
@@ -349,6 +386,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err("the host is not ready; see the failures above".into())
             }
         }
+        Command::Warp { action } => match action {
+            WarpAction::Setup => warp::setup(&cli.config),
+            WarpAction::Refresh => warp::refresh(&cli.config),
+            WarpAction::Status => warp::status(),
+            WarpAction::Revert { purge } => warp::revert(purge),
+        },
         Command::Firewall { action } => firewall(action, &cli.config),
     }
 }
