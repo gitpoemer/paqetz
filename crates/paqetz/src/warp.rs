@@ -144,12 +144,13 @@ table inet {NFT_TABLE} {{
     set dest4 {{
         type ipv4_addr
         flags interval
+        auto-merge
 {elements}    }}
-    chain mark {{
+    chain paqetz_mark {{
         type filter hook prerouting priority mangle; policy accept;
         iifname \"{device}\" ip daddr @dest4 meta mark set {MARK:#x}
     }}
-    chain out {{
+    chain paqetz_nat {{
         type nat hook postrouting priority srcnat; policy accept;
         oifname \"{IFACE}\" masquerade
     }}
@@ -264,6 +265,40 @@ fn arch_name() -> Result<&'static str, Box<dyn std::error::Error>> {
         "armv7l" => Ok("armv7"),
         other => Err(format!("no wgcf build published for this architecture ({other})").into()),
     }
+}
+
+/// Everything this needs from the host, checked before anything is changed.
+///
+/// The same rule the Xray install follows: finding out that the thing which
+/// brings the interface up is missing, having already downloaded a binary and
+/// registered an account with Cloudflare, is a worse way to learn it. Each
+/// entry names the package, because "wg-quick is missing" and "install
+/// wireguard-tools" are not the same sentence to somebody who has not met
+/// WireGuard before.
+fn preflight() -> Result<(), Box<dyn std::error::Error>> {
+    for (tool, package, why) in [
+        ("curl", "curl", "fetch wgcf and the relay list"),
+        ("sha256sum", "coreutils", "verify the download"),
+        ("nft", "nftables", "install the destination rules"),
+        ("wg-quick", "wireguard-tools", "bring the WARP interface up"),
+    ] {
+        let found = std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !found {
+            return Err(format!(
+                "`{tool}` is missing, and is needed to {why}.\n\
+                 Install it and run this again:\n\n    \
+                 apt install -y {package}\n\n\
+                 Nothing has been changed on this host."
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Step one: put the wgcf binary in place.
@@ -428,7 +463,15 @@ fn bring_up() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {IFACE} is already up");
         return Ok(());
     }
-    crate::service::run_elevated("systemctl", &["enable", "--now", &unit])?;
+    crate::service::run_elevated("systemctl", &["enable", "--now", &unit]).map_err(|e| {
+        format!(
+            "{e}\n\n\
+             If it says the unit does not exist, `wg-quick@.service` comes from \
+             wireguard-tools:\n\n    apt install -y wireguard-tools\n\n\
+             Then run `paqetz warp setup` again -- what is already done is \
+             detected and skipped."
+        )
+    })?;
     if !interface_exists(IFACE) {
         return Err(format!(
             "`{unit}` started but there is no {IFACE} interface. \
@@ -641,6 +684,8 @@ pub(crate) fn setup(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
             return Err("nothing was chosen to route through WARP".into());
         }
     }
+
+    preflight()?;
 
     println!("\n--- installing ---");
     let dir = Path::new(STATE_DIR);
@@ -970,6 +1015,86 @@ mod tests {
         // whole day with a list that has already rotted.
         assert!(timer.contains("Persistent=true"), "{timer}");
         assert!(timer.contains("WantedBy=timers.target"), "{timer}");
+    }
+
+    #[test]
+    #[ignore = "needs privilege: `nft -c` initialises a netlink cache"]
+    fn nft_accepts_the_generated_ruleset() {
+        // `mark` and `out` are keywords in nft's grammar, so naming chains
+        // after what they do produced a ruleset that only failed on the host it
+        // was meant for -- after the account had been registered and the
+        // interface brought up. Nothing in a unit test catches that; only nft
+        // can say whether nft will take it.
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let mut dests = BTreeSet::new();
+        dests.insert("45.66.35.10".to_owned());
+        // Overlapping on purpose: a range somebody adds by hand will sooner or
+        // later contain a relay, and an interval set refuses that without
+        // auto-merge.
+        dests.insert("45.66.35.0/24".to_owned());
+        dests.insert("185.220.101.4".to_owned());
+
+        for script in [nft_script("paqetz0", &dests), nft_revert()] {
+            let mut child = Command::new("nft")
+                .args(["-c", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("nft");
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(script.as_bytes())
+                .expect("write");
+            let out = child.wait_with_output().expect("wait");
+            assert!(
+                out.status.success(),
+                "nft refused this:\n{script}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_the_install_needs_is_named_with_its_package() {
+        // The failure this exists for: wgcf downloaded, an account registered
+        // with Cloudflare, a profile written -- and then `wg-quick@warp` does
+        // not exist, because wireguard-tools was never installed. The check
+        // belongs before the first change, and has to name the package: "wg-quick
+        // is missing" is not a sentence anyone can act on.
+        //
+        // Asserted against the source of the check itself, because what matters
+        // is that each tool carries a package name, and a tool added later
+        // without one would pass any test written against a copy of the list.
+        let source = include_str!("warp.rs");
+        let table = source
+            .split_once("fn preflight()")
+            .expect("a preflight")
+            .1
+            .split_once("] {")
+            .expect("a table of tools")
+            .0;
+        for tool in ["curl", "sha256sum", "nft", "wg-quick"] {
+            assert!(
+                table.contains(&format!("(\"{tool}\"")),
+                "{tool} is not checked for"
+            );
+        }
+        assert!(
+            table.contains("wireguard-tools"),
+            "the package is not named"
+        );
+        // Every entry is a triple of tool, package and reason, so a tool added
+        // later without a package to install shows up as a short row.
+        let entries = table.matches("(\"").count();
+        assert!(entries >= 4, "the table lost an entry: {table}");
+        assert!(
+            table.matches(',').count() >= entries * 2,
+            "each tool needs a package and a reason: {table}"
+        );
     }
 
     #[test]
