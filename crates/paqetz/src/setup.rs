@@ -179,7 +179,15 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
             t,
             "# log = \"info\"                # off | error | warn | info | debug"
         )?;
-        writeln!(t, "# health_interval = 60         # seconds")
+        writeln!(t, "# health_interval = 60         # seconds")?;
+        writeln!(t, "#")?;
+        writeln!(t, "# [[tunnel.lane]]")?;
+        writeln!(t, "# class  = 10")?;
+        if initiator {
+            writeln!(t, "# mark   = 79")
+        } else {
+            writeln!(t, "# egress = \"warp\"")
+        }
     };
 
     // The form that can hold several tunnels, written even for one. A file that

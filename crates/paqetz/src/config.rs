@@ -45,6 +45,41 @@ pub(crate) struct TunnelConfig {
     /// The peer at the far end. Exactly one per tunnel; several destinations
     /// means several tunnels, which is what `[[tunnel]]` is for.
     pub(crate) peer: Peer,
+    /// Numbered paths through the tunnel, each leaving by its own route.
+    ///
+    /// Empty unless asked for, and empty means the tunnel behaves exactly as it
+    /// did before this existed: no rules installed, no field read, nothing
+    /// tagged.
+    pub(crate) lanes: Vec<Lane>,
+}
+
+/// A numbered path through the tunnel.
+///
+/// A firewall mark cannot cross a tunnel -- it is kernel metadata attached to a
+/// buffer, not anything on the wire -- so the intent has to be written into the
+/// packet. It goes in the inner header's DSCP field: six bits that are already
+/// there, already zero, and inside the AEAD, so the outer packet is unchanged
+/// in size, shape and timing and an observer cannot tell one lane from another.
+///
+/// The two ends fill in different halves. The client says which mark becomes
+/// which class; the server says what each class means. That split is
+/// deliberate: a client that could name a routing table would be choosing its
+/// own way out of somebody else's machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Lane {
+    /// The class carried in the inner packet's DSCP.
+    pub(crate) class: u8,
+    /// The mark on this end whose traffic travels in it. Client side.
+    pub(crate) mark: Option<u32>,
+    /// The interface this class leaves by. Server side.
+    pub(crate) egress: Option<String>,
+    /// The table holding that interface's default route.
+    ///
+    /// Derived from where the route actually lives when it is not written
+    /// down, because an operator keeping this in step with a `wg-quick`
+    /// profile by hand gets a lane that looks configured and silently routes
+    /// nowhere.
+    pub(crate) table: Option<u32>,
 }
 
 /// This end of the tunnel.
@@ -344,6 +379,102 @@ pub(crate) enum Fragment {
     Path,
 }
 
+/// The classes a lane may take.
+///
+/// Zero is "no lane" -- the ordinary path, and what every packet carries today
+/// -- so it cannot name one. Sixty-three is what six bits of DSCP hold.
+const LANE_CLASSES: std::ops::RangeInclusive<u8> = 1..=63;
+
+/// Where a lane's internal firewall mark starts.
+///
+/// Well clear of the small numbers the rest of this uses -- 81 for routing,
+/// 0x51 for the SOCKS5 listener, 0x57 for the WARP destinations -- so a lane
+/// cannot silently take another feature's traffic. The mark is an
+/// implementation detail of the server's routing and never appears in the
+/// configuration or on the wire.
+const LANE_MARK_BASE: u32 = 0x100;
+
+/// The internal mark a class routes under, on the server.
+pub(crate) const fn lane_mark(class: u8) -> u32 {
+    LANE_MARK_BASE + class as u32
+}
+
+/// Reads and checks the lanes.
+///
+/// A file with no `[[tunnel.lane]]` yields none, and a tunnel with no lanes
+/// installs nothing and reads nothing: the feature is absent rather than
+/// present-and-idle.
+fn lanes(raw: &[RawLane], route_marked: Option<u32>, socks5: Option<&Socks5>) -> Result<Vec<Lane>> {
+    let mut lanes: Vec<Lane> = Vec::with_capacity(raw.len());
+    for entry in raw {
+        if !LANE_CLASSES.contains(&entry.class) {
+            return Err(invalid(
+                "tunnel.lane.class",
+                format!(
+                    "expected {} to {}: zero is the ordinary path, which needs no lane, and \
+                     the field carrying this holds six bits",
+                    LANE_CLASSES.start(),
+                    LANE_CLASSES.end()
+                ),
+            ));
+        }
+        if entry.mark.is_none() && entry.egress.is_none() {
+            return Err(invalid(
+                "tunnel.lane",
+                format!(
+                    "class {} says nothing: the end that sends needs `mark`, naming whose \
+                     traffic travels in it, and the end that forwards needs `egress`, naming \
+                     where it leaves by",
+                    entry.class
+                ),
+            ));
+        }
+        if let Some(mark) = entry.mark {
+            if mark == 0 {
+                return Err(invalid(
+                    "tunnel.lane.mark",
+                    "zero is what unmarked traffic carries, so it cannot select a lane",
+                ));
+            }
+            // Sharing a mark with the ordinary path means the ordinary path's
+            // traffic is tagged too, and every packet takes the lane.
+            if route_marked == Some(mark) {
+                return Err(invalid(
+                    "tunnel.lane.mark",
+                    format!("{mark} is already interface.route_marked, which is the ordinary path"),
+                ));
+            }
+            if socks5.is_some_and(|s| s.mark == mark) {
+                return Err(invalid(
+                    "tunnel.lane.mark",
+                    format!("{mark} is already the SOCKS5 listener's mark"),
+                ));
+            }
+        }
+        if lanes.iter().any(|l| l.class == entry.class) {
+            return Err(invalid(
+                "tunnel.lane.class",
+                format!("{} appears twice", entry.class),
+            ));
+        }
+        if let Some(mark) = entry.mark
+            && lanes.iter().any(|l| l.mark == Some(mark))
+        {
+            return Err(invalid(
+                "tunnel.lane.mark",
+                format!("{mark} appears twice; one mark cannot choose two lanes"),
+            ));
+        }
+        lanes.push(Lane {
+            class: entry.class,
+            mark: entry.mark,
+            egress: entry.egress.clone(),
+            table: entry.table,
+        });
+    }
+    Ok(lanes)
+}
+
 /// The largest outer packet no path in practice needs to fragment.
 ///
 /// The floor every IPv6-capable link must carry, and a de-facto minimum for
@@ -488,6 +619,8 @@ struct RawConfig {
     peer: Option<RawPeer>,
     #[serde(default)]
     socks5: Option<RawSocks5>,
+    #[serde(default)]
+    lane: Vec<RawLane>,
 
     // The form that can name more than one.
     #[serde(default)]
@@ -511,6 +644,20 @@ struct RawTunnel {
     peer: RawPeer,
     #[serde(default)]
     socks5: Option<RawSocks5>,
+    #[serde(default)]
+    lane: Vec<RawLane>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLane {
+    class: u8,
+    #[serde(default)]
+    mark: Option<u32>,
+    #[serde(default)]
+    egress: Option<String>,
+    #[serde(default)]
+    table: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -860,13 +1007,13 @@ impl Config {
                 // Named for its device, which is what a log line would have to
                 // call it otherwise.
                 let name = iface.device.clone().unwrap_or_else(|| "paqetz0".to_owned());
-                vec![Self::one(name, iface, peer, raw.socks5)?]
+                vec![Self::one(name, iface, peer, raw.socks5, raw.lane)?]
             }
             (None, None, Some(list)) if !list.is_empty() => {
                 let mut out = Vec::with_capacity(list.len());
                 for (i, t) in list.into_iter().enumerate() {
                     let name = t.name.unwrap_or_else(|| format!("tunnel{i}"));
-                    out.push(Self::one(name, t.interface, t.peer, t.socks5)?);
+                    out.push(Self::one(name, t.interface, t.peer, t.socks5, t.lane)?);
                 }
                 out
             }
@@ -983,6 +1130,7 @@ impl Config {
         iface: RawInterface,
         peer_raw: RawPeer,
         socks5_raw: Option<RawSocks5>,
+        lane_raw: Vec<RawLane>,
     ) -> Result<TunnelConfig> {
         let private_key = PrivateKey::from_base64(&iface.private_key)
             .map_err(|e| invalid("interface.private_key", e.to_string()))?;
@@ -1218,6 +1366,10 @@ impl Config {
             ));
         }
 
+        // After the mark and the listener, because a lane sharing either
+        // means the ordinary path is tagged as well and every packet takes it.
+        let lanes = lanes(&lane_raw, iface.route_marked, socks5.as_ref())?;
+
         Ok(TunnelConfig {
             name,
             socks5,
@@ -1441,6 +1593,7 @@ impl Config {
                 // WARP profile, which is the usual reason to want this.
                 egress_table: iface.egress_table.unwrap_or(51_820),
             },
+            lanes,
             peer: Peer {
                 public_key,
                 endpoint,
@@ -1545,6 +1698,119 @@ mod tests {
         assert_eq!(on.interface.repeat.capacity, 1200);
         assert_eq!(on.interface.repeat.deadline, 700);
         assert_eq!(on.interface.repeat.asks, 3);
+    }
+
+    #[test]
+    fn a_file_without_lanes_has_none() {
+        // The requirement this exists for: a configuration that never mentions
+        // lanes must behave exactly as it did before they existed. Empty is
+        // not "present and idle" -- nothing downstream reads a field or
+        // installs a rule.
+        let c = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert!(c.lanes.is_empty());
+    }
+
+    #[test]
+    fn each_end_fills_in_the_half_it_owns() {
+        // The end that sends says whose traffic travels in the lane.
+        let text = format!("{CLIENT}\n[[lane]]\nmark = 79\nclass = 10\n");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert_eq!(c.lanes.len(), 1);
+        assert_eq!(c.lanes[0].class, 10);
+        assert_eq!(c.lanes[0].mark, Some(79));
+        assert_eq!(c.lanes[0].egress, None);
+
+        // The end that forwards says where it leaves by, and may leave the
+        // table to be derived from where that interface's route lives.
+        let text = format!("{SERVER}\n[[lane]]\nclass = 10\negress = \"warp\"\n");
+        let c = Config::parse(&text)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert_eq!(c.lanes[0].egress.as_deref(), Some("warp"));
+        assert_eq!(c.lanes[0].table, None, "derived, not written");
+
+        // And the same under a named tunnel, since a file may be written
+        // either way and one form silently ignoring lanes would be worse than
+        // refusing them.
+        let text = THREE.replacen(
+            "[tunnel.peer]",
+            "[[tunnel.lane]]\nclass = 12\nmark = 77\n\n[tunnel.peer]",
+            1,
+        );
+        let c = Config::parse(&text).expect("parse");
+        let first = c.tunnels.first().expect("a tunnel");
+        assert_eq!(first.lanes.len(), 1, "the named form carries lanes too");
+        assert_eq!(first.lanes[0].class, 12);
+        assert!(
+            c.tunnels[1].lanes.is_empty(),
+            "and only for the tunnel that named them"
+        );
+    }
+
+    #[test]
+    fn a_lane_refuses_what_would_take_the_ordinary_path_with_it() {
+        let lane = |body: &str| Config::parse(&format!("{CLIENT}\n[[lane]]\n{body}\n"));
+
+        // Zero is what every unmarked packet already carries.
+        assert!(lane("class = 0\nmark = 79").is_err());
+        // Six bits is what the field holds.
+        assert!(lane("class = 64\nmark = 79").is_err());
+        assert!(lane("class = 63\nmark = 79").is_ok());
+        // An unmarked socket is every socket.
+        assert!(lane("class = 10\nmark = 0").is_err());
+        // Saying neither half says nothing at all.
+        let err = lane("class = 10").expect_err("says nothing");
+        assert!(err.to_string().contains("says nothing"), "{err}");
+        // Two lanes cannot be one class, nor one mark two lanes.
+        assert!(
+            Config::parse(&format!(
+                "{CLIENT}\n[[lane]]\nclass = 10\nmark = 79\n[[lane]]\nclass = 10\nmark = 78\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            Config::parse(&format!(
+                "{CLIENT}\n[[lane]]\nclass = 10\nmark = 79\n[[lane]]\nclass = 11\nmark = 79\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_lane_cannot_take_the_mark_the_ordinary_path_uses() {
+        // Sharing it means the ordinary path is tagged too, and every packet
+        // takes the lane -- which is the opposite of what was asked for.
+        let text = CLIENT.replace("[peer]", "route_marked = 81\nroute_table = 81\n\n[peer]");
+        let err = Config::parse(&format!("{text}\n[[lane]]\nclass = 10\nmark = 81\n"))
+            .expect_err("should refuse");
+        assert!(err.to_string().contains("route_marked"), "{err}");
+
+        // A different mark is fine.
+        assert!(Config::parse(&format!("{text}\n[[lane]]\nclass = 10\nmark = 79\n")).is_ok());
+    }
+
+    #[test]
+    fn a_lanes_internal_mark_is_clear_of_the_ones_in_use() {
+        // The server routes each class under a mark of its own. Colliding with
+        // the routing mark, the listener's, or the WARP destinations' would be
+        // one feature silently taking another's traffic.
+        for class in 1..=63u8 {
+            let mark = lane_mark(class);
+            assert!(mark >= LANE_MARK_BASE, "class {class}");
+            for taken in [81u32, 0x51, 0x57] {
+                assert_ne!(mark, taken, "class {class} collides with {taken:#x}");
+            }
+        }
+        // And distinct per class, or two lanes would route as one.
+        let marks: std::collections::BTreeSet<u32> = (1..=63u8).map(lane_mark).collect();
+        assert_eq!(marks.len(), 63);
     }
 
     #[test]

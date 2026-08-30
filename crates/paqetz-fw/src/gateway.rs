@@ -291,6 +291,120 @@ impl TunnelRoutes {
     }
 }
 
+/// Points a firewall mark at a routing table, without touching its routes.
+///
+/// Distinct from the policy route the tunnel installs for its own device, which
+/// also puts a route *in* the table. Here the table belongs to something else --
+/// a `wg-quick` profile, usually -- and writing into it would fight whatever
+/// brought it up.
+///
+/// Removed before it is added, because `ip rule add` is not idempotent: run
+/// twice it installs the rule twice, and the duplicate is invisible until
+/// somebody reads `ip rule` and wonders.
+///
+/// # Errors
+/// Returns the tool's failure.
+pub fn point_mark_at(mark: u32, table: u32, priority: u32) -> Result<()> {
+    let mark = format!("{mark:#x}");
+    let table = table.to_string();
+    let priority = priority.to_string();
+    let spec = [
+        "rule", "del", "fwmark", &mark, "lookup", &table, "priority", &priority,
+    ];
+    while run_ip(&spec).is_ok() {}
+    run_ip(&[
+        "rule", "add", "fwmark", &mark, "lookup", &table, "priority", &priority,
+    ])
+}
+
+/// Removes such a rule.
+pub fn unpoint_mark(mark: u32, table: u32, priority: u32) {
+    let mark = format!("{mark:#x}");
+    let table = table.to_string();
+    let priority = priority.to_string();
+    while run_ip(&[
+        "rule", "del", "fwmark", &mark, "lookup", &table, "priority", &priority,
+    ])
+    .is_ok()
+    {}
+}
+
+/// Priority of a lane's rule.
+///
+/// Above the blanket egress rule, so a lane is consulted before anything that
+/// would sweep all the tunnel's traffic one way.
+pub const LANE_RULE_PRIORITY: u32 = 9_000;
+
+/// The routing table holding a default route out of `interface`.
+///
+/// Derived rather than configured, because an operator keeping a table number
+/// in step with a `wg-quick` profile by hand gets a lane that looks configured,
+/// finds an empty table, falls through to the main one, and sends the traffic
+/// out the ordinary way. That failure is silent at every layer: the rules are
+/// installed, the counters move, and the packets leave by the wrong interface.
+///
+/// # Errors
+/// Returns a message naming what was found when there is no such route, or
+/// when there is more than one and the choice is not this function's to make.
+pub fn table_for(interface: &str) -> core::result::Result<u32, String> {
+    let listed = std::process::Command::new("ip")
+        .args(["route", "show", "table", "all"])
+        .output()
+        .map_err(|e| format!("could not run `ip route show table all`: {e}"))?;
+    table_in(&String::from_utf8_lossy(&listed.stdout), interface)
+}
+
+/// The same decision, over text a test can supply.
+fn table_in(text: &str, interface: &str) -> core::result::Result<u32, String> {
+    let mut found: Vec<u32> = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("default") {
+            continue;
+        }
+        let fields: Vec<&str> = fields.collect();
+        let pair = |key: &str| {
+            fields
+                .windows(2)
+                .find_map(|w| (w.first() == Some(&key)).then(|| w.get(1).copied())?)
+        };
+        let leaves_by = pair("dev") == Some(interface);
+        if !leaves_by {
+            continue;
+        }
+        // Absent, the route is in `main`, which is the one table a lane must
+        // not use: everything already looks there, so it would not select.
+        let table = pair("table").and_then(|t| t.parse::<u32>().ok());
+        match table {
+            Some(t) if !found.contains(&t) => found.push(t),
+            Some(_) => {}
+            None => {
+                return Err(format!(
+                    "{interface} has its default route in the main table, so nothing can be \
+                     steered to it -- every lookup already ends there. Bring it up with a table \
+                     of its own (`Table = 51820` in a wg-quick profile)."
+                ));
+            }
+        }
+    }
+    match found.as_slice() {
+        [] => Err(format!(
+            "no default route leaves by {interface}. Bring the interface up first, with a table \
+             of its own, and check `ip route show table all`."
+        )),
+        [one] => Ok(*one),
+        many => Err(format!(
+            "{interface} has default routes in {} tables ({}), so which one a lane should use is \
+             not derivable. Write it down as `table`.",
+            many.len(),
+            many.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Panicking on an out-of-range index is exactly what a test should do.
@@ -314,6 +428,53 @@ mod tests {
             }),
             ..gateway()
         }
+    }
+
+    #[test]
+    fn the_table_a_lane_needs_is_read_off_the_routes() {
+        // Taken from a live host: wg-quick with `Table = 51820` puts WARP's
+        // default there, main keeps the host's own, and a paqetz tunnel adds
+        // its own table for marked traffic.
+        let routes = "\
+default via 185.31.8.1 dev eth0 proto static onlink
+default dev warp table 51820 scope link
+default dev paqetz0 table 81 scope link metric 1
+blackhole default table 81 metric 100
+10.7.0.0/24 dev paqetz0 proto kernel scope link src 10.7.0.1
+";
+        assert_eq!(table_in(routes, "warp"), Ok(51_820));
+        assert_eq!(table_in(routes, "paqetz0"), Ok(81));
+    }
+
+    #[test]
+    fn a_route_in_the_main_table_cannot_be_steered_to() {
+        // Every lookup already ends in main, so a rule pointing there selects
+        // nothing -- and the traffic leaves the ordinary way while the rules,
+        // the counters and the logs all look correct.
+        let routes = "default via 185.31.8.1 dev eth0 proto static onlink\n";
+        let err = table_in(routes, "eth0").expect_err("main is not steerable");
+        assert!(err.contains("main table"), "{err}");
+    }
+
+    #[test]
+    fn an_interface_that_is_not_up_says_so_rather_than_guessing() {
+        let routes = "default dev warp table 51820 scope link\n";
+        let err = table_in(routes, "wg0").expect_err("no such route");
+        assert!(err.contains("no default route"), "{err}");
+        assert!(err.contains("wg0"), "{err}");
+    }
+
+    #[test]
+    fn two_tables_for_one_interface_is_not_a_choice_to_make_here() {
+        // Picking one would be picking where somebody's traffic goes, on
+        // evidence that does not decide it.
+        let routes = "\
+default dev warp table 51820 scope link
+default dev warp table 90 scope link
+";
+        let err = table_in(routes, "warp").expect_err("ambiguous");
+        assert!(err.contains("51820") && err.contains("90"), "{err}");
+        assert!(err.contains("Write it down"), "{err}");
     }
 
     #[test]

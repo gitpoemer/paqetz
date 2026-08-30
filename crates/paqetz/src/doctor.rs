@@ -118,6 +118,11 @@ pub(crate) fn run(path: &Path) -> bool {
             findings.push(check_standard_port(t.interface.listen_port));
         }
         findings.push(check_mtu(t.interface.mtu, t.interface.shape));
+        for lane in &t.lanes {
+            if let Some(interface) = lane.egress.as_deref() {
+                findings.push(check_lane(lane.class, interface, lane.table));
+            }
+        }
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));
         if t.interface.gateway {
@@ -451,6 +456,40 @@ pub(crate) fn outbound_mtu() -> Option<u32> {
         .and_then(|t| default_route_interface(&t))
         .and_then(|iface| std::fs::read_to_string(format!("/sys/class/net/{iface}/mtu")).ok())
         .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// Whether a lane can actually reach the way out it names.
+///
+/// The failure this catches is the quiet one. A lane whose table holds no route
+/// installs cleanly, matches packets, moves its counters, and sends the traffic
+/// out the ordinary interface -- because the lookup finds an empty table and
+/// falls through to the main one. Everything looks right except where the
+/// packets go, which is the one thing not visible from the host.
+fn check_lane(class: u8, interface: &str, written: Option<u32>) -> Finding {
+    if !std::path::Path::new(&format!("/sys/class/net/{interface}")).exists() {
+        return Finding::fail(
+            format!("lane {class}"),
+            format!("{interface} does not exist on this host"),
+            format!("bring {interface} up, or point the lane at an interface that is"),
+        );
+    }
+    match (written, paqetz_fw::gateway::table_for(interface)) {
+        (Some(table), _) => Finding::pass(
+            format!("lane {class}"),
+            format!("leaves by {interface}, table {table} as written"),
+        ),
+        (None, Ok(table)) => Finding::pass(
+            format!("lane {class}"),
+            format!("leaves by {interface}, table {table}"),
+        ),
+        (None, Err(why)) => Finding::fail(
+            format!("lane {class}"),
+            why,
+            format!(
+                "write the table down as `table` under the lane, or bring {interface} up with one of its own"
+            ),
+        ),
+    }
 }
 
 /// Whether the inner MTU leaves room for the tunnel's overhead.

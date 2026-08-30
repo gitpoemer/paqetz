@@ -559,11 +559,33 @@ struct Attached {
     listener: Option<paqetz_net4::route::Policy>,
     gateway: Option<(paqetz_fw::gateway::Gateway, bool)>,
     routes: Option<paqetz_fw::gateway::TunnelRoutes>,
+    /// What the lanes installed: their tagging table, and one rule each on the
+    /// end that forwards. Empty for a tunnel with no lanes, which then leaves
+    /// exactly as much behind as it did before they existed: nothing.
+    lanes: Vec<LanePlan>,
+    /// The policy routes that put each lane's marked traffic into the tunnel,
+    /// on the end that sends.
+    lane_marks: Vec<paqetz_net4::route::Policy>,
 }
 
 impl Attached {
     /// Leaves the host as it was found.
     fn revert(self) {
+        if !self.lanes.is_empty() {
+            let _ = paqetz_fw::nft_script(&paqetz_fw::rules::lane_revert());
+            for plan in &self.lanes {
+                if let (Some(table), Some(_)) = (plan.egress_table, plan.rule.egress.as_ref()) {
+                    paqetz_fw::gateway::unpoint_mark(
+                        plan.rule.route_mark,
+                        table,
+                        paqetz_fw::gateway::LANE_RULE_PRIORITY,
+                    );
+                }
+            }
+        }
+        for policy in &self.lane_marks {
+            policy.revert(&self.device);
+        }
         if let Some(routes) = self.routes {
             routes.revert();
         }
@@ -625,6 +647,60 @@ fn attach(
             policy.table
         );
         s5.table = policy.table;
+    }
+
+    // Lanes, if any. Absent, nothing below runs and the tunnel behaves exactly
+    // as it did before they existed.
+    let plans = match lane_plans(cfg) {
+        Ok(plans) => plans,
+        Err(e) => {
+            log::error!("{e}");
+            log::error!("the tunnel will run, but its lanes are not installed");
+            Vec::new()
+        }
+    };
+    let mut lane_marks = Vec::new();
+    if !plans.is_empty() {
+        let rules: Vec<_> = plans.iter().map(|p| p.rule.clone()).collect();
+        if let Err(e) = paqetz_fw::nft_script(&paqetz_fw::rules::lane_script(&device, &rules)) {
+            log::error!("could not install the lane rules: {e}");
+        }
+        for plan in &plans {
+            // The sending end: the mark has to reach the tunnel as well as be
+            // tagged, or the traffic leaves this host the ordinary way and the
+            // far end never sees the class at all.
+            if let Some(mark) = plan.rule.mark {
+                let policy = paqetz_net4::route::Policy {
+                    mark,
+                    table: cfg.interface.route_table,
+                };
+                match policy.apply(&device) {
+                    Ok(()) => {
+                        log::info!(
+                            "lane {}: sockets marked {mark} route through {device} and travel tagged",
+                            plan.rule.class
+                        );
+                        lane_marks.push(policy);
+                    }
+                    Err(e) => log::error!("lane {}: {e}", plan.rule.class),
+                }
+            }
+            // The forwarding end: the class's own mark points at the table
+            // holding that interface's route. The routes there belong to
+            // whatever brought the interface up, and are left alone.
+            if let (Some(table), Some(out)) = (plan.egress_table, plan.rule.egress.as_deref()) {
+                match paqetz_fw::gateway::point_mark_at(
+                    plan.rule.route_mark,
+                    table,
+                    paqetz_fw::gateway::LANE_RULE_PRIORITY,
+                ) {
+                    Ok(()) => {
+                        log::info!("lane {}: leaves by {out} (table {table})", plan.rule.class);
+                    }
+                    Err(e) => log::error!("lane {}: {e}", plan.rule.class),
+                }
+            }
+        }
     }
 
     let want_routes = cfg.interface.route_all;
@@ -779,6 +855,8 @@ fn attach(
     };
 
     Ok(Attached {
+        lanes: plans,
+        lane_marks,
         device,
         marked,
         listener: policy,
@@ -1302,6 +1380,42 @@ fn effective_guard(cfg: &Config) -> Result<paqetz_fw::rules::Guard, &'static str
              cannot be named ahead of time. `run` installs them itself; to manage \
              them by hand, set interface.listen_port to a fixed port.",
         )
+}
+
+/// One lane, resolved into what the firewall and the routing each need.
+struct LanePlan {
+    /// What the nftables rules are built from.
+    rule: paqetz_fw::rules::Lane,
+    /// The table this class leaves by, on the end that forwards.
+    egress_table: Option<u32>,
+}
+
+/// Turns this tunnel's lanes into that.
+///
+/// Each half is filled in by the end that owns it: `mark` by the end that
+/// sends, `egress` by the end that forwards. A lane naming an interface has its
+/// routing table derived from where that interface's default route actually
+/// lives, because a number kept in step by hand produces a lane that looks
+/// configured and quietly routes nowhere.
+fn lane_plans(cfg: &config::TunnelConfig) -> Result<Vec<LanePlan>, String> {
+    let mut out = Vec::with_capacity(cfg.lanes.len());
+    for lane in &cfg.lanes {
+        let egress_table = match (lane.egress.as_deref(), lane.table) {
+            (None, _) => None,
+            (Some(_), Some(written)) => Some(written),
+            (Some(interface), None) => Some(paqetz_fw::gateway::table_for(interface)?),
+        };
+        out.push(LanePlan {
+            rule: paqetz_fw::rules::Lane {
+                class: lane.class,
+                mark: lane.mark,
+                egress: lane.egress.clone(),
+                route_mark: config::lane_mark(lane.class),
+            },
+            egress_table,
+        });
+    }
+    Ok(out)
 }
 
 fn effective_port(cfg: &Config) -> Option<u16> {

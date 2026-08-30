@@ -274,6 +274,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_sending_end_tags_and_a_forwarding_end_reads() {
+        // A firewall mark cannot cross a tunnel, so the intent travels in the
+        // inner header's DSCP -- a byte already present, already zero, and
+        // inside the AEAD, so the outer packet is unchanged in size and shape.
+        let lanes = vec![Lane {
+            class: 10,
+            mark: Some(79),
+            egress: None,
+            route_mark: 0x10a,
+        }];
+        let script = lane_script("paqetz0", &lanes);
+        assert!(
+            script.contains("oifname \"paqetz0\" meta mark 0x4f counter ip dscp set 10"),
+            "{script}"
+        );
+        // The sending end names no way out, so it installs none.
+        assert!(!script.contains("masquerade"), "{script}");
+
+        let lanes = vec![Lane {
+            class: 10,
+            mark: None,
+            egress: Some("warp".to_owned()),
+            route_mark: 0x10a,
+        }];
+        let script = lane_script("paqetz0", &lanes);
+        assert!(
+            script.contains("iifname \"paqetz0\" ip dscp 10 counter meta mark set 0x10a"),
+            "{script}"
+        );
+        assert!(
+            script.contains("oifname \"warp\" counter masquerade"),
+            "{script}"
+        );
+        // Cleared on the way out: it was written to be read on this host, and
+        // carrying it onward tells the destination something for no gain.
+        assert!(
+            script.contains("oifname \"warp\" counter ip dscp set 0"),
+            "{script}"
+        );
+        assert!(
+            !script.contains("meta mark 0x"),
+            "nothing to tag here: {script}"
+        );
+    }
+
+    #[test]
+    fn several_classes_leaving_one_way_translate_once() {
+        // A masquerade rule per lane would translate the same packet once for
+        // every class that happens to name the same interface.
+        let lanes = vec![
+            Lane {
+                class: 10,
+                mark: None,
+                egress: Some("warp".to_owned()),
+                route_mark: 0x10a,
+            },
+            Lane {
+                class: 11,
+                mark: None,
+                egress: Some("warp".to_owned()),
+                route_mark: 0x10b,
+            },
+            Lane {
+                class: 12,
+                mark: None,
+                egress: Some("wg0".to_owned()),
+                route_mark: 0x10c,
+            },
+        ];
+        let script = lane_script("paqetz0", &lanes);
+        assert_eq!(
+            script
+                .matches("oifname \"warp\" counter masquerade")
+                .count(),
+            1,
+            "{script}"
+        );
+        assert_eq!(
+            script.matches("oifname \"wg0\" counter masquerade").count(),
+            1,
+            "{script}"
+        );
+        // But every class still gets its own mark, or two lanes leaving by one
+        // interface would be indistinguishable to the routing.
+        for (dscp, mark) in [(10, "0x10a"), (11, "0x10b"), (12, "0x10c")] {
+            assert!(
+                script.contains(&format!("ip dscp {dscp} counter meta mark set {mark}")),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_lanes_is_an_empty_table_rather_than_absent_rules() {
+        // The table is still replaced, so a file that had lanes and no longer
+        // does leaves nothing of them behind.
+        let script = lane_script("paqetz0", &[]);
+        assert!(script.starts_with(&format!(
+            "add table inet {LANE_TABLE}\ndelete table inet {LANE_TABLE}\n"
+        )));
+        assert!(!script.contains("dscp"), "{script}");
+        assert!(!script.contains("masquerade"), "{script}");
+    }
+
+    #[test]
     fn a_protocol_guard_covers_both_directions_and_the_kernels_answer() {
         // The same three jobs as the per-port rules: exempt each direction
         // from connection tracking, then stop the kernel announcing that it
@@ -490,4 +595,91 @@ mod tests {
             );
         }
     }
+}
+
+/// One numbered path through the tunnel, as the firewall sees it.
+///
+/// The two ends install different halves. The sending end tags what carries
+/// `mark` with `class`, in the inner packet's DSCP; the forwarding end matches
+/// that class and steers it to `egress`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lane {
+    /// The class carried in the inner header's DSCP.
+    pub class: u8,
+    /// Whose traffic travels in it, on the sending end.
+    pub mark: Option<u32>,
+    /// Where it leaves by, on the forwarding end.
+    pub egress: Option<String>,
+    /// The internal mark the forwarding end routes it under.
+    pub route_mark: u32,
+}
+
+/// The nftables table lanes own.
+pub const LANE_TABLE: &str = "paqetz_lane";
+
+/// The script that installs whatever halves these lanes describe.
+///
+/// One table, one transaction, `add` then `delete` then define, as everything
+/// here is written: the same result whether or not anything was there before,
+/// and no lane can be half-installed.
+///
+/// Both directions carry counters. Without them "is this lane working" has no
+/// answer, and on a feature whose entire job is to send *some* traffic
+/// elsewhere that is the only question anyone will ask.
+///
+/// The forwarding end clears the class on the way out. It was written into the
+/// packet to be read on this host; leaving it set would carry a marking to the
+/// destination and every network between, which says something about the
+/// traffic to anyone who looks and does nothing for anybody.
+#[must_use]
+pub fn lane_script(device: &str, lanes: &[Lane]) -> String {
+    let mut tag = String::new();
+    let mut pick = String::new();
+    let mut out = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for lane in lanes {
+        let dscp = lane.class;
+        if let Some(mark) = lane.mark {
+            tag.push_str(&format!(
+                "        oifname \"{device}\" meta mark {mark:#x} counter ip dscp set {dscp}\n"
+            ));
+        }
+        if let Some(egress) = lane.egress.as_deref() {
+            pick.push_str(&format!(
+                "        iifname \"{device}\" ip dscp {dscp} counter meta mark set {:#x}\n",
+                lane.route_mark
+            ));
+            // One rule per interface however many classes leave by it, or a
+            // packet is translated once per lane that names the same way out.
+            if !seen.contains(&egress) {
+                seen.push(egress);
+                out.push_str(&format!(
+                    "        oifname \"{egress}\" counter ip dscp set 0\n\
+                     \x20       oifname \"{egress}\" counter masquerade\n"
+                ));
+            }
+        }
+    }
+    format!(
+        "add table inet {LANE_TABLE}
+delete table inet {LANE_TABLE}
+table inet {LANE_TABLE} {{
+    chain tag {{
+        type filter hook postrouting priority mangle; policy accept;
+{tag}    }}
+    chain pick {{
+        type filter hook prerouting priority mangle; policy accept;
+{pick}    }}
+    chain leave {{
+        type nat hook postrouting priority srcnat; policy accept;
+{out}    }}
+}}
+"
+    )
+}
+
+/// The script that removes them.
+#[must_use]
+pub fn lane_revert() -> String {
+    format!("add table inet {LANE_TABLE}\ndelete table inet {LANE_TABLE}\n")
 }
