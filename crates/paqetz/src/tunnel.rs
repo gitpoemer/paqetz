@@ -1792,6 +1792,20 @@ impl Tunnel {
             return Ok(());
         };
 
+        // The waiting side has no peer to derive its own outer address from, so
+        // it starts at 0.0.0.0 and learns it here, from where the peer sent to.
+        //
+        // Not cosmetic. A carrier filtered by protocol rather than by port
+        // matches this end's own transmissions as well as the peer's, and the
+        // check that drops them compares the source against this address --
+        // which, left unspecified, never matches. The result is a responder
+        // decrypting every packet it just sent, failing, and counting a
+        // rejection: the counter that exists to say "someone is sending
+        // garbage at this port" instead reporting its own traffic.
+        if let Ok(mut local) = self.local.lock() {
+            *local = learn_local(*local, (seg.dst.0, seg.dst.1));
+        }
+
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // As on the initiating side: a rekey must not restart the conversation
@@ -2389,6 +2403,23 @@ fn fitted_mtu(configured: u32, shape: crate::config::Shape, link: Option<u32>) -
     }
 }
 
+/// This end's own outer address, once a packet has said what it is.
+///
+/// Kept after the first answer rather than followed. The destination of an
+/// inbound packet is only evidence about this host while nobody is spoofing,
+/// and a value that moved on every arrival would hand an off-path party the
+/// ability to change what this end believes its own address to be -- which is
+/// exactly what the check reading it is defending against.
+///
+/// The whole decision, in one place a test can reach.
+const fn learn_local(current: (Ipv4Addr, u16), destination: (Ipv4Addr, u16)) -> (Ipv4Addr, u16) {
+    if current.0.is_unspecified() {
+        destination
+    } else {
+        current
+    }
+}
+
 /// Reads the source address of an inner IPv4 packet.
 fn inner_source(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.first().map(|b| b >> 4) != Some(4) {
@@ -2534,6 +2565,32 @@ mod tests {
             "a packet with nowhere to go is not a packet that was sent"
         );
         assert_eq!(stats.tx_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_waiting_side_learns_its_own_address_once_and_keeps_it() {
+        // Without this the responder's own outer address stays 0.0.0.0, and the
+        // check that drops self-captured packets compares against it and never
+        // matches. A carrier filtered by protocol rather than by port sees its
+        // own transmissions, so the responder decrypts everything it just sent,
+        // fails, and counts a rejection -- the counter that exists to report
+        // somebody sending garbage instead reporting its own traffic.
+        let unset = (Ipv4Addr::UNSPECIFIED, 0);
+        let ours = (Ipv4Addr::new(203, 0, 113, 5), 8443);
+        assert_eq!(
+            learn_local(unset, ours),
+            ours,
+            "learned from the first packet"
+        );
+
+        // And never moved afterwards. The destination of an inbound packet is
+        // evidence about this host only while nobody is spoofing, and a value
+        // that followed every arrival would let an off-path party choose what
+        // this end believes its own address is -- defeating the check that
+        // reads it.
+        let elsewhere = (Ipv4Addr::new(198, 51, 100, 7), 9999);
+        assert_eq!(learn_local(ours, elsewhere), ours, "kept, not followed");
+        assert_eq!(learn_local(ours, unset), ours);
     }
 
     #[test]
