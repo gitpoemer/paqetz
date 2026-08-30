@@ -15,14 +15,15 @@ use core::net::Ipv4Addr;
 #[must_use]
 pub fn sum(data: &[u8], initial: u64) -> u64 {
     let mut acc = initial;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        // `chunks_exact(2)` guarantees two bytes.
-        let hi = u64::from(*c.first().unwrap_or(&0));
-        let lo = u64::from(*c.get(1).unwrap_or(&0));
-        acc += (hi << 8) | lo;
+    // Fixed-size chunks, so each pair is an array and both bytes are reachable
+    // without a fallible index -- which is also what the checksum wants: a word
+    // half-read as zero is a checksum that passes over corrupt data.
+    let (pairs, remainder) = data.as_chunks::<2>();
+    for [hi, lo] in pairs {
+        acc += (u64::from(*hi) << 8) | u64::from(*lo);
     }
-    if let Some(last) = chunks.remainder().first() {
+    // An odd trailing byte is the high half of a word whose low half is zero.
+    if let Some(last) = remainder.first() {
         acc += u64::from(*last) << 8;
     }
     acc
