@@ -68,6 +68,17 @@ fn handshake_pad() -> usize {
 /// genuinely gone is not a cost worth protecting against.
 const RETRY_WHEN_GONE: Millis = 30_000;
 
+/// How long to wait after a peer says goodbye before handshaking at it again.
+///
+/// The peer sends that message on its way out, so for a moment after it
+/// arrives the peer is still running and still holding keys. A handshake that
+/// lands in that moment is answered by a process about to exit, and the
+/// session it establishes dies a few milliseconds later -- leaving this end
+/// believing it has one, and waiting out [`PRESUMED_DEAD`] to find out
+/// otherwise. That is the wait this whole mechanism exists to avoid, so it is
+/// worth a second not to reintroduce it.
+const REJOIN_AFTER: Millis = 1_000;
+
 /// How long to wait before repeating an unanswered confirmation.
 const CONFIRM_RETRY: Millis = 1_000;
 
@@ -340,6 +351,13 @@ struct PeerState {
     /// path is failing, and a path that drops [`CONFIRM_TRIES`] consecutive
     /// packets has a problem no amount of repeating will solve.
     confirm_tries: u8,
+    /// The earliest a handshake may be attempted, whatever else is true.
+    ///
+    /// Set only by [`Self::farewell`]. Distinct from `retry_at`, which paces
+    /// repeated attempts: this holds the *first* one back, and `retry_at` has
+    /// no effect on a state with no session and nothing pending, which is
+    /// exactly what a goodbye leaves behind.
+    resume_at: Millis,
     /// When the carrier should move to the next port.
     rotate_at: Millis,
     /// The smallest path MTU a hop has reported, if any has.
@@ -387,6 +405,7 @@ impl PeerState {
             confirm_owed: false,
             confirm_tries: 0,
             last_data_receive: None,
+            resume_at: 0,
             rotate_at: Millis::MAX,
             reported_mtu: None,
             unanswered: 0,
@@ -572,6 +591,9 @@ impl PeerState {
     /// second copy of the same reasoning -- which agrees with itself no matter
     /// what either copy says.
     fn wants_handshake(&self, now: Millis) -> bool {
+        if now < self.resume_at {
+            return false;
+        }
         let waited = now >= self.retry_at;
         match self.session.as_ref() {
             None if self.exhausted(now) => self.revive(now),
@@ -627,9 +649,36 @@ impl PeerState {
         self.last_keepalive = None;
         self.last_data_receive = None;
         self.attempt_started = None;
+        self.resume_at = 0;
         // A reply is the only thing that proves this five-tuple still reaches
         // the peer, so it is the only thing that clears the count.
         self.unanswered = 0;
+    }
+
+    /// Drops everything belonging to a peer that has said it is going away.
+    ///
+    /// Every session, including the one waiting to be confirmed and the one
+    /// being kept for packets still in flight: the peer is about to forget all
+    /// of them, so holding any is holding keys nobody on the other side has.
+    /// The handshake that follows is held back by `resume_at` so it does not
+    /// land on a process that has not finished leaving.
+    fn farewell(&mut self, now: Millis) {
+        self.session = None;
+        self.next = None;
+        self.previous = None;
+        self.pending = None;
+        self.confirm_owed = false;
+        self.confirm_tries = 0;
+        self.last_send = None;
+        self.last_keepalive = None;
+        self.last_data_receive = None;
+        // A fresh run of attempts rather than whatever clock was already
+        // running: a peer that restarts after ninety idle seconds must not
+        // inherit a run that has already given up.
+        self.attempt_started = None;
+        self.resume_at = now.saturating_add(REJOIN_AFTER);
+        // Named by a counter the next session restarts at zero.
+        self.outbox.clear();
     }
 
     /// Whether the peer has spoken and we owe it a word back.
@@ -651,6 +700,23 @@ impl PeerState {
         // measured version of.
         let spoke = self.last_send.max(self.last_keepalive).unwrap_or(0);
         spoke < heard && now.saturating_sub(heard) >= KEEPALIVE_TIMEOUT
+    }
+
+    /// Whether an interval has passed with nothing sent at all.
+    ///
+    /// WireGuard's persistent keepalive, and the same job: hold a NAT mapping
+    /// open on a tunnel that has nothing to say. Unlike `owes_keepalive` it
+    /// does not wait for the peer to speak first, because the case it exists
+    /// for is the one where neither end is speaking.
+    ///
+    /// It does not arm the liveness timer, and cannot: the packet is empty, so
+    /// `seal_into` leaves `last_send` alone. That is deliberate. An empty
+    /// packet is answered with nothing, so treating silence after one as proof
+    /// the peer had gone is how an idle tunnel handshakes itself to death --
+    /// which this codebase has already shipped once.
+    fn owes_persistent(&self, now: Millis, every: Millis) -> bool {
+        let spoke = self.last_send.max(self.last_keepalive).unwrap_or(0);
+        now.saturating_sub(spoke) >= every
     }
 
     /// Whether the peer has stopped answering a session we are still using.
@@ -1105,6 +1171,10 @@ impl Tunnel {
                 this.reload(path);
             }
         }
+        // Before the flag, while the datapath is still up and the session is
+        // still usable. A peer that hears this handshakes again in a second
+        // rather than waiting out a timer for a restart that already finished.
+        this.say_goodbye();
         this.stop();
 
         drop((t1, t2, t3, t4));
@@ -1241,6 +1311,28 @@ impl Tunnel {
                 "reload: {} changed but needs a restart to take effect",
                 needs_restart.join(", ")
             );
+        }
+    }
+
+    /// Tells the peer this end is going, while there are still keys to say it
+    /// with.
+    ///
+    /// Best effort and quiet about it. Every reason this can fail -- no
+    /// session, a carrier that has gone, a path that drops the packet -- is a
+    /// reason the peer falls back to the timers it used before this existed,
+    /// which is where a crash or a `kill -9` leaves it anyway.
+    fn say_goodbye(&self) {
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.session.is_none() {
+                return;
+            }
+        }
+        let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
+        let mut frame = vec![0u8; MAX_FRAME];
+        match self.send_inner(&crate::repeat::BYE, &mut sealed, &mut frame) {
+            Ok(()) => debug!("told the peer this end is going away"),
+            Err(e) => debug!("could not tell the peer this end is going away: {e}"),
         }
     }
 
@@ -1978,6 +2070,7 @@ impl Tunnel {
         };
         let mut repeats: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut repeated: Option<Vec<u8>> = None;
+        let mut farewell = false;
         match crate::repeat::parse(packet) {
             Some(crate::repeat::Control::Nack(wanted)) => {
                 for want in wanted {
@@ -2002,9 +2095,26 @@ impl Tunnel {
                     Stats::bump(&self.stats.duplicate);
                 }
             }
+            Some(crate::repeat::Control::Bye) => {
+                // Unconditional, because reaching here means the packet
+                // decrypted, and that means a session existed to decrypt it
+                // under. It also means a second one cannot follow: the keys it
+                // would have to be sealed under have just been thrown away.
+                state.farewell(now);
+                farewell = true;
+            }
             None => {}
         }
         drop(state);
+
+        if farewell {
+            Stats::bump(&self.stats.farewells);
+            info!(
+                "{}the peer is going away; dropped the session and will \
+                 handshake again shortly",
+                self.tag()
+            );
+        }
 
         Stats::bump(&self.stats.rx_packets);
         Stats::add(&self.stats.rx_bytes, n as u64);
@@ -2321,6 +2431,11 @@ impl Tunnel {
                     .is_none_or(|sent| now.saturating_sub(sent) >= CONFIRM_RETRY)
             } else {
                 self.cfg.interface.keepalive && state.owes_keepalive(now)
+                    || self
+                        .cfg
+                        .interface
+                        .persistent_keepalive
+                        .is_some_and(|every| state.owes_persistent(now, every))
             };
             if !owed {
                 return Ok(());
@@ -3403,6 +3518,83 @@ mod tests {
         let mut state = PeerState::new(None, crate::repeat::Limits::off());
         let mut inner = [0u8; 64];
         assert!(state.open(&[0u8; 32], &mut inner, 0).is_none());
+    }
+
+    #[test]
+    fn a_goodbye_drops_everything_and_holds_the_next_handshake_briefly() {
+        // The peer is still running for the moment after it says this. A
+        // handshake that lands there is answered by a process about to exit,
+        // and the session it wins dies with it -- which is the very wait this
+        // message exists to skip.
+        let mut s = spoke(Some(1_000), Some(1_100));
+        s.confirm_owed = true;
+        s.confirm_tries = 2;
+        s.attempt_started = Some(0);
+
+        s.farewell(2_000);
+        assert!(s.session.is_none() && s.next.is_none() && s.previous.is_none());
+        assert!(s.pending.is_none());
+        assert!(!s.confirm_owed);
+        assert_eq!(
+            s.last_send, None,
+            "nothing was sent under keys nobody holds"
+        );
+        assert_eq!(s.attempt_started, None, "a fresh run, not an expired one");
+
+        assert!(
+            !s.wants_handshake(2_000),
+            "the peer has not finished leaving"
+        );
+        assert!(!s.wants_handshake(2_000 + REJOIN_AFTER - 1));
+        assert!(s.wants_handshake(2_000 + REJOIN_AFTER), "and then at once");
+    }
+
+    #[test]
+    fn a_completed_handshake_lifts_the_goodbye_hold() {
+        // Otherwise a pair that restarts twice inside a second leaves a hold
+        // in place that nothing clears, and the tunnel waits for no reason.
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
+        s.farewell(1_000);
+        assert!(!s.wants_handshake(1_000));
+        s.established(1_100, noise::REKEY_AFTER_TIME);
+        assert_eq!(s.resume_at, 0);
+    }
+
+    #[test]
+    fn a_persistent_keepalive_measures_from_whatever_went_out_last() {
+        const EVERY: Millis = 25_000;
+        // Nothing sent yet, so the clock runs from zero: one interval after
+        // the tunnel started, and no burst at the moment it comes up.
+        let mut s = PeerState::new(None, crate::repeat::Limits::off());
+        assert!(!s.owes_persistent(EVERY - 1, EVERY));
+        assert!(s.owes_persistent(EVERY, EVERY));
+
+        // Data resets it, and so does a keepalive: either one held the mapping
+        // open, which is the entire job.
+        s.last_send = Some(10_000);
+        assert!(!s.owes_persistent(10_000 + EVERY - 1, EVERY));
+        assert!(s.owes_persistent(10_000 + EVERY, EVERY));
+        s.last_keepalive = Some(20_000);
+        assert!(!s.owes_persistent(20_000 + EVERY - 1, EVERY));
+
+        // Hearing from the peer is not sending to it, so it does not count.
+        s.last_receive = Some(40_000);
+        assert!(s.owes_persistent(20_000 + EVERY, EVERY));
+    }
+
+    #[test]
+    fn a_persistent_keepalive_does_not_make_a_live_peer_look_dead() {
+        // The distinction the passive keepalive already had to learn. An empty
+        // packet is answered with nothing, so if sending one armed the liveness
+        // timer, an idle tunnel would rehandshake every interval for ever.
+        // `seal_into` skips `last_send` for an empty packet, so the state a
+        // persistent keepalive leaves behind is this one.
+        let mut s = spoke(None, Some(1_000));
+        s.last_keepalive = Some(2_000);
+        assert!(
+            !s.presumed_dead(2_000 + PRESUMED_DEAD * 10),
+            "silence after a question nobody can answer proves nothing"
+        );
     }
 
     #[test]

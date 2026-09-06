@@ -62,6 +62,19 @@ pub(crate) struct Plan {
     pub(crate) egress: Option<String>,
     /// Whether the tunnel carries IPv6 inside as well as IPv4.
     pub(crate) ipv6: bool,
+    /// Whether the end that connects out is the way out to the internet.
+    ///
+    /// The ordinary arrangement is the other way round: users reach the client
+    /// host, and the server they are forwarded to is the one with a way out.
+    /// Reversed, the host that must be findable is the entrance and the host
+    /// that connects to it is the exit -- which is what you want when the exit
+    /// has no address anyone can reach, because it is behind a NAT, on a
+    /// dynamic connection, or somewhere that does not accept connections.
+    ///
+    /// Who initiates does not change: the entrance still waits, the exit still
+    /// connects out. What moves is which file carries `gateway` and which
+    /// carries the knobs a proxy uses to get in.
+    pub(crate) reverse: bool,
 }
 
 impl Default for Plan {
@@ -78,6 +91,7 @@ impl Default for Plan {
             route_marked: None,
             egress: None,
             ipv6: false,
+            reverse: false,
         }
     }
 }
@@ -101,16 +115,22 @@ impl Role {
     }
 }
 
-/// Whether this host should be offered the client's Xray inbound.
+/// Whether this host should be offered the Xray inbound.
 ///
-/// Everywhere but the server. That inbound carries a REALITY private key, and
-/// it is the key for the leg between a user and the client host — the server
-/// has no use for it, cannot answer the questions that produce it, and would be
-/// left holding a copy after it was moved to where it belongs. `None` keeps the
-/// offer, since generating both ends on a third machine is exactly what that
-/// answer means.
-const fn generates_client_inbound(role: Option<Role>) -> bool {
-    !matches!(role, Some(Role::Server))
+/// Only the end users connect to. That inbound carries a REALITY private key
+/// for the leg between a user and that host; the other end has no use for it,
+/// cannot answer the questions that produce it, and would be left holding a
+/// copy after it was moved to where it belongs. `None` keeps the offer, since
+/// generating both ends on a third machine is exactly what that answer means.
+///
+/// Which end that is follows `reverse`, not the file's name: reversed, the
+/// entrance is the host that waits.
+const fn generates_inbound(role: Option<Role>, reverse: bool) -> bool {
+    match role {
+        None => true,
+        Some(Role::Server) => reverse,
+        Some(Role::Client) => !reverse,
+    }
 }
 
 /// The two finished configuration files.
@@ -135,7 +155,15 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         s,
         "# paqetz — SERVER. This file belongs on the host with the"
     )?;
-    writeln!(s, "# stable address, the one the client connects to.\n")?;
+    writeln!(s, "# stable address, the one the client connects to.")?;
+    if plan.reverse {
+        writeln!(
+            s,
+            "# It is the way IN: users reach the tunnel here, and what"
+        )?;
+        writeln!(s, "# they send leaves by the client.")?;
+    }
+    writeln!(s)?;
     // Written into both files, commented out, and not offered as a question.
     // Which of these a path carries is a property of that path and cannot be
     // discovered from here -- so the value is left where someone who has
@@ -149,7 +177,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     //
     // `initiator` because rotation is the initiating side's alone: the side
     // that waits has to be findable, so its port cannot move.
-    let tuning = |t: &mut String, initiator: bool| -> std::fmt::Result {
+    let tuning = |t: &mut String, initiator: bool, exit: bool| -> std::fmt::Result {
         writeln!(
             t,
             "\n# --- Optional. Values shown are the ones in force. ---"
@@ -166,6 +194,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(t, "# fragment = \"never\"          # never | path")?;
         writeln!(t, "# mtu = 1400")?;
         writeln!(t, "# keepalive = true")?;
+        writeln!(t, "# persistent_keepalive = 25   # seconds")?;
         writeln!(t, "#")?;
         writeln!(t, "# retransmit = false")?;
         writeln!(t, "# retransmit_buffer = 1024     # packets")?;
@@ -192,11 +221,101 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(t, "#")?;
         writeln!(t, "# [[tunnel.lane]]")?;
         writeln!(t, "# class  = 10")?;
-        if initiator {
-            writeln!(t, "# mark   = 79")
-        } else {
+        // A lane's `mark` names whose traffic travels in it, on the end that
+        // sends; its `egress` names where that traffic leaves by, on the end
+        // that forwards. So the hint follows the way out, not the handshake.
+        if exit {
             writeln!(t, "# egress = \"warp\"")
+        } else {
+            writeln!(t, "# mark   = 79")
         }
+    };
+
+    // The knobs that belong to the end which is the way out, and the ones that
+    // belong to the end a proxy gets in by. Which file each lands in is the
+    // only thing `reverse` changes.
+    let mut exit_iface = String::new();
+    if plan.gateway {
+        exit_iface.push_str(
+            "\n# Forward and translate the peer's traffic to the\n\
+             # internet. Without this the two ends can reach each\n\
+             # other and nothing beyond.\ngateway = true\n",
+        );
+    }
+    if let Some(iface) = plan.egress.as_ref() {
+        exit_iface.push_str(&format!(
+            "\n# Send the forwarded traffic out this interface, so the\n\
+             # destination sees its address rather than this host's.\n\
+             # Bringing it up is not paqetz's job.\negress = \"{iface}\"\n"
+        ));
+    }
+
+    let mut entry_iface = String::new();
+    if plan.route_all {
+        entry_iface.push_str(
+            "\n# Send this host's traffic through the tunnel. The\n\
+             # tunnel's own packets are excepted automatically, so\n\
+             # turning this on does not cut the connection.\nroute_all = true\n",
+        );
+    }
+    if let Some(mark) = plan.route_marked {
+        entry_iface.push_str(&format!(
+            "\n# Sockets stamped with this mark are steered into the tunnel by a\n\
+             # policy route, so a program can opt in without the host doing so.\n\
+             route_marked = {mark}\nroute_table  = {mark}\n"
+        ));
+    }
+
+    // The end that is not the way out is the one whose peer answers from
+    // anywhere: replies arrive carrying the address of whatever site was
+    // reached, not the peer's own, and the default range would refuse them all.
+    let mut entry_peer = String::new();
+    if plan.gateway {
+        let ranges = if plan.ipv6 {
+            "[\"0.0.0.0/0\", \"::/0\"]"
+        } else {
+            "[\"0.0.0.0/0\"]"
+        };
+        entry_peer.push_str(&format!(
+            "\n# What this peer may use as an inner source address. It defaults\n\
+             # to the peer's own address, which is right for a tunnel\n\
+             # between two hosts and wrong for one that is a way out:\n\
+             # replies arrive carrying the address of whatever site was\n\
+             # reached, not the peer's, and would all be refused.\n\
+             allowed_ips = {ranges}\n"
+        ));
+    }
+
+    let mut entry_socks5 = String::new();
+    if let Some(listen) = plan.socks5.as_ref() {
+        entry_socks5.push_str(&format!(
+            "\n# A SOCKS5 listener, for pointing one program at the\n\
+             # tunnel without routing the whole host through it.\n\
+             [tunnel.socks5]\nlisten = \"{listen}\"\n\
+             \n# Names are resolved through the tunnel, by the far end,\n\
+             # rather than by whatever resolver this host is pointed at.\n\
+             # The local network then learns neither what is being\n\
+             # reached nor gets to choose the answer. `system` opts out.\n\
+             dns = \"1.1.1.1\"\n"
+        ));
+    }
+
+    // The server waits and the client connects out, always. `reverse` moves
+    // only which of them is the way out.
+    let (server_iface, client_iface) = if plan.reverse {
+        (&entry_iface, &exit_iface)
+    } else {
+        (&exit_iface, &entry_iface)
+    };
+    let (server_peer, client_peer) = if plan.reverse {
+        (entry_peer.as_str(), "")
+    } else {
+        ("", entry_peer.as_str())
+    };
+    let (server_socks5, client_socks5) = if plan.reverse {
+        (entry_socks5.as_str(), "")
+    } else {
+        ("", entry_socks5.as_str())
     };
 
     // The form that can hold several tunnels, written even for one. A file that
@@ -213,22 +332,8 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         writeln!(s, "# address6 = \"{SERVER_INNER6}/{PREFIX6}\"")?;
     }
     writeln!(s, "listen_port = {}", plan.port)?;
-    if plan.gateway {
-        writeln!(s, "\n# Forward and translate the client's traffic to the")?;
-        writeln!(s, "# internet. Without this the two ends can reach each")?;
-        writeln!(s, "# other and nothing beyond.")?;
-        writeln!(s, "gateway = true")?;
-    }
-    if let Some(iface) = plan.egress.as_ref() {
-        writeln!(
-            s,
-            "\n# Send the forwarded traffic out this interface, so the"
-        )?;
-        writeln!(s, "# destination sees its address rather than this host's.")?;
-        writeln!(s, "# Bringing it up is not paqetz's job.")?;
-        writeln!(s, "egress = \"{iface}\"")?;
-    }
-    tuning(&mut s, false)?;
+    s.push_str(server_iface);
+    tuning(&mut s, false, !plan.reverse)?;
     writeln!(s, "\n[tunnel.peer]")?;
     writeln!(s, "# The client's public key.")?;
     writeln!(s, "public_key = \"{}\"", client.public.to_base64())?;
@@ -238,10 +343,17 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     } else {
         writeln!(s, "# tunnel_address6 = \"{CLIENT_INNER6}\"")?;
     }
+    s.push_str(server_peer);
+    s.push_str(server_socks5);
 
     let mut c = String::new();
     writeln!(c, "# paqetz — CLIENT. This file belongs on the host that")?;
-    writeln!(c, "# connects out.\n")?;
+    writeln!(c, "# connects out.")?;
+    if plan.reverse {
+        writeln!(c, "# It is the way OUT: what arrives through the tunnel")?;
+        writeln!(c, "# reaches the internet from here.")?;
+    }
+    writeln!(c)?;
     writeln!(c, "[[tunnel]]")?;
     writeln!(c, "name = {DEFAULT_NAME:?}\n")?;
     writeln!(c, "[tunnel.interface]")?;
@@ -252,25 +364,8 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     } else {
         writeln!(c, "# address6 = \"{CLIENT_INNER6}/{PREFIX6}\"")?;
     }
-    if plan.route_all {
-        writeln!(c, "\n# Send this host's traffic through the tunnel. The")?;
-        writeln!(c, "# tunnel's own packets are excepted automatically, so")?;
-        writeln!(c, "# turning this on does not cut the connection.")?;
-        writeln!(c, "route_all = true")?;
-    }
-    if let Some(mark) = plan.route_marked {
-        writeln!(
-            c,
-            "\n# Sockets stamped with this mark are steered into the tunnel by a"
-        )?;
-        writeln!(
-            c,
-            "# policy route, so a program can opt in without the host doing so."
-        )?;
-        writeln!(c, "route_marked = {mark}")?;
-        writeln!(c, "route_table  = {mark}")?;
-    }
-    tuning(&mut c, true)?;
+    c.push_str(client_iface);
+    tuning(&mut c, true, plan.reverse)?;
     writeln!(c, "\n[tunnel.peer]")?;
     writeln!(c, "# The server's public key.")?;
     writeln!(c, "public_key = \"{}\"", server.public.to_base64())?;
@@ -281,50 +376,8 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     } else {
         writeln!(c, "# tunnel_address6 = \"{SERVER_INNER6}\"")?;
     }
-    if plan.gateway {
-        writeln!(
-            c,
-            "\n# What this peer may use as an inner source address. It defaults"
-        )?;
-        writeln!(
-            c,
-            "# to the peer's own address, which is right for a tunnel"
-        )?;
-        writeln!(
-            c,
-            "# between two hosts and wrong for one that is a way out:"
-        )?;
-        writeln!(
-            c,
-            "# replies arrive carrying the address of whatever site was"
-        )?;
-        writeln!(c, "# reached, not the server's, and would all be refused.")?;
-        if plan.ipv6 {
-            writeln!(c, "allowed_ips = [\"0.0.0.0/0\", \"::/0\"]")?;
-        } else {
-            writeln!(c, "allowed_ips = [\"0.0.0.0/0\"]")?;
-        }
-    }
-    if let Some(listen) = plan.socks5.as_ref() {
-        writeln!(c, "\n# A SOCKS5 listener, for pointing one program at the")?;
-        writeln!(c, "# tunnel without routing the whole host through it.")?;
-        writeln!(c, "[tunnel.socks5]")?;
-        writeln!(c, "listen = \"{listen}\"")?;
-        writeln!(
-            c,
-            "\n# Names are resolved through the tunnel, by this server,"
-        )?;
-        writeln!(
-            c,
-            "# rather than by whatever resolver this host is pointed at."
-        )?;
-        writeln!(c, "# The local network then learns neither what is being")?;
-        writeln!(
-            c,
-            "# reached nor gets to choose the answer. `system` opts out."
-        )?;
-        writeln!(c, "dns = \"1.1.1.1\"")?;
-    }
+    c.push_str(client_peer);
+    c.push_str(client_socks5);
 
     Ok(Pair {
         server: s,
@@ -343,6 +396,7 @@ pub(crate) fn init(
     route_all: bool,
     socks5: Option<String>,
     ipv6: bool,
+    reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (host, port) = split_endpoint(endpoint)?;
     let plan = Plan {
@@ -352,6 +406,7 @@ pub(crate) fn init(
         route_all,
         socks5,
         ipv6,
+        reverse,
         ..Plan::default()
     };
     let pair = render(&plan)?;
@@ -444,7 +499,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         if crate::service::has_systemd() {
             if yes_no(
                 &format!(
-                    "\n7. Install paqetz as a system service on this host,\n   \
+                    "\n8. Install paqetz as a system service on this host,\n   \
                      running {}, so it starts at boot and restarts on failure?",
                     role.file()
                 ),
@@ -478,7 +533,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
         } else {
-            println!("\n7. No systemd on this host, so nothing to install.");
+            println!("\n8. No systemd on this host, so nothing to install.");
             println!("   Run it however this system starts things:");
             println!("     paqetz run -c {}", source.display());
         }
@@ -745,17 +800,34 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
     let gateway = true;
     let route_all = false;
     println!(
-        "   Assuming the usual arrangement: the server is a way out to the\n   \
-         internet, and the client sends only what you point at the tunnel\n   \
-         rather than everything. Both are settings in the files if you want\n   \
-         the other shape -- `gateway` on the server, `route_all` on the client.\n"
+        "   Assuming the usual arrangement in one respect: this end sends only\n   \
+         what you point at the tunnel rather than everything. `route_all` is\n   \
+         the setting for the other shape.\n"
     );
+
+    // Asked before the questions it changes the meaning of: which host a proxy
+    // gets in by, and which host the traffic leaves from, are opposite ends in
+    // one arrangement and the same answer reversed in the other.
+    let reverse = yes_no(
+        "2. Is the host that CONNECTS OUT the way out to the internet?\n   \
+         Normally no: users reach the client, and the server they are\n   \
+         forwarded to has the way out. Answer yes for the reverse -- the\n   \
+         server is the entrance users reach, and the client behind it is\n   \
+         where traffic leaves for the internet. That is the arrangement for\n   \
+         an exit with no address anyone can connect to: behind a NAT, on a\n   \
+         dynamic connection, or anywhere that refuses inbound connections.",
+        false,
+    )?;
+    let entrance = if reverse { "server" } else { "client" };
+    let exit = if reverse { "client" } else { "server" };
 
     let socks5 = {
         let want = yes_no(
-            "2. Add a SOCKS5 listener on the client?\n   \
-             This is how you point one program — Xray, a browser, curl —\n   \
-             at the tunnel while the rest of the host carries on as normal.",
+            &format!(
+                "\n3. Add a SOCKS5 listener on the {entrance}?\n   \
+                 This is how you point one program — Xray, a browser, curl —\n   \
+                 at the tunnel while the rest of the host carries on as normal."
+            ),
             true,
         )?;
         if want {
@@ -770,10 +842,12 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
     // first has been answered.
     let route_marked = {
         let want = yes_no(
-            "\n3. Steer marked sockets into the tunnel as well?\n   \
-             A program that can stamp a mark on its own sockets — Xray can —\n   \
-             then reaches the tunnel without a proxy in between, which is one\n   \
-             less hop and one less thing to hold the traffic up.",
+            &format!(
+                "\n4. Steer marked sockets on the {entrance} into the tunnel as well?\n   \
+                 A program that can stamp a mark on its own sockets — Xray can —\n   \
+                 then reaches the tunnel without a proxy in between, which is one\n   \
+                 less hop and one less thing to hold the traffic up."
+            ),
             true,
         )?;
         if want {
@@ -793,13 +867,15 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
     // The server's egress. Only sensible when it is a way out at all.
     let egress = if gateway {
         let want = yes_no(
-            "\n4. Should the server send the forwarded traffic out a different\n   \
-             interface than its own?\n   \
-             The usual reason is a Cloudflare WARP tunnel: the destination\n   \
-             then sees WARP's address rather than the server's datacentre\n   \
-             one. paqetz routes and translates for it but does not bring it\n   \
-             up — use wgcf and wg-quick for that, with `Table = 51820` in\n   \
-             the profile.",
+            &format!(
+                "\n5. Should the {exit} send the forwarded traffic out a different\n   \
+                 interface than its own?\n   \
+                 The usual reason is a Cloudflare WARP tunnel: the destination\n   \
+                 then sees WARP's address rather than that host's datacentre\n   \
+                 one. paqetz routes and translates for it but does not bring it\n   \
+                 up — use wgcf and wg-quick for that, with `Table = 51820` in\n   \
+                 the profile."
+            ),
             false,
         )?;
         if want {
@@ -812,11 +888,14 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
     };
 
     let ipv6 = yes_no(
-        "\n5. Carry IPv6 inside the tunnel as well?\n   \
-         Only useful when the server has working IPv6 of its own to send it\n   \
-         out by; without that, IPv6 destinations time out instead of being\n   \
-         refused. Off, the tunnel carries IPv4 and Xray is told to refuse\n   \
-         IPv6 rather than let it leave by the client host's own address.",
+        &format!(
+            "\n6. Carry IPv6 inside the tunnel as well?\n   \
+             Only useful when the {exit} has working IPv6 of its own to send\n   \
+             it out by; without that, IPv6 destinations time out instead of\n   \
+             being refused. Off, the tunnel carries IPv4 and Xray is told to\n   \
+             refuse IPv6 rather than let it leave by the {entrance}'s own\n   \
+             address."
+        ),
         false,
     )?;
 
@@ -829,6 +908,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         route_marked,
         egress: egress.clone(),
         ipv6,
+        reverse,
         ..Plan::default()
     };
     let pair = render(&plan)?;
@@ -845,22 +925,27 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
     println!("  {}   → the CLIENT", client_path.display());
     println!("\nThe keys in them are already matched. Do not swap the files.\n");
 
-    // An Xray inbound, for the arrangement where users connect to the client
-    // host and their traffic leaves through the tunnel.
-    if !generates_client_inbound(role) {
+    // An Xray inbound, for the host users connect to. Which host that is
+    // follows the arrangement rather than the file's name.
+    if !generates_inbound(role, reverse) {
         println!(
-            "The client's Xray inbound is not generated here. It contains a\n\
-             REALITY private key for the leg between a user and the client\n\
-             host, which is not this one — run `paqetz setup` or `paqetz xray`\n\
-             there, so the key is only ever on the host that uses it.\n"
+            "The Xray inbound is not generated here. It contains a REALITY\n\
+             private key for the leg between a user and the {entrance}, which\n\
+             is not this host — run `paqetz setup` or `paqetz xray` there, so\n\
+             the key is only ever on the host that uses it.\n"
         );
     } else if yes_no(
-        "6. Generate an Xray REALITY inbound for the client host?\n   \
-         This is how users reach the tunnel: they connect to Xray, and\n   \
-         Xray forwards what it receives through paqetz.",
+        &format!(
+            "7. Generate an Xray REALITY inbound for the {entrance}?\n   \
+             This is how users reach the tunnel: they connect to Xray, and\n   \
+             Xray forwards what it receives through paqetz."
+        ),
         false,
     )? {
-        let public = ask("   What address will users reach the client host at?", "")?;
+        let public = ask(
+            &format!("   What address will users reach the {entrance} at?"),
+            "",
+        )?;
         println!(
             "\n   REALITY impersonates a real site. It must speak TLS 1.3, sit on\n                a large network, and not itself be blocked where this runs.\n                Suggestions: {}",
             crate::xray::SUGGESTED_DESTINATIONS.join(", ")
@@ -947,7 +1032,8 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         // actually there: asking "install?" of a machine that already has it,
         // or generating a configuration for software the host does not have,
         // are both ways of wasting the reader's attention.
-        if role == Some(Role::Client) {
+        // Whichever end users reach: reversed, that is the one that waits.
+        if role.is_some_and(|r| generates_inbound(Some(r), reverse)) {
             let installed = crate::xray::installed_version(crate::xray::DEFAULT_PREFIX);
             let wanted = match installed.as_deref() {
                 None => yes_no(
@@ -1101,6 +1187,7 @@ mod tests {
                 "fragment",
                 "mtu",
                 "keepalive",
+                "persistent_keepalive",
                 "retransmit",
                 "retransmit_buffer",
                 "retransmit_deadline",
@@ -1502,17 +1589,104 @@ mod tests {
     }
 
     #[test]
-    fn the_server_is_never_offered_the_client_inbound() {
+    fn only_the_host_users_reach_is_offered_the_inbound() {
         assert!(
-            !generates_client_inbound(Some(Role::Server)),
+            !generates_inbound(Some(Role::Server), false),
             "its REALITY private key would be written to a host with no use \
              for it, and left there after being copied to the one that has"
         );
-        assert!(generates_client_inbound(Some(Role::Client)));
+        assert!(generates_inbound(Some(Role::Client), false));
+        // Reversed, the entrance is the host that waits, so the offer moves
+        // with it rather than staying on the file called "client".
+        assert!(generates_inbound(Some(Role::Server), true));
+        assert!(!generates_inbound(Some(Role::Client), true));
+        for reverse in [true, false] {
+            assert!(
+                generates_inbound(None, reverse),
+                "generating both ends on a third machine is what `neither` means"
+            );
+        }
+    }
+
+    #[test]
+    fn reversing_moves_the_way_out_without_moving_who_connects() {
+        let plan = Plan {
+            route_marked: Some(81),
+            socks5: Some("127.0.0.1:1080".to_owned()),
+            egress: Some("warp".to_owned()),
+            reverse: true,
+            ..plan()
+        };
+        let pair = render(&plan).expect("render");
+
+        // Who initiates is untouched: the server still waits, the client
+        // still connects out. Only the way out moved.
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("server parses")
+            .into_only()
+            .expect("one");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("client parses")
+            .into_only()
+            .expect("one");
+        assert!(client.peer.is_initiator(), "the client still connects out");
+        assert!(!server.peer.is_initiator(), "the server still waits");
+
+        // The exit forwards and translates, and names the interface it leaves
+        // by; the entrance does neither.
+        assert!(client.interface.gateway, "{}", pair.client);
+        assert!(!server.interface.gateway, "{}", pair.server);
+        assert_eq!(client.interface.egress.as_deref(), Some("warp"));
+        assert_eq!(server.interface.egress, None);
+
+        // The entrance is where a proxy gets in, and where replies from
+        // anywhere have to be allowed.
+        assert_eq!(server.interface.route_marked, Some(81));
+        assert_eq!(client.interface.route_marked, None);
+        assert!(server.socks5.is_some(), "{}", pair.server);
+        assert!(client.socks5.is_none(), "{}", pair.client);
+        assert!(server.peer.permits("203.0.113.9".parse().expect("address")));
+        assert!(!client.peer.permits("203.0.113.9".parse().expect("address")));
+
+        // The lane hint follows the way out too, since `egress` belongs to the
+        // end that forwards and `mark` to the end that sends.
         assert!(
-            generates_client_inbound(None),
-            "generating both ends on a third machine is what `neither` means"
+            pair.client.contains("# egress = \"warp\""),
+            "{}",
+            pair.client
         );
+        assert!(pair.server.contains("# mark   = 79"), "{}", pair.server);
+    }
+
+    #[test]
+    fn the_ordinary_arrangement_is_unchanged() {
+        // The reverse work moved where these are written from a fixed file to
+        // a computed one. What the ordinary answer produces must not have
+        // moved with it.
+        let plan = Plan {
+            route_marked: Some(81),
+            socks5: Some("127.0.0.1:1080".to_owned()),
+            egress: Some("warp".to_owned()),
+            ..plan()
+        };
+        let pair = render(&plan).expect("render");
+        let server = crate::config::Config::parse(&pair.server)
+            .expect("server parses")
+            .into_only()
+            .expect("one");
+        let client = crate::config::Config::parse(&pair.client)
+            .expect("client parses")
+            .into_only()
+            .expect("one");
+        assert!(server.interface.gateway);
+        assert!(!client.interface.gateway);
+        assert_eq!(server.interface.egress.as_deref(), Some("warp"));
+        assert_eq!(client.interface.route_marked, Some(81));
+        assert!(client.socks5.is_some());
+        assert!(server.socks5.is_none());
+        assert!(client.peer.permits("203.0.113.9".parse().expect("address")));
+        assert!(pair.server.contains("# egress = \"warp\""));
+        assert!(pair.client.contains("# mark   = 79"));
     }
 
     #[test]

@@ -51,6 +51,8 @@ const MARKER: u8 = 0x00;
 const KIND_NACK: u8 = 1;
 /// A packet being sent again, carrying the counter it first went out under.
 const KIND_REPEAT: u8 = 2;
+/// This end is going away, and its keys with it.
+const KIND_BYE: u8 = 3;
 
 /// How many packets beyond a gap must arrive before it is called a loss, by
 /// default.
@@ -131,7 +133,18 @@ pub(crate) enum Control<'a> {
     Nack(Vec<u64>),
     /// A packet, sent again, and the counter it first went out under.
     Repeat { original: u64, packet: &'a [u8] },
+    /// The peer is shutting down: its keys are about to stop existing.
+    ///
+    /// Sent inside the session, so it is authenticated and replay-protected
+    /// like everything else here -- nobody who has not already broken the
+    /// tunnel can use it to take one down. What it saves is the wait: without
+    /// it a restart is indistinguishable from silence, and silence is only
+    /// resolved by a timer measured in minutes.
+    Bye,
 }
+
+/// The whole of a goodbye. Two bytes, and nothing to get wrong.
+pub(crate) const BYE: [u8; 2] = [MARKER, KIND_BYE];
 
 /// Reads a control message, or `None` if this is ordinary tunnelled traffic.
 ///
@@ -162,6 +175,10 @@ pub(crate) fn parse(payload: &[u8]) -> Option<Control<'_>> {
                 packet,
             })
         }
+        // Nothing to read: the message is the fact that it arrived. Trailing
+        // bytes are ignored rather than refused, so a later version may say
+        // more about why without this one deciding it is malformed.
+        KIND_BYE => Some(Control::Bye),
         _ => None,
     }
 }
@@ -633,6 +650,19 @@ mod tests {
             }
             other => panic!("expected a repeat, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_goodbye_is_two_bytes_and_says_only_that() {
+        assert_eq!(parse(&BYE), Some(Control::Bye));
+        // Trailing bytes are read as the same message rather than refused,
+        // so a later version may add a reason without this one calling the
+        // whole thing malformed.
+        assert_eq!(parse(&[MARKER, KIND_BYE, 7, 7]), Some(Control::Bye));
+        // And it cannot be confused with the other two.
+        assert_eq!(BYE[0], MARKER);
+        assert_ne!(KIND_BYE, KIND_NACK);
+        assert_ne!(KIND_BYE, KIND_REPEAT);
     }
 
     #[test]

@@ -34,6 +34,12 @@ tunnel_address = "10.7.0.1"
 # Name of the TUN device.
 #device = "paqetz0"
 
+# Send an empty packet whenever nothing else has gone out for this many
+# seconds, so a NAT mapping does not lapse on an idle tunnel. Off unless set.
+# The arrangement that wants it is the one where this end is the way out and
+# the peer has traffic to push in.
+#persistent_keepalive = 25
+
 # How packets move between the device and the wire.
 #   "simple"  (default) — one packet per syscall.
 #   "batched"           — up to 32 per syscall, drained from what is already

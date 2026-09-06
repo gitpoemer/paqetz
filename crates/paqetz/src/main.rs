@@ -108,6 +108,12 @@ enum Command {
         /// its own to send it out by.
         #[arg(long)]
         ipv6: bool,
+        /// Make the end that connects out the way out to the internet.
+        ///
+        /// For an exit nobody can connect to. The server becomes the entrance
+        /// users reach, and the client behind it is where traffic leaves.
+        #[arg(long)]
+        reverse: bool,
     },
 
     /// Set up a tunnel, one question at a time.
@@ -371,7 +377,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             route_all,
             socks5,
             ipv6,
-        } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5, ipv6),
+            reverse,
+        } => setup::init(
+            &endpoint,
+            &out,
+            !no_gateway,
+            route_all,
+            socks5,
+            ipv6,
+            reverse,
+        ),
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action, &cli.config),

@@ -79,6 +79,12 @@ pub(crate) struct Stats {
     pub(crate) handshakes_done: AtomicU64,
     /// Times the peer's endpoint changed under an authenticated packet.
     pub(crate) roams: AtomicU64,
+    /// Times the peer said it was shutting down.
+    ///
+    /// Worth a counter rather than only a log line: on a pair that restarts
+    /// more often than anyone meant it to -- a service flapping, a unit with a
+    /// failing `ExecStartPre` -- this is the number that says so.
+    pub(crate) farewells: AtomicU64,
     /// Repeats that arrived for a gap that had already been filled.
     ///
     /// A second copy of a packet already delivered. Some is normal -- a repeat
@@ -170,6 +176,7 @@ impl Stats {
             ("repeated", get(&self.repeated)),
             ("repaired", get(&self.repaired)),
             ("roams", get(&self.roams)),
+            ("farewells", get(&self.farewells)),
         ] {
             if value > 0 {
                 line.push_str(&format!(" | {name} {value}"));

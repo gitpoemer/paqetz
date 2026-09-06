@@ -175,6 +175,21 @@ pub(crate) struct Interface {
     /// seconds, which is a metronome — a real trade, and the wrong side of it is
     /// losing the first click after a pause.
     pub(crate) keepalive: bool,
+    /// Send an empty packet every so often even when the peer has said
+    /// nothing, to hold a NAT mapping open.
+    ///
+    /// WireGuard's `PersistentKeepalive`, and off by default for the same
+    /// reason it is there: it matters only for an end that must stay reachable
+    /// while idle. The ordinary arrangement has the initiator behind the NAT
+    /// and nothing needing to reach it, so the mapping lapsing costs nothing.
+    /// A tunnel whose *initiator* is the way out is the case that wants this:
+    /// the far end has traffic to push in, and cannot if the mapping is gone.
+    ///
+    /// It does not make a dead peer detectable any faster. The packet is
+    /// empty, so nothing answers it, and reading silence after an unanswered
+    /// empty packet as death is what makes an idle tunnel handshake itself to
+    /// death.
+    pub(crate) persistent_keepalive: Option<Millis>,
     /// What to do about a hop too small to pass a packet whole.
     pub(crate) fragment: Fragment,
     /// Whether the carrier moves between outer ports, and how.
@@ -758,6 +773,8 @@ struct RawInterface {
     transmit: Option<String>,
     #[serde(default)]
     keepalive: Option<bool>,
+    #[serde(default)]
+    persistent_keepalive: Option<u64>,
     retransmit: Option<RawRetransmit>,
     retransmit_buffer: Option<usize>,
     retransmit_deadline: Option<u64>,
@@ -1599,6 +1616,19 @@ impl Config {
                     }
                 },
                 keepalive: iface.keepalive.unwrap_or(true),
+                persistent_keepalive: match iface.persistent_keepalive {
+                    None => None,
+                    // Bounded below because a metronome is what this is, and a
+                    // fast one is a loud one; above because a mapping that
+                    // survives ten minutes of silence did not need holding.
+                    Some(s) if !(5..=600).contains(&s) => {
+                        return Err(invalid(
+                            "interface.persistent_keepalive",
+                            format!("{s} is outside the usable range 5-600 seconds"),
+                        ));
+                    }
+                    Some(s) => Some(s * 1_000),
+                },
                 fragment,
                 rotation: {
                     // One source for the defaults, as above, so "unset" and
@@ -3041,6 +3071,30 @@ tunnel_address = "10.7.0.2"
                 "{good:?} was refused"
             );
         }
+    }
+
+    #[test]
+    fn a_persistent_keepalive_is_off_unless_asked_for_and_bounded_when_it_is() {
+        let off = Config::parse(CLIENT)
+            .expect("parses")
+            .into_only()
+            .expect("one");
+        assert_eq!(off.interface.persistent_keepalive, None);
+
+        let on = with_interface("persistent_keepalive = 25").expect("parses");
+        assert_eq!(
+            on.interface.persistent_keepalive,
+            Some(25_000),
+            "written in seconds, held in milliseconds like every other interval"
+        );
+
+        for bad in [0, 4, 601] {
+            let err =
+                with_interface(&format!("persistent_keepalive = {bad}")).expect_err("out of range");
+            assert!(err.to_string().contains("5-600"), "{bad}: {err}");
+        }
+        assert!(with_interface("persistent_keepalive = 5").is_ok());
+        assert!(with_interface("persistent_keepalive = 600").is_ok());
     }
 
     #[test]

@@ -725,6 +725,79 @@ How users are assigned to countries is Xray's business rather than paqetz's —
 by inbound tag, by user, or by destination, whichever suits. paqetz's part ends
 at "a socket marked 82 leaves through the Netherlands".
 
+## Reverse: the exit connects out
+
+The ordinary arrangement has users reach the client host and their traffic leave
+from the server. Reversed, the server is the **entrance** users reach and the
+client behind it is the **exit** where traffic reaches the internet.
+
+Who connects to whom does not change. The server still waits and the client
+still connects out, which is the point: it works when the exit has no address
+anyone can reach, because it is behind a NAT, on a dynamic connection, or
+somewhere that refuses inbound connections.
+
+`paqetz setup` asks, and `paqetz init --reverse` writes it. What moves between
+the two files is only this:
+
+| | ordinary | reverse |
+|---|---|---|
+| `gateway`, `egress` | server | client |
+| `route_marked`, `[tunnel.socks5]` | client | server |
+| `allowed_ips = ["0.0.0.0/0"]` | client's peer | server's peer |
+| Xray inbound, and where users connect | client | server |
+
+Nothing in the datapath knows which arrangement it is in. Rotation still belongs
+to the end that connects out, and a lane's `mark` still goes on the end that
+sends while its `egress` goes on the end that forwards.
+
+Two things are worth knowing before choosing it. The entrance is the host that
+holds the REALITY key and sees traffic in the clear between Xray and the tunnel,
+so in this arrangement that host is the findable one. And if the exit sits behind
+a NAT, the mapping has to stay open for the entrance to push traffic in: set
+`persistent_keepalive` on the exit, below.
+
+### A restart is announced
+
+A process going down says so, inside the tunnel, while it still has keys to say
+it with:
+
+```
+[ 2.001] info  the peer is going away; dropped the session and will handshake again shortly
+```
+
+The message is two bytes inside the session, so it is authenticated and
+replay-protected like everything else and indistinguishable on the wire from any
+other packet. Without it a restart is just silence, and silence is only resolved
+by a timer: up to fifteen seconds on a tunnel carrying traffic, and up to the
+rekey interval — a couple of minutes — on an idle one. With it the far end drops
+the session at once and handshakes a second later, which is roughly how long the
+restart itself takes.
+
+It is best effort. A crash, a `kill -9`, or a power cut sends nothing, and those
+fall back to the same timers as before. `farewells` in the health line counts
+how many arrived, which is the number to look at on a pair that turns out to be
+restarting more often than anyone meant it to.
+
+### Holding a mapping open while idle
+
+```toml
+# under [tunnel.interface]
+persistent_keepalive = 25   # seconds
+```
+
+Off by default. It sends an empty packet whenever nothing else has gone out for
+that long, which is WireGuard's `PersistentKeepalive` and does the same job:
+keeps a NAT mapping from lapsing on a tunnel with nothing to say.
+
+The ordinary arrangement does not need it — the end behind the NAT is the one
+that connects out, and nothing has to reach it. A **reverse** tunnel is the case
+that does: the entrance has traffic to push in, and cannot if the mapping is
+gone.
+
+It does not make a dead peer detectable any sooner, and is not meant to. Nothing
+answers an empty packet, so reading silence after one as proof the peer had gone
+is exactly how an idle tunnel ends up handshaking itself to death.
+
 ### The original form still works
 
 One `[interface]` and one `[peer]` describes a single tunnel and parses exactly
