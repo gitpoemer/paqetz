@@ -112,6 +112,7 @@ carrier = "${CARRIER}"
 ${CARRIER_PROTO}
 datapath = "${DATAPATH}"
 health_interval = 2
+persistent_keepalive = 5
 
 [peer]
 public_key = "${SRV_PUB}"
@@ -121,6 +122,50 @@ tunnel_address = "${SRV_INNER}"
 [socks5]
 listen = "127.0.0.1:1080"
 EOF
+
+# --- the reverse arrangement ------------------------------------------------
+# Config level on purpose: nothing in the datapath learns which arrangement it
+# is in, so what there is to check is that the flag reaches the generator and
+# that each knob lands in the file for the host that can act on it.
+log "reverse arrangement"
+if "${BIN}" init --reverse -o "${WORK}/rev" "${SRV_OUTER}:${PORT}" >/dev/null 2>&1; then
+    ok "init --reverse writes a pair"
+else
+    bad "init --reverse failed"
+fi
+
+if grep -q '^gateway = true' "${WORK}/rev/client.toml" &&
+    ! grep -q '^gateway = true' "${WORK}/rev/server.toml"; then
+    ok "reversed, the end that connects out is the way out"
+else
+    bad "reversed, gateway is on the wrong end"
+fi
+
+# The half that must not move: who connects to whom is what makes this work
+# for an exit nobody can reach.
+if grep -q '^endpoint = ' "${WORK}/rev/client.toml" &&
+    ! grep -q '^endpoint = ' "${WORK}/rev/server.toml"; then
+    ok "reversing does not change which end connects out"
+else
+    bad "reversing moved the endpoint"
+fi
+
+# Replies arrive carrying the address of whatever was reached, so the end that
+# is not the way out is the one that has to allow them.
+if grep -q '^allowed_ips = ' "${WORK}/rev/server.toml" &&
+    ! grep -q '^allowed_ips = ' "${WORK}/rev/client.toml"; then
+    ok "reversed, the entrance allows replies from anywhere"
+else
+    bad "reversed, allowed_ips is on the wrong end"
+fi
+
+"${BIN}" init -o "${WORK}/fwd" "${SRV_OUTER}:${PORT}" >/dev/null 2>&1
+if grep -q '^gateway = true' "${WORK}/fwd/server.toml" &&
+    grep -q '^allowed_ips = ' "${WORK}/fwd/client.toml"; then
+    ok "the ordinary arrangement is unchanged"
+else
+    bad "the ordinary arrangement changed"
+fi
 
 # --- namespaces -------------------------------------------------------------
 log "creating namespaces"
@@ -611,6 +656,50 @@ if [[ -n ${srv_pid_hup} ]]; then
     fi
 else
     bad "could not find the server process to signal"
+fi
+
+# --- an idle tunnel keeps its mapping warm ----------------------------------
+log "persistent keepalive"
+# The client carries `persistent_keepalive = 5`. With nothing to send, the
+# passive keepalive stays silent -- it only ever answers a peer that has
+# spoken -- so anything the server hears across an idle window came from the
+# persistent one, which is the whole point of it existing separately.
+rx_before=$(grep -o 'rx [0-9]* pkt' "${WORK}/server.log" | tail -1 | awk '{print $2}')
+sleep 12
+rx_after=$(grep -o 'rx [0-9]* pkt' "${WORK}/server.log" | tail -1 | awk '{print $2}')
+if [[ -n ${rx_before} && -n ${rx_after} && ${rx_after} -gt ${rx_before} ]]; then
+    ok "an idle tunnel still speaks, so a mapping in the path stays open (rx ${rx_before} -> ${rx_after})"
+else
+    bad "an idle tunnel sent nothing (rx ${rx_before:-none} -> ${rx_after:-none})"
+fi
+
+# --- a restart is announced -------------------------------------------------
+log "a restart is announced"
+# The server alone, so the client is still there to hear it. A goodbye is one
+# authenticated packet inside the session; without it the client learns of the
+# restart only when a liveness or rekey timer runs out.
+sudo pkill -INT -f "paqetz run -c ${WORK}/server.toml" 2>/dev/null
+sleep 3
+if grep -q "the peer is going away" "${WORK}/client.log"; then
+    ok "the client heard the server say it was going"
+else
+    bad "the client did not hear the server go, and will wait out a timer"
+fi
+if grep -q "farewells" "${WORK}/client.log"; then
+    ok "the goodbye is counted in the health line"
+else
+    bad "the goodbye was not counted in the health line"
+fi
+
+# What hearing it buys: back in about as long as the restart took, rather than
+# after a timer measured in minutes.
+sudo ip netns exec "${SRV_NS}" "${BIN}" run -c "${WORK}/server.toml" \
+    >> "${WORK}/server.log" 2>&1 &
+sleep 6
+if sudo ip netns exec "${CLI_NS}" ping -c2 -W3 "${SRV_INNER}" >/dev/null 2>&1; then
+    ok "the tunnel is back after the peer restarted"
+else
+    bad "the tunnel did not come back after the peer restarted"
 fi
 
 # --- firewall rules were installed and are removed on exit ------------------

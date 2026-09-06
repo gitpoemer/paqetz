@@ -719,6 +719,30 @@ impl PeerState {
         now.saturating_sub(spoke) >= every
     }
 
+    /// Whether an empty packet is owed, for any of the three reasons there
+    /// are.
+    ///
+    /// Extracted from the function that acts on it for the same reason
+    /// [`Self::wants_handshake`] was: left inline, what a test could reach was
+    /// a second copy of the same reasoning, which agrees with itself no matter
+    /// what either copy says. Two of these three are settings, and a setting
+    /// that is never consulted is a feature that silently does nothing.
+    ///
+    /// The confirmation comes first and ignores both settings: it is one
+    /// packet per handshake, and without it a tunnel with keepalives off can
+    /// leave the responder holding a session it is not allowed to use.
+    fn owes_empty(&self, now: Millis, keepalive: bool, persistent: Option<Millis>) -> bool {
+        if self.confirm_owed {
+            // Repeated until the peer answers, but not on every tick: this is
+            // a packet whose whole purpose is to be unremarkable.
+            return self
+                .last_keepalive
+                .is_none_or(|sent| now.saturating_sub(sent) >= CONFIRM_RETRY);
+        }
+        keepalive && self.owes_keepalive(now)
+            || persistent.is_some_and(|every| self.owes_persistent(now, every))
+    }
+
     /// Whether the peer has stopped answering a session we are still using.
     ///
     /// Only asked of a session we have actually sent under: a tunnel that has
@@ -2419,25 +2443,11 @@ impl Tunnel {
             if state.session.is_none() {
                 return Ok(());
             }
-            // The confirmation is owed regardless of the keepalive setting: it
-            // is one packet per handshake, and without it a tunnel that turned
-            // keepalives off can leave the responder holding a session it is
-            // not allowed to use and an old one it can no longer use.
-            let owed = if state.confirm_owed {
-                // Repeated until the peer answers, but not on every tick: this
-                // is a packet whose whole purpose is to be unremarkable.
-                state
-                    .last_keepalive
-                    .is_none_or(|sent| now.saturating_sub(sent) >= CONFIRM_RETRY)
-            } else {
-                self.cfg.interface.keepalive && state.owes_keepalive(now)
-                    || self
-                        .cfg
-                        .interface
-                        .persistent_keepalive
-                        .is_some_and(|every| state.owes_persistent(now, every))
-            };
-            if !owed {
+            if !state.owes_empty(
+                now,
+                self.cfg.interface.keepalive,
+                self.cfg.interface.persistent_keepalive,
+            ) {
                 return Ok(());
             }
         }
@@ -3595,6 +3605,66 @@ mod tests {
             !s.presumed_dead(2_000 + PRESUMED_DEAD * 10),
             "silence after a question nobody can answer proves nothing"
         );
+    }
+
+    #[test]
+    fn a_persistent_keepalive_is_reached_with_the_passive_one_turned_off() {
+        // The wiring, not the predicate. Both settings feed one decision, and
+        // a setting the decision never consults is a feature that reads as
+        // configured and does nothing at all.
+        const EVERY: Millis = 25_000;
+        let idle = spoke(None, None);
+
+        // Off and unset: what an idle tunnel did before any of this existed.
+        assert!(!idle.owes_empty(EVERY * 10, false, None));
+        assert!(
+            !idle.owes_empty(EVERY * 10, true, None),
+            "the passive keepalive answers a peer, and this one has not spoken"
+        );
+
+        // Set, and reached even though the passive keepalive is off -- which
+        // is the combination a reverse tunnel with a quiet entrance runs.
+        assert!(idle.owes_empty(EVERY, false, Some(EVERY)));
+        assert!(!idle.owes_empty(EVERY - 1, false, Some(EVERY)));
+
+        // The passive one still works on its own terms, unchanged.
+        let answered = spoke(None, Some(1_000));
+        assert!(answered.owes_empty(1_000 + KEEPALIVE_TIMEOUT, true, None));
+        assert!(!answered.owes_empty(1_000 + KEEPALIVE_TIMEOUT, false, None));
+    }
+
+    #[test]
+    fn a_confirmation_outranks_both_settings() {
+        // One packet per handshake, owed whatever the settings say: without it
+        // a tunnel with keepalives off leaves the responder holding a session
+        // it is not allowed to seal under.
+        let mut s = spoke(None, None);
+        s.confirm_owed = true;
+        assert!(s.owes_empty(0, false, None));
+
+        // Paced, though, or it is a packet a tick on a carrier whose whole
+        // purpose is to be unremarkable.
+        s.last_keepalive = Some(1_000);
+        assert!(!s.owes_empty(1_000 + CONFIRM_RETRY - 1, false, None));
+        assert!(s.owes_empty(1_000 + CONFIRM_RETRY, false, None));
+    }
+
+    #[test]
+    fn a_goodbye_is_control_and_never_a_packet() {
+        // The receive path asks this twice: once when deciding not to hold it
+        // in the outbox for a peer to ask for again, and once when deciding
+        // not to write it to the device. Both ask `repeat::parse`, so this is
+        // the expression the two share.
+        assert!(crate::repeat::parse(&crate::repeat::BYE).is_some());
+
+        // And if either ever stopped asking, it is still not a packet: the
+        // device would be handed two bytes whose version nibble is zero.
+        assert_eq!(inner_source(&crate::repeat::BYE), None);
+        assert_eq!(inner_addresses6(&crate::repeat::BYE), None);
+
+        // It is worth carrying, though -- that check exists to drop the
+        // kernel's IPv6 multicast chatter, and must not swallow this.
+        assert!(worth_carrying(&crate::repeat::BYE));
     }
 
     #[test]
