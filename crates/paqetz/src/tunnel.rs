@@ -18,7 +18,7 @@
 //! with the rest of the throughput work.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -895,6 +895,20 @@ impl Tunnel {
             "configuring the TUN device",
             tun.configure(cfg.interface.address, cfg.interface.netmask, mtu),
         )?;
+        // With an address the device carries IPv6; without one it is told so,
+        // or the kernel gives it a link-local address and starts sending
+        // neighbour and listener traffic into a tunnel that refuses it.
+        match cfg.interface.address6 {
+            Some((addr, prefix)) => os(
+                "configuring the TUN device for IPv6",
+                tun.configure6(addr, prefix),
+            )?,
+            None => {
+                if let Err(e) = tun.set_ipv6(false) {
+                    debug!("could not turn IPv6 off on the device: {e}");
+                }
+            }
+        }
 
         let rx = os(
             format!("opening a capture socket on {interface}"),
@@ -1452,6 +1466,9 @@ impl Tunnel {
         sealed: &mut [u8],
         frame: &mut [u8],
     ) -> Result<Option<(usize, Ipv4Addr)>> {
+        if !worth_carrying(packet) {
+            return Ok(None);
+        }
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -2046,6 +2063,9 @@ impl Tunnel {
 
     /// Checks an inner packet and writes it to the device.
     fn deliver(&self, packet: &[u8]) -> Result<()> {
+        if packet.first().map(|b| b >> 4) == Some(6) {
+            return self.deliver6(packet);
+        }
         let Some(source) = inner_source(packet) else {
             return Ok(());
         };
@@ -2082,6 +2102,58 @@ impl Tunnel {
             return Ok(());
         }
 
+        self.write_inner(packet)
+    }
+
+    /// The same checks for an inner IPv6 packet.
+    ///
+    /// A device without an IPv6 address has nowhere to put one, so a peer
+    /// sending them is either configured for IPv6 on its side only, which is
+    /// said once, or is an older build whose kernel sent listener reports into
+    /// the tunnel, which is nothing and is dropped as nothing.
+    fn deliver6(&self, packet: &[u8]) -> Result<()> {
+        let Some((source, destination)) = inner_addresses6(packet) else {
+            return Ok(());
+        };
+        if destination.is_multicast() {
+            return Ok(());
+        }
+        if self.cfg.interface.address6.is_none() {
+            Stats::bump(&self.stats.disallowed);
+            if !self.stats.explained_ipv6.swap(true, Ordering::Relaxed) {
+                warn_!(
+                    "refused an inner IPv6 packet from {source}: this end has no \
+                     `address6`, so the tunnel carries IPv4 only"
+                );
+            }
+            return Ok(());
+        }
+        if !self.cfg.peer.permits6(source) {
+            Stats::bump(&self.stats.disallowed);
+            debug!("inner packet refused: source {source} is outside the peer's range");
+            if !self
+                .stats
+                .explained_disallowed
+                .swap(true, Ordering::Relaxed)
+            {
+                warn_!("refused an inner packet from {source}: outside this peer's allowed_ips");
+                warn_!(
+                    "if this peer is a way out to the internet, it needs \
+                     `allowed_ips = [\"0.0.0.0/0\", \"::/0\"]`"
+                );
+            }
+            return Ok(());
+        }
+        if !plausible_source6(source) {
+            Stats::bump(&self.stats.martian);
+            debug!("inner packet refused: source {source} is not a usable address");
+            return Ok(());
+        }
+        self.write_inner(packet)
+    }
+
+    /// Writes a checked inner packet to the device.
+    fn write_inner(&self, packet: &[u8]) -> Result<()> {
         match self.tun.send(packet) {
             Ok(_) => Ok(()),
             // The device is non-blocking in batched mode, so a full queue
@@ -2420,6 +2492,28 @@ const fn learn_local(current: (Ipv4Addr, u16), destination: (Ipv4Addr, u16)) -> 
     }
 }
 
+/// Reads the source and destination of an inner IPv6 packet.
+fn inner_addresses6(packet: &[u8]) -> Option<(Ipv6Addr, Ipv6Addr)> {
+    if packet.first().map(|b| b >> 4) != Some(6) {
+        return None;
+    }
+    let src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
+    let dst: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
+    Some((Ipv6Addr::from(src), Ipv6Addr::from(dst)))
+}
+
+/// Whether an inner IPv6 packet is one worth carrying at all.
+///
+/// The kernel sends neighbour discovery and listener reports into any device
+/// with IPv6 on, all to multicast, none of which the far end can do anything
+/// with. Dropped before they are encrypted rather than after they arrive.
+fn worth_carrying(packet: &[u8]) -> bool {
+    match inner_addresses6(packet) {
+        Some((_, dst)) => !dst.is_multicast(),
+        None => true,
+    }
+}
+
 /// Reads the source address of an inner IPv4 packet.
 fn inner_source(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.first().map(|b| b >> 4) != Some(4) {
@@ -2444,6 +2538,16 @@ pub(crate) fn plausible_source(addr: Ipv4Addr) -> bool {
         || addr.is_multicast()
         || addr.is_broadcast()
         || addr.is_link_local()
+        || addr.is_unspecified())
+}
+
+/// The same for IPv6. Link-local covers what the kernel sends of its own
+/// accord from a device that has just come up.
+#[must_use]
+pub(crate) fn plausible_source6(addr: Ipv6Addr) -> bool {
+    !(addr.is_loopback()
+        || addr.is_multicast()
+        || addr.is_unicast_link_local()
         || addr.is_unspecified())
 }
 
@@ -3441,6 +3545,47 @@ mod tests {
                 *b = 0x45;
             }
             assert_eq!(inner_source(&short), None, "len {len}");
+        }
+    }
+
+    #[test]
+    fn inner_addresses6_read_both_ends_of_the_header() {
+        let mut packet = [0u8; 40];
+        packet[0] = 0x60;
+        packet[8..24].copy_from_slice(&"fd00:7::2".parse::<Ipv6Addr>().unwrap().octets());
+        packet[24..40].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        let (src, dst) = inner_addresses6(&packet).expect("parses");
+        assert_eq!(src, "fd00:7::2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(dst, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(inner_addresses6(&packet[..39]), None, "a runt");
+        packet[0] = 0x45;
+        assert_eq!(inner_addresses6(&packet), None, "IPv4");
+    }
+
+    #[test]
+    fn multicast_ipv6_is_not_worth_carrying() {
+        // What the kernel sends into a device that has just come up: a
+        // listener report to ff02::16 from a link-local address.
+        let mut packet = [0u8; 40];
+        packet[0] = 0x60;
+        packet[8..24].copy_from_slice(&"fe80::1".parse::<Ipv6Addr>().unwrap().octets());
+        packet[24..40].copy_from_slice(&"ff02::16".parse::<Ipv6Addr>().unwrap().octets());
+        assert!(!worth_carrying(&packet));
+        packet[24..40].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        assert!(worth_carrying(&packet));
+        // IPv4 and control frames are not this function's business.
+        let v4 = [0x45u8; 20];
+        assert!(worth_carrying(&v4));
+        assert!(worth_carrying(&[0u8; 12]));
+    }
+
+    #[test]
+    fn martian_ipv6_sources_are_refused() {
+        for bad in ["::1", "ff02::1", "fe80::1", "::"] {
+            assert!(!plausible_source6(bad.parse().unwrap()), "{bad}");
+        }
+        for good in ["fd00:7::2", "2001:db8::1"] {
+            assert!(plausible_source6(good.parse().unwrap()), "{good}");
         }
     }
 

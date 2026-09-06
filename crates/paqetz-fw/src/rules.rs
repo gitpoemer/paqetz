@@ -284,7 +284,7 @@ mod tests {
             egress: None,
             route_mark: 0x10a,
         }];
-        let script = lane_script("paqetz0", &lanes);
+        let script = lane_script("paqetz0", &lanes, false);
         assert!(
             script.contains("oifname \"paqetz0\" meta mark 0x4f counter ip dscp set 10"),
             "{script}"
@@ -298,7 +298,7 @@ mod tests {
             egress: Some("warp".to_owned()),
             route_mark: 0x10a,
         }];
-        let script = lane_script("paqetz0", &lanes);
+        let script = lane_script("paqetz0", &lanes, false);
         assert!(
             script.contains("iifname \"paqetz0\" ip dscp 10 counter meta mark set 0x10a"),
             "{script}"
@@ -317,6 +317,33 @@ mod tests {
             !script.contains("meta mark 0x"),
             "nothing to tag here: {script}"
         );
+    }
+
+    #[test]
+    fn ipv6_lanes_read_and_write_the_other_header_too() {
+        let lanes = vec![Lane {
+            class: 10,
+            mark: Some(79),
+            egress: Some("warp".to_owned()),
+            route_mark: 0x10a,
+        }];
+        let script = lane_script("paqetz0", &lanes, true);
+        assert!(
+            script.contains("meta mark 0x4f counter ip6 dscp set 10"),
+            "{script}"
+        );
+        assert!(
+            script.contains("iifname \"paqetz0\" ip6 dscp 10 counter meta mark set 0x10a"),
+            "{script}"
+        );
+        assert!(
+            script.contains("oifname \"warp\" counter ip6 dscp set 0"),
+            "{script}"
+        );
+        // Translation is not per family in an inet table: once.
+        assert_eq!(script.matches("counter masquerade").count(), 1, "{script}");
+        // And without it, not a trace.
+        assert!(!lane_script("paqetz0", &lanes, false).contains("ip6"));
     }
 
     #[test]
@@ -343,7 +370,7 @@ mod tests {
                 route_mark: 0x10c,
             },
         ];
-        let script = lane_script("paqetz0", &lanes);
+        let script = lane_script("paqetz0", &lanes, false);
         assert_eq!(
             script
                 .matches("oifname \"warp\" counter masquerade")
@@ -370,7 +397,7 @@ mod tests {
     fn no_lanes_is_an_empty_table_rather_than_absent_rules() {
         // The table is still replaced, so a file that had lanes and no longer
         // does leaves nothing of them behind.
-        let script = lane_script("paqetz0", &[]);
+        let script = lane_script("paqetz0", &[], false);
         assert!(script.starts_with(&format!(
             "add table inet {LANE_TABLE}\ndelete table inet {LANE_TABLE}\n"
         )));
@@ -631,8 +658,12 @@ pub const LANE_TABLE: &str = "paqetz_lane";
 /// packet to be read on this host; leaving it set would carry a marking to the
 /// destination and every network between, which says something about the
 /// traffic to anyone who looks and does nothing for anybody.
+///
+/// `ipv6` adds the same rules for the other family's header. The table is
+/// `inet` already, so it is one more line per rule rather than another table.
 #[must_use]
-pub fn lane_script(device: &str, lanes: &[Lane]) -> String {
+pub fn lane_script(device: &str, lanes: &[Lane], ipv6: bool) -> String {
+    let families: &[&str] = if ipv6 { &["ip", "ip6"] } else { &["ip"] };
     let mut tag = String::new();
     let mut pick = String::new();
     let mut out = String::new();
@@ -640,22 +671,30 @@ pub fn lane_script(device: &str, lanes: &[Lane]) -> String {
     for lane in lanes {
         let dscp = lane.class;
         if let Some(mark) = lane.mark {
-            tag.push_str(&format!(
-                "        oifname \"{device}\" meta mark {mark:#x} counter ip dscp set {dscp}\n"
-            ));
+            for family in families {
+                tag.push_str(&format!(
+                    "        oifname \"{device}\" meta mark {mark:#x} counter {family} dscp set {dscp}\n"
+                ));
+            }
         }
         if let Some(egress) = lane.egress.as_deref() {
-            pick.push_str(&format!(
-                "        iifname \"{device}\" ip dscp {dscp} counter meta mark set {:#x}\n",
-                lane.route_mark
-            ));
+            for family in families {
+                pick.push_str(&format!(
+                    "        iifname \"{device}\" {family} dscp {dscp} counter meta mark set {:#x}\n",
+                    lane.route_mark
+                ));
+            }
             // One rule per interface however many classes leave by it, or a
             // packet is translated once per lane that names the same way out.
             if !seen.contains(&egress) {
                 seen.push(egress);
+                for family in families {
+                    out.push_str(&format!(
+                        "        oifname \"{egress}\" counter {family} dscp set 0\n"
+                    ));
+                }
                 out.push_str(&format!(
-                    "        oifname \"{egress}\" counter ip dscp set 0\n\
-                     \x20       oifname \"{egress}\" counter masquerade\n"
+                    "        oifname \"{egress}\" counter masquerade\n"
                 ));
             }
         }

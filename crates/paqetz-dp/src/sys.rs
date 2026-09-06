@@ -223,6 +223,12 @@ impl IfReq {
         i16::from_ne_bytes([self.data[0], self.data[1]])
     }
 
+    /// Reads the payload as an interface index.
+    #[must_use]
+    pub const fn index(&self) -> libc::c_int {
+        libc::c_int::from_ne_bytes([self.data[0], self.data[1], self.data[2], self.data[3]])
+    }
+
     /// Overwrites the payload with an MTU.
     pub const fn set_mtu(&mut self, mtu: i32) {
         let bytes = mtu.to_ne_bytes();

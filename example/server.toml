@@ -9,6 +9,10 @@ private_key = "REPLACE-WITH-YOUR-PRIVATE-KEY"
 # This end's address inside the tunnel, with the tunnel subnet's prefix.
 address = "10.7.0.1/24"
 
+# Set on both ends, the tunnel carries IPv6 inside as well. Only worth it when
+# this host has working IPv6 of its own to forward onto.
+#address6 = "fd00:7::1/64"
+
 # The outer TCP port. Avoid 80 and 443: the firewall rules are scoped to this
 # port and would disturb the host's own traffic on a standard one.
 listen_port = 9999
@@ -20,3 +24,4 @@ public_key = "REPLACE-WITH-THE-CLIENT-PUBLIC-KEY"
 # The client's address inside the tunnel. Its allowed source addresses are
 # derived from this, so there is normally no `allowed_ips` to write.
 tunnel_address = "10.7.0.2"
+#tunnel_address6 = "fd00:7::2"

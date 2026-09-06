@@ -70,6 +70,8 @@ pub(crate) struct Stats {
     /// The counter says how many; it cannot say why, and the why is almost
     /// always a peer whose `allowed_ips` is narrower than what it forwards.
     pub(crate) explained_disallowed: AtomicBool,
+    /// Whether the IPv6-without-an-address explanation has been printed.
+    pub(crate) explained_ipv6: AtomicBool,
 
     /// Handshakes started by this side.
     pub(crate) handshakes_sent: AtomicU64,

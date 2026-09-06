@@ -104,6 +104,10 @@ enum Command {
         /// Add a SOCKS5 listener on the client at this address.
         #[arg(long, value_name = "ADDR")]
         socks5: Option<String>,
+        /// Carry IPv6 inside the tunnel as well. Needs a server with IPv6 of
+        /// its own to send it out by.
+        #[arg(long)]
+        ipv6: bool,
     },
 
     /// Set up a tunnel, one question at a time.
@@ -265,6 +269,12 @@ enum XrayAction {
         /// Keep Iranian destinations out of the tunnel.
         #[arg(long)]
         block_domestic: bool,
+        /// Let IPv6 destinations through, for a tunnel that carries IPv6.
+        ///
+        /// Otherwise they are refused, since an IPv6 address would be dialled
+        /// from this host's own IPv6, outside the tunnel.
+        #[arg(long)]
+        allow_ipv6: bool,
         /// Where to write the configuration.
         #[arg(short, long, default_value = "xray-config.json")]
         out: PathBuf,
@@ -289,6 +299,10 @@ enum XrayAction {
         /// Keep Iranian destinations out of the tunnel. Asked for if omitted.
         #[arg(long)]
         block_domestic: Option<bool>,
+        /// Refuse IPv6 destinations. Asked for if omitted, defaulting to
+        /// whether the tunnel carries IPv6.
+        #[arg(long)]
+        block_ipv6: Option<bool>,
     },
     /// Download and install Xray, verifying the published checksum.
     Install {
@@ -356,7 +370,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             no_gateway,
             route_all,
             socks5,
-        } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5),
+            ipv6,
+        } => setup::init(&endpoint, &out, !no_gateway, route_all, socks5, ipv6),
         Command::Setup { out } => setup::interactive(&out),
         Command::Service { action } => service_command(action, &cli.config),
         Command::Xray { action } => xray_command(action, &cli.config),
@@ -557,7 +572,7 @@ struct Attached {
     device: String,
     marked: Option<paqetz_net4::route::Policy>,
     listener: Option<paqetz_net4::route::Policy>,
-    gateway: Option<(paqetz_fw::gateway::Gateway, bool)>,
+    gateway: Option<(paqetz_fw::gateway::Gateway, paqetz_fw::gateway::TurnedOn)>,
     routes: Option<paqetz_fw::gateway::TunnelRoutes>,
     /// What the lanes installed: their tagging table, and one rule each on the
     /// end that forwards. Empty for a tunnel with no lanes, which then leaves
@@ -617,12 +632,17 @@ fn attach(
     let mut socks5 = cfg.socks5.clone();
     let device = cfg.interface.device.clone();
     let want_gateway = cfg.interface.gateway;
+    // Every rule and route below comes in two families when the tunnel
+    // carries IPv6, and in one when it does not -- which is the default, and
+    // installs exactly what it did before the second family existed.
+    let ipv6 = cfg.carries_ipv6();
     let mark_route = cfg
         .interface
         .route_marked
         .map(|mark| paqetz_net4::route::Policy {
             mark,
             table: cfg.interface.route_table,
+            ipv6,
         });
     // One rule per mark. `route_marked` and the SOCKS5 listener both steer by
     // mark, and both default to 0x51, so a host using both installed two rules
@@ -662,7 +682,8 @@ fn attach(
     let mut lane_marks = Vec::new();
     if !plans.is_empty() {
         let rules: Vec<_> = plans.iter().map(|p| p.rule.clone()).collect();
-        if let Err(e) = paqetz_fw::nft_script(&paqetz_fw::rules::lane_script(&device, &rules)) {
+        if let Err(e) = paqetz_fw::nft_script(&paqetz_fw::rules::lane_script(&device, &rules, ipv6))
+        {
             log::error!("could not install the lane rules: {e}");
         }
         for plan in &plans {
@@ -673,6 +694,7 @@ fn attach(
                 let policy = paqetz_net4::route::Policy {
                     mark,
                     table: cfg.interface.route_table,
+                    ipv6,
                 };
                 match policy.apply(&device) {
                     Ok(()) => {
@@ -743,9 +765,13 @@ fn attach(
     let policy = match socks5 {
         None => None,
         Some(cfg) => {
+            // The listener itself dials IPv4 only, so the rule is for the
+            // other traffic carrying its mark, which is why it follows the
+            // tunnel's family rather than the listener's.
             let policy = paqetz_net4::route::Policy {
                 mark: cfg.mark,
                 table: cfg.table,
+                ipv6,
             };
             // Already installed if `route_marked` asked for the same thing.
             // Applying it again would revert and reinstate the identical rule,
@@ -797,6 +823,7 @@ fn attach(
         let gw = paqetz_fw::gateway::Gateway {
             device: device.clone(),
             subnet,
+            subnet6: cfg.tunnel_subnet6(),
             egress: egress_choice,
         };
         if !gw.egress_present() {
@@ -807,11 +834,18 @@ fn attach(
         }
         match gw.apply() {
             Ok(turned_on) => {
-                log::info!(
-                    "forwarding and address translation for {}/{}",
-                    subnet.0,
-                    subnet.1
-                );
+                match cfg.tunnel_subnet6() {
+                    Some((net6, prefix6)) => log::info!(
+                        "forwarding and address translation for {}/{} and {net6}/{prefix6}",
+                        subnet.0,
+                        subnet.1
+                    ),
+                    None => log::info!(
+                        "forwarding and address translation for {}/{}",
+                        subnet.0,
+                        subnet.1
+                    ),
+                }
                 Some((gw, turned_on))
             }
             Err(e) => {
@@ -835,6 +869,7 @@ fn attach(
                 endpoint: *endpoint.ip(),
                 original_gateway: gw,
                 original_device: dev,
+                ipv6,
             };
             match r.apply() {
                 Ok(()) => {
@@ -945,6 +980,7 @@ fn xray_setup(
     port: u16,
     prefix: &str,
     block_domestic: Option<bool>,
+    block_ipv6: Option<bool>,
     config: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tunnel = config::Config::load(config).ok().and_then(|c| {
@@ -952,15 +988,17 @@ fn xray_setup(
             (
                 t.socks5.as_ref().map(|s| s.listen.to_string()),
                 t.interface.route_marked,
+                t.carries_ipv6(),
             )
         })
     });
+    let carries_ipv6 = tunnel.as_ref().is_some_and(|t| t.2);
     // The mark wins when both are configured: a marked socket reaches the
     // tunnel through the kernel's routing, where SOCKS5 reaches it through a
     // proxy that must accept, parse and relay every connection first.
     let upstream = match &tunnel {
-        Some((_, Some(mark))) => xray::Upstream::Marked(*mark),
-        Some((Some(listen), None)) => xray::Upstream::Socks5(listen.clone()),
+        Some((_, Some(mark), _)) => xray::Upstream::Marked(*mark),
+        Some((Some(listen), None, _)) => xray::Upstream::Socks5(listen.clone()),
         _ => {
             return Err(format!(
                 "read {} but found neither a socks5 listener nor route_marked, so there \
@@ -1007,12 +1045,22 @@ fn xray_setup(
             true,
         )?,
     };
+    let block_ipv6 = match block_ipv6 {
+        Some(b) => b,
+        None => setup::yes_no(
+            "\nRefuse IPv6 destinations? The tunnel's routing is per address family,\n\
+             so an IPv6 address handed to Xray would otherwise be dialled from this\n\
+             host's own IPv6, outside the tunnel.",
+            !carries_ipv6,
+        )?,
+    };
     let generated = xray::generate(&xray::Plan {
         listen_port: port,
         dest,
         upstream,
         public_address: public,
         block_domestic,
+        block_ipv6,
     })?;
 
     // Install before applying, so the configuration is never written for
@@ -1058,6 +1106,7 @@ fn xray_command(
             socks5,
             mark,
             block_domestic,
+            allow_ipv6,
             out,
         } => {
             let upstream = match (socks5, mark) {
@@ -1071,6 +1120,7 @@ fn xray_command(
                 upstream,
                 public_address,
                 block_domestic,
+                block_ipv6: !allow_ipv6,
             })?;
             // Holds the REALITY private key.
             service::write_file(&out, &generated.config, 0o600)?;
@@ -1086,7 +1136,16 @@ fn xray_command(
             port,
             prefix,
             block_domestic,
-        } => xray_setup(public_address, dest, port, &prefix, block_domestic, config),
+            block_ipv6,
+        } => xray_setup(
+            public_address,
+            dest,
+            port,
+            &prefix,
+            block_domestic,
+            block_ipv6,
+            config,
+        ),
         XrayAction::Install { version, prefix } => {
             let v = xray::install(version.as_deref(), &prefix)?;
             println!("\nInstalled {v}.");

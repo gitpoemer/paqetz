@@ -151,6 +151,17 @@ pub(crate) struct Plan {
     /// visible, and occasionally blocked at the far end for arriving from the
     /// wrong place.
     pub(crate) block_domestic: bool,
+    /// Refuse IPv6 destinations rather than let them leave by the host's
+    /// own IPv6.
+    ///
+    /// The policy route that steers marked sockets into the tunnel is a rule
+    /// per address family, and the SOCKS5 listener dials IPv4 only. A user
+    /// handing Xray an IPv6 literal -- which a client that resolved the name
+    /// itself does -- would otherwise have it dialled from this host's own
+    /// IPv6 address, outside the tunnel, showing that address to the
+    /// destination. On by default; off is for a tunnel configured to carry
+    /// IPv6 inside, where the rule exists for the other family too.
+    pub(crate) block_ipv6: bool,
 }
 
 /// The generated credentials and the two artefacts they appear in.
@@ -197,16 +208,22 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
         // through the tunnel -- rather than handing it to the host's resolver.
         // Without it the connection is tunnelled but the lookup that chose its
         // destination is not, which is the failure this whole path exists to
-        // avoid. `UseIPv4` because the tunnel carries IPv4.
+        // avoid. `UseIPv4` because the tunnel carries IPv4; with IPv6 allowed
+        // through, both are asked for and IPv4 is still tried first.
         Upstream::Marked(mark) => format!(
             r#"    {{
       "tag": "tunnel",
       "protocol": "freedom",
-      "settings": {{ "domainStrategy": "UseIPv4" }},
+      "settings": {{ "domainStrategy": "{}" }},
       "streamSettings": {{
         "sockopt": {{ "mark": {mark} }}
       }}
-    }}"#
+    }}"#,
+            if plan.block_ipv6 {
+                "UseIPv4"
+            } else {
+                "UseIPv4v6"
+            }
         ),
     };
 
@@ -222,11 +239,24 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
             format!(
                 r#"  "dns": {{
     "servers": ["{RESOLVER}"],
-    "queryStrategy": "UseIPv4"
+    "queryStrategy": "{}"
   }},
-"#
+"#,
+                if plan.block_ipv6 { "UseIPv4" } else { "UseIP" }
             ),
         ),
+    };
+
+    // First, so nothing below it can send an IPv6 destination anywhere.
+    let ipv6 = if plan.block_ipv6 {
+        r#"
+      {
+        "type": "field",
+        "ip": ["::/0"],
+        "outboundTag": "block"
+      },"#
+    } else {
+        ""
     };
 
     let domestic = if plan.block_domestic {
@@ -288,7 +318,7 @@ pub(crate) fn generate(plan: &Plan) -> Result<Generated, Box<dyn std::error::Err
   ],
   "routing": {{
     "domainStrategy": "{domain_strategy}",
-    "rules": [
+    "rules": [{ipv6}
       {{
         "type": "field",
         "ip": ["geoip:private"],
@@ -397,7 +427,62 @@ mod tests {
             upstream: Upstream::Socks5("127.0.0.1:1080".to_owned()),
             public_address: "203.0.113.5".to_owned(),
             block_domestic: false,
+            block_ipv6: true,
         }
+    }
+
+    #[test]
+    fn ipv6_destinations_are_blocked_unless_the_tunnel_carries_them() {
+        // The policy route is per family, so an IPv6 literal handed to Xray
+        // would be dialled from this host's own IPv6, outside the tunnel.
+        for upstream in [
+            Upstream::Marked(81),
+            Upstream::Socks5("127.0.0.1:1080".to_owned()),
+        ] {
+            let on = generate(&Plan {
+                upstream: upstream.clone(),
+                block_ipv6: true,
+                ..plan()
+            })
+            .expect("generate");
+            assert!(on.config.contains(r#""ip": ["::/0"]"#), "{}", on.config);
+            // Before the private-range rule, so it is consulted first.
+            assert!(
+                on.config.find("::/0") < on.config.find("geoip:private"),
+                "{}",
+                on.config
+            );
+            well_formed_json(&on.config).unwrap_or_else(|e| panic!("{e}\n{}", on.config));
+
+            let off = generate(&Plan {
+                upstream,
+                block_ipv6: false,
+                ..plan()
+            })
+            .expect("generate");
+            assert!(!off.config.contains("::/0"), "{}", off.config);
+            well_formed_json(&off.config).unwrap_or_else(|e| panic!("{e}\n{}", off.config));
+        }
+    }
+
+    #[test]
+    fn allowing_ipv6_asks_for_both_families_and_still_prefers_ipv4() {
+        let g = generate(&Plan {
+            upstream: Upstream::Marked(81),
+            block_ipv6: false,
+            ..plan()
+        })
+        .expect("generate");
+        assert!(
+            g.config.contains(r#""domainStrategy": "UseIPv4v6""#),
+            "{}",
+            g.config
+        );
+        assert!(
+            g.config.contains(r#""queryStrategy": "UseIP""#),
+            "{}",
+            g.config
+        );
     }
 
     #[test]
@@ -1088,6 +1173,7 @@ mod install_tests {
             upstream: Upstream::Marked(81),
             public_address: "example.com".to_owned(),
             block_domestic: false,
+            block_ipv6: true,
         })
         .expect("generate");
         assert!(

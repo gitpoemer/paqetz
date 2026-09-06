@@ -4,6 +4,7 @@
 [interface]
 private_key = "REPLACE-WITH-YOUR-PRIVATE-KEY"
 address = "10.7.0.2/24"
+#address6 = "fd00:7::2/64"
 
 # No listen_port: the outer port is ephemeral, chosen at start-up. Nothing needs
 # to reach this end at a fixed address.
@@ -12,6 +13,7 @@ address = "10.7.0.2/24"
 public_key = "REPLACE-WITH-THE-SERVER-PUBLIC-KEY"
 endpoint = "203.0.113.5:9999"
 tunnel_address = "10.7.0.1"
+#tunnel_address6 = "fd00:7::1"
 
 # --- Everything below is optional. The defaults are what you want. ---
 

@@ -53,26 +53,43 @@ pub struct Policy {
     pub mark: u32,
     /// The routing table the rule points at.
     pub table: u32,
+    /// Whether to install the IPv6 rule and routes as well.
+    ///
+    /// Rules and tables are per family. Without this a marked IPv6 socket
+    /// matches nothing and leaves by the ordinary route, which is the same
+    /// silent escape the blackhole exists to close -- so it is only offered
+    /// when the tunnel carries IPv6, and then always with the blackhole.
+    pub ipv6: bool,
 }
+
+/// The `ip` family switch for each address family a policy covers.
+const FAMILIES: [&str; 2] = ["-4", "-6"];
 
 impl Policy {
     /// The commands [`apply`](Self::apply) would run, for display.
     #[must_use]
     pub fn plan(&self, device: &str) -> Vec<String> {
-        vec![
-            format!(
-                "ip rule add fwmark {} lookup {} priority {}",
+        let mut out = Vec::new();
+        for family in self.families() {
+            out.push(format!(
+                "ip {family} rule add fwmark {} lookup {} priority {}",
                 self.mark, self.table, PRIORITY
-            ),
-            format!(
-                "ip route replace default dev {} table {} metric {}",
+            ));
+            out.push(format!(
+                "ip {family} route replace default dev {} table {} metric {}",
                 device, self.table, DEVICE_METRIC
-            ),
-            format!(
-                "ip route replace blackhole default table {} metric {}",
+            ));
+            out.push(format!(
+                "ip {family} route replace blackhole default table {} metric {}",
                 self.table, BLACKHOLE_METRIC
-            ),
-        ]
+            ));
+        }
+        out
+    }
+
+    /// The families this policy is installed for.
+    fn families(&self) -> &'static [&'static str] {
+        if self.ipv6 { &FAMILIES } else { &FAMILIES[..1] }
     }
 
     /// Installs the rule and route. Safe to call when they already exist.
@@ -83,39 +100,45 @@ impl Policy {
         // Removed first so a repeat leaves one of each rather than a stack of
         // duplicates, which `ip rule` will happily accumulate.
         self.revert(device);
-        run(&[
-            "rule",
-            "add",
-            "fwmark",
-            &self.mark.to_string(),
-            "lookup",
-            &self.table.to_string(),
-            "priority",
-            &PRIORITY.to_string(),
-        ])?;
-        run(&[
-            "route",
-            "replace",
-            "default",
-            "dev",
-            device,
-            "table",
-            &self.table.to_string(),
-            "metric",
-            &DEVICE_METRIC.to_string(),
-        ])?;
-        // The fallback that makes a vanished device fail closed rather than
-        // silently route around the tunnel.
-        run(&[
-            "route",
-            "replace",
-            "blackhole",
-            "default",
-            "table",
-            &self.table.to_string(),
-            "metric",
-            &BLACKHOLE_METRIC.to_string(),
-        ])
+        for family in self.families() {
+            run(&[
+                family,
+                "rule",
+                "add",
+                "fwmark",
+                &self.mark.to_string(),
+                "lookup",
+                &self.table.to_string(),
+                "priority",
+                &PRIORITY.to_string(),
+            ])?;
+            run(&[
+                family,
+                "route",
+                "replace",
+                "default",
+                "dev",
+                device,
+                "table",
+                &self.table.to_string(),
+                "metric",
+                &DEVICE_METRIC.to_string(),
+            ])?;
+            // The fallback that makes a vanished device fail closed rather
+            // than silently route around the tunnel.
+            run(&[
+                family,
+                "route",
+                "replace",
+                "blackhole",
+                "default",
+                "table",
+                &self.table.to_string(),
+                "metric",
+                &BLACKHOLE_METRIC.to_string(),
+            ])?;
+        }
+        Ok(())
     }
 
     /// Removes the rule and route. Safe to call when they are absent.
@@ -129,33 +152,42 @@ impl Policy {
         // matching on the current table would walk past it and leave it behind
         // for ever. `ip rule del` matches on the selectors it is given, so
         // omitting the table matches whichever one is there.
-        while run(&[
-            "rule",
-            "del",
-            "fwmark",
-            &self.mark.to_string(),
-            "priority",
-            &PRIORITY.to_string(),
-        ])
-        .is_ok()
-        {}
-        let _ = run(&[
-            "route",
-            "del",
-            "default",
-            "dev",
-            device,
-            "table",
-            &self.table.to_string(),
-        ]);
-        let _ = run(&[
-            "route",
-            "del",
-            "blackhole",
-            "default",
-            "table",
-            &self.table.to_string(),
-        ]);
+        //
+        // Both families regardless of what this policy asks for: a rule this
+        // program wrote when the tunnel carried IPv6 is still this program's
+        // to remove after it stopped.
+        for family in FAMILIES {
+            while run(&[
+                family,
+                "rule",
+                "del",
+                "fwmark",
+                &self.mark.to_string(),
+                "priority",
+                &PRIORITY.to_string(),
+            ])
+            .is_ok()
+            {}
+            let _ = run(&[
+                family,
+                "route",
+                "del",
+                "default",
+                "dev",
+                device,
+                "table",
+                &self.table.to_string(),
+            ]);
+            let _ = run(&[
+                family,
+                "route",
+                "del",
+                "blackhole",
+                "default",
+                "table",
+                &self.table.to_string(),
+            ]);
+        }
     }
 }
 
@@ -194,6 +226,7 @@ mod tests {
         let plan = Policy {
             mark: 0x51,
             table: 51,
+            ipv6: false,
         }
         .plan("paqetz0");
         assert!(plan[0].contains("lookup 51"), "adding still names it");
@@ -213,6 +246,7 @@ mod tests {
         let plan = Policy {
             mark: 0x51,
             table: 51,
+            ipv6: false,
         }
         .plan("paqetz0");
         assert_eq!(plan.len(), 3);
@@ -237,6 +271,7 @@ mod tests {
         let plan = Policy {
             mark: 0x51,
             table: 51,
+            ipv6: false,
         }
         .plan("paqetz0");
         assert!(
@@ -253,10 +288,37 @@ mod tests {
 
     #[test]
     fn the_plan_is_runnable_as_printed() {
-        for line in (Policy { mark: 1, table: 2 }).plan("tun0") {
-            assert!(line.starts_with("ip "), "got: {line}");
-            assert!(!line.contains("{}"), "unsubstituted placeholder: {line}");
+        for ipv6 in [false, true] {
+            for line in (Policy {
+                mark: 1,
+                table: 2,
+                ipv6,
+            })
+            .plan("tun0")
+            {
+                assert!(line.starts_with("ip -"), "got: {line}");
+                assert!(!line.contains("{}"), "unsubstituted placeholder: {line}");
+            }
         }
+    }
+
+    #[test]
+    fn ipv6_doubles_the_plan_and_keeps_the_blackhole() {
+        // A marked IPv6 socket with no IPv6 rule leaves by the ordinary
+        // route, so when the family is on it gets the whole arrangement,
+        // blackhole included, and not only the rule.
+        let plan = Policy {
+            mark: 0x51,
+            table: 51,
+            ipv6: true,
+        }
+        .plan("paqetz0");
+        assert_eq!(plan.len(), 6);
+        let v6: Vec<&String> = plan.iter().filter(|l| l.starts_with("ip -6 ")).collect();
+        assert_eq!(v6.len(), 3, "{plan:?}");
+        assert!(v6[0].contains("fwmark 81"), "{}", v6[0]);
+        assert!(v6[1].contains("dev paqetz0"), "{}", v6[1]);
+        assert!(v6[2].contains("blackhole"), "{}", v6[2]);
     }
 
     #[test]

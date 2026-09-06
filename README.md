@@ -621,12 +621,37 @@ new five-tuple. Moving on a timer is the same cure without the outage.
 
 Turn either off if your path does not want it.
 
-### IPv4 only
+### IPv6
 
-The tunnel carries IPv4. A destination reachable only over IPv6 is refused
-rather than sent around the tunnel — which is what would otherwise happen, since
-the policy route is a v4 rule and a marked v6 socket matches nothing and leaves
-by the ordinary route. Dual-stack destinations are unaffected.
+The wire is IPv4. What travels inside it is IPv4 by default, and IPv6 as well
+if both ends are given an address for it:
+
+```toml
+# server                              # client
+[tunnel.interface]                    [tunnel.interface]
+address6 = "fd00:7::1/64"             address6 = "fd00:7::2/64"
+[tunnel.peer]                         [tunnel.peer]
+tunnel_address6 = "fd00:7::2"         tunnel_address6 = "fd00:7::1"
+                                      allowed_ips = ["0.0.0.0/0", "::/0"]
+```
+
+`paqetz setup` asks, and `paqetz init --ipv6` writes it. Everything that has an
+IPv4 half then gets an IPv6 one — the policy route, `route_all`'s two halves,
+forwarding and translation on the server, the lanes — and only then: a file
+without `address6` installs exactly what it always has, and the device is told
+to carry no IPv6 at all, so the kernel's own neighbour and listener chatter
+never enters the tunnel. It is only worth turning on when the server has
+working IPv6 of its own to forward onto. Without that, IPv6 destinations time
+out instead of being refused, which is worse.
+
+Without it, the generated Xray configuration **refuses IPv6 destinations**. The
+policy route that steers marked sockets into the tunnel is a rule per address
+family, so an IPv6 address handed to Xray — which a client that resolved the
+name itself will do — would otherwise be dialled from the client host's own
+IPv6, outside the tunnel, showing that address to the destination. `paqetz xray
+setup` asks, defaulting to refuse unless the tunnel carries IPv6; `paqetz xray
+config --allow-ipv6` is the same switch. Dual-stack destinations are unaffected
+either way: IPv4 is tried first.
 
 ## Several servers from one client
 

@@ -125,6 +125,7 @@ pub(crate) fn run(path: &Path) -> bool {
         }
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));
+        findings.extend(check_inner_ipv6(t));
         if t.interface.gateway {
             findings.push(check_forwarding_allowed(&t.interface.device));
         }
@@ -595,6 +596,49 @@ fn check_inner_addresses(cfg: &TunnelConfig) -> Finding {
             "traffic will need an explicit route; usually both should share one subnet",
         )
     }
+}
+
+/// The same questions for the IPv6 pair, when there is one, plus whether the
+/// host has IPv6 at all -- a device can be given an address on a host that has
+/// the family switched off, and nothing then leaves by it.
+fn check_inner_ipv6(cfg: &TunnelConfig) -> Option<Finding> {
+    let (ours, prefix) = cfg.interface.address6?;
+    let theirs = cfg.peer.tunnel_address6?;
+    if ours == theirs {
+        return Some(Finding::fail(
+            "inner IPv6 addresses",
+            format!("both ends are configured as {ours}"),
+            "give each end a distinct IPv6 address inside the tunnel",
+        ));
+    }
+    if !cfg.peer.permits6(theirs) {
+        return Some(Finding::fail(
+            "inner IPv6 addresses",
+            format!("{theirs} is not inside the peer's allowed range"),
+            "widen peer.allowed_ips, or correct peer.tunnel_address6",
+        ));
+    }
+    if !crate::config::in_network6(theirs, ours, prefix) {
+        return Some(Finding::warn(
+            "inner IPv6 addresses",
+            format!("{ours}/{prefix} and {theirs} are in different subnets"),
+            "traffic will need an explicit route; usually both should share one subnet",
+        ));
+    }
+    let disabled = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        .is_ok_and(|t| t.trim() == "1");
+    if disabled {
+        return Some(Finding::warn(
+            "inner IPv6 addresses",
+            "this host has IPv6 switched off (net.ipv6.conf.all.disable_ipv6 = 1)",
+            "the device gets its address regardless, but nothing IPv6 can leave this host; \
+             turn IPv6 on, or drop address6 from both ends",
+        ));
+    }
+    Some(Finding::pass(
+        "inner IPv6 addresses",
+        format!("{ours} ↔ {theirs}"),
+    ))
 }
 
 // ---------------------------------------------------------------------------

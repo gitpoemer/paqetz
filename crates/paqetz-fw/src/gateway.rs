@@ -11,7 +11,7 @@
 //! nothing has gone wrong from the tunnel's point of view.
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::{Error, Result, nft_script, run_ip};
 
@@ -25,6 +25,19 @@ pub const TABLE: &str = "paqetz_gw";
 /// Where `ip_forward` lives.
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 
+/// Its IPv6 counterpart.
+const IP6_FORWARD: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+
+/// Which forwarding switches [`Gateway::apply`] turned on, so
+/// [`Gateway::revert`] can put back exactly those.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnedOn {
+    /// IPv4 forwarding was off before, and is on because of us.
+    pub ipv4: bool,
+    /// The same for IPv6.
+    pub ipv6: bool,
+}
+
 /// What the server needs in order to be a way out.
 #[derive(Debug, Clone)]
 pub struct Gateway {
@@ -32,6 +45,9 @@ pub struct Gateway {
     pub device: String,
     /// The tunnel's inner subnet, whose traffic is translated.
     pub subnet: (Ipv4Addr, u8),
+    /// The inner IPv6 subnet, when the tunnel carries IPv6. Forwarded and
+    /// translated the same way, in a table of its own family.
+    pub subnet6: Option<(Ipv6Addr, u8)>,
     /// Send the peer's traffic out this interface rather than the default
     /// route, translating it to that interface's address.
     ///
@@ -68,10 +84,15 @@ impl Gateway {
     /// The commands and settings [`apply`](Self::apply) would put in place.
     #[must_use]
     pub fn plan(&self) -> Vec<String> {
-        vec![
+        let mut out = vec![
             "sysctl -w net.ipv4.ip_forward=1".to_owned(),
             format!("nft -f - <<'EOF'\n{}EOF", self.ruleset()),
-        ]
+        ];
+        if let Some(rules) = self.ruleset6() {
+            out.push("sysctl -w net.ipv6.conf.all.forwarding=1".to_owned());
+            out.push(format!("nft -f - <<'EOF'\n{rules}EOF"));
+        }
+        out
     }
 
     /// Whether the egress interface exists on this host.
@@ -115,18 +136,53 @@ table ip {TABLE} {{
         )
     }
 
+    /// The IPv6 half, when there is one.
+    ///
+    /// A table of its own family rather than one `inet` table for both, so a
+    /// tunnel carrying only IPv4 installs exactly what it always has.
+    fn ruleset6(&self) -> Option<String> {
+        let (net, prefix) = self.subnet6?;
+        let device = &self.device;
+        let masquerade = self.egress.as_ref().map_or_else(
+            || format!("ip6 saddr {net}/{prefix} oifname != \"{device}\" masquerade"),
+            |e| {
+                format!(
+                    "ip6 saddr {net}/{prefix} oifname \"{}\" masquerade",
+                    e.interface
+                )
+            },
+        );
+        Some(format!(
+            "add table ip6 {TABLE}
+delete table ip6 {TABLE}
+table ip6 {TABLE} {{
+    chain forward {{
+        type filter hook forward priority filter; policy accept;
+        iifname \"{device}\" accept
+        oifname \"{device}\" ct state established,related accept
+    }}
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        {masquerade}
+    }}
+}}
+"
+        ))
+    }
+
     /// Turns on forwarding and installs the translation rules.
     ///
-    /// Returns whether `ip_forward` had to be changed, so it can be put back
-    /// exactly as it was — a host that was already forwarding for other reasons
-    /// must not have that turned off when the tunnel stops.
+    /// Returns which forwarding switches had to be changed, so they can be put
+    /// back exactly as they were — a host that was already forwarding for
+    /// other reasons must not have that turned off when the tunnel stops.
     ///
     /// # Errors
     /// Returns an error if the setting cannot be written or `nft` fails.
-    pub fn apply(&self) -> Result<bool> {
-        let was_on = forwarding_enabled()?;
-        if !was_on {
+    pub fn apply(&self) -> Result<TurnedOn> {
+        let mut turned_on = TurnedOn::default();
+        if !forwarding_enabled()? {
             set_forwarding(true)?;
+            turned_on.ipv4 = true;
         }
         nft_script(&self.ruleset())?;
 
@@ -135,40 +191,67 @@ table ip {TABLE} {{
         // it, including the tunnel's, which would collapse the tunnel.
         if let Some(e) = self.egress.as_ref() {
             let (net, prefix) = self.subnet;
-            let from = format!("{net}/{prefix}");
-            let table = e.table.to_string();
-            let prio = EGRESS_RULE_PRIORITY.to_string();
-            // Removed first, so a repeat leaves one rule rather than a stack.
-            while run_ip(&[
-                "rule", "del", "from", &from, "lookup", &table, "priority", &prio,
-            ])
-            .is_ok()
-            {}
-            run_ip(&[
-                "rule", "add", "from", &from, "lookup", &table, "priority", &prio,
-            ])?;
+            point_source_at("-4", &format!("{net}/{prefix}"), e.table)?;
         }
-        Ok(!was_on)
+
+        if let Some(rules) = self.ruleset6() {
+            if !switch_read(IP6_FORWARD)? {
+                switch_write(IP6_FORWARD, true)?;
+                turned_on.ipv6 = true;
+            }
+            nft_script(&rules)?;
+            if let (Some(e), Some((net, prefix))) = (self.egress.as_ref(), self.subnet6) {
+                point_source_at("-6", &format!("{net}/{prefix}"), e.table)?;
+            }
+        }
+        Ok(turned_on)
     }
 
-    /// Removes the rules, and restores forwarding if we turned it on.
-    pub fn revert(&self, restore_forwarding: bool) {
+    /// Removes the rules, and restores whichever forwarding we turned on.
+    pub fn revert(&self, turned_on: TurnedOn) {
         if let Some(e) = self.egress.as_ref() {
             let (net, prefix) = self.subnet;
-            let from = format!("{net}/{prefix}");
-            let table = e.table.to_string();
-            let prio = EGRESS_RULE_PRIORITY.to_string();
-            while run_ip(&[
-                "rule", "del", "from", &from, "lookup", &table, "priority", &prio,
-            ])
-            .is_ok()
-            {}
+            unpoint_source("-4", &format!("{net}/{prefix}"), e.table);
+            if let Some((net, prefix)) = self.subnet6 {
+                unpoint_source("-6", &format!("{net}/{prefix}"), e.table);
+            }
         }
         let _ = nft_script(&format!("add table ip {TABLE}\ndelete table ip {TABLE}\n"));
-        if restore_forwarding {
+        if self.subnet6.is_some() {
+            let _ = nft_script(&format!(
+                "add table ip6 {TABLE}\ndelete table ip6 {TABLE}\n"
+            ));
+        }
+        if turned_on.ipv4 {
             let _ = set_forwarding(false);
         }
+        if turned_on.ipv6 {
+            let _ = switch_write(IP6_FORWARD, false);
+        }
     }
+}
+
+/// Sends traffic from `from` to `table`, in one address family.
+///
+/// Removed first, so a repeat leaves one rule rather than a stack.
+fn point_source_at(family: &str, from: &str, table: u32) -> Result<()> {
+    unpoint_source(family, from, table);
+    let table = table.to_string();
+    let prio = EGRESS_RULE_PRIORITY.to_string();
+    run_ip(&[
+        family, "rule", "add", "from", from, "lookup", &table, "priority", &prio,
+    ])
+}
+
+/// Removes such a rule, however many times it was added.
+fn unpoint_source(family: &str, from: &str, table: u32) {
+    let table = table.to_string();
+    let prio = EGRESS_RULE_PRIORITY.to_string();
+    while run_ip(&[
+        family, "rule", "del", "from", from, "lookup", &table, "priority", &prio,
+    ])
+    .is_ok()
+    {}
 }
 
 /// Whether IPv4 forwarding is on.
@@ -176,24 +259,34 @@ table ip {TABLE} {{
 /// # Errors
 /// Returns an error if the setting cannot be read.
 pub fn forwarding_enabled() -> Result<bool> {
-    let text = std::fs::read_to_string(IP_FORWARD).map_err(|source| Error::Spawn {
-        command: IP_FORWARD.to_owned(),
+    switch_read(IP_FORWARD)
+}
+
+/// Turns IPv4 forwarding on or off.
+fn set_forwarding(on: bool) -> Result<()> {
+    switch_write(IP_FORWARD, on)
+}
+
+/// Reads a kernel switch under `/proc/sys`.
+fn switch_read(path: &str) -> Result<bool> {
+    let text = std::fs::read_to_string(path).map_err(|source| Error::Spawn {
+        command: path.to_owned(),
         source,
     })?;
     Ok(text.trim() != "0")
 }
 
-/// Turns IPv4 forwarding on or off.
-fn set_forwarding(on: bool) -> Result<()> {
-    std::fs::write(IP_FORWARD, if on { "1\n" } else { "0\n" }).map_err(|source| {
+/// Writes one.
+fn switch_write(path: &str, on: bool) -> Result<()> {
+    std::fs::write(path, if on { "1\n" } else { "0\n" }).map_err(|source| {
         if source.kind() == io::ErrorKind::PermissionDenied {
             Error::Spawn {
-                command: format!("writing {IP_FORWARD} (needs root)"),
+                command: format!("writing {path} (needs root)"),
                 source,
             }
         } else {
             Error::Spawn {
-                command: IP_FORWARD.to_owned(),
+                command: path.to_owned(),
                 source,
             }
         }
@@ -223,7 +316,18 @@ pub struct TunnelRoutes {
     pub original_gateway: Option<Ipv4Addr>,
     /// The interface that gateway is reached over.
     pub original_device: String,
+    /// Whether this host's IPv6 goes through the tunnel as well.
+    ///
+    /// The same two halves, in the other family. Nothing to pin: the tunnel's
+    /// own packets are IPv4, so no IPv6 route can capture them.
+    pub ipv6: bool,
 }
+
+/// The two halves that beat a default route without replacing it.
+const HALVES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
+
+/// The same for IPv6.
+const HALVES6: [&str; 2] = ["::/1", "8000::/1"];
 
 impl TunnelRoutes {
     /// The commands [`apply`](Self::apply) would run.
@@ -239,8 +343,13 @@ impl TunnelRoutes {
                 self.endpoint, self.original_device
             ),
         }];
-        for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+        for half in HALVES {
             out.push(format!("ip route add {half} dev {}", self.device));
+        }
+        if self.ipv6 {
+            for half in HALVES6 {
+                out.push(format!("ip -6 route add {half} dev {}", self.device));
+            }
         }
         out
     }
@@ -275,16 +384,26 @@ impl TunnelRoutes {
         let pin_args: Vec<&str> = pin.iter().map(String::as_str).collect();
         run_ip(&pin_args)?;
 
-        for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+        for half in HALVES {
             run_ip(&["route", "replace", half, "dev", &self.device])?;
+        }
+        if self.ipv6 {
+            for half in HALVES6 {
+                run_ip(&["-6", "route", "replace", half, "dev", &self.device])?;
+            }
         }
         Ok(())
     }
 
     /// Removes the routes, restoring the original path.
     pub fn revert(&self) {
-        for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+        for half in HALVES {
             let _ = run_ip(&["route", "del", half, "dev", &self.device]);
+        }
+        if self.ipv6 {
+            for half in HALVES6 {
+                let _ = run_ip(&["-6", "route", "del", half, "dev", &self.device]);
+            }
         }
         let endpoint = format!("{}/32", self.endpoint);
         let _ = run_ip(&["route", "del", &endpoint]);
@@ -416,6 +535,7 @@ mod tests {
         Gateway {
             device: "paqetz0".to_owned(),
             subnet: (Ipv4Addr::new(10, 7, 0, 0), 24),
+            subnet6: None,
             egress: None,
         }
     }
@@ -537,8 +657,67 @@ default dev warp table 90 scope link
     #[test]
     fn the_gateway_plan_turns_forwarding_on_before_installing_rules() {
         let plan = gateway().plan();
+        assert_eq!(plan.len(), 2, "IPv4 only installs what it always has");
         assert!(plan[0].contains("ip_forward=1"), "{}", plan[0]);
         assert!(plan[1].contains("masquerade"), "{}", plan[1]);
+    }
+
+    fn with_ipv6() -> Gateway {
+        Gateway {
+            subnet6: Some(("fd00:7::".parse().expect("address"), 64)),
+            ..gateway()
+        }
+    }
+
+    #[test]
+    fn an_inner_ipv6_subnet_gets_its_own_table_and_switch() {
+        // Its own family's table rather than one `inet` table for both, so
+        // the IPv4-only ruleset is byte-for-byte what it was.
+        let plan = with_ipv6().plan();
+        assert_eq!(plan.len(), 4, "{plan:?}");
+        assert!(
+            plan[2].contains("net.ipv6.conf.all.forwarding=1"),
+            "{}",
+            plan[2]
+        );
+        let rules = with_ipv6().ruleset6().expect("has one");
+        assert!(rules.contains("table ip6 paqetz_gw"), "{rules}");
+        assert!(
+            rules.contains("ip6 saddr fd00:7::/64 oifname != \"paqetz0\" masquerade"),
+            "{rules}"
+        );
+        assert_eq!(with_ipv6().ruleset(), gateway().ruleset());
+        assert!(gateway().ruleset6().is_none());
+    }
+
+    #[test]
+    fn ipv6_egress_translates_on_the_named_interface_too() {
+        let g = Gateway {
+            subnet6: Some(("fd00:7::".parse().expect("address"), 64)),
+            ..with_egress()
+        };
+        let rules = g.ruleset6().expect("has one");
+        assert!(
+            rules.contains("ip6 saddr fd00:7::/64 oifname \"warp\" masquerade"),
+            "{rules}"
+        );
+    }
+
+    #[test]
+    fn ipv6_routes_are_the_same_two_halves_in_the_other_family() {
+        let r = TunnelRoutes {
+            ipv6: true,
+            ..routes()
+        };
+        let plan = r.plan();
+        assert_eq!(plan.len(), 5, "{plan:?}");
+        assert!(
+            plan[3].contains("ip -6 route add ::/1 dev paqetz0"),
+            "{}",
+            plan[3]
+        );
+        assert!(plan[4].contains("8000::/1"), "{}", plan[4]);
+        assert_eq!(routes().plan().len(), 3);
     }
 
     fn routes() -> TunnelRoutes {
@@ -546,6 +725,7 @@ default dev warp table 90 scope link
             device: "paqetz0".to_owned(),
             endpoint: Ipv4Addr::new(203, 0, 113, 5),
             original_gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            ipv6: false,
             original_device: "enp3s0".to_owned(),
         }
     }

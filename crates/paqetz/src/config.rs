@@ -7,7 +7,7 @@
 //! buffer sizes, and no `role` field — which side initiates follows from
 //! whether a peer has an endpoint.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 
 use paqetz_core::{Millis, PrivateKey, PublicKey};
@@ -91,6 +91,15 @@ pub(crate) struct Interface {
     pub(crate) address: Ipv4Addr,
     /// The tunnel subnet's mask.
     pub(crate) netmask: Ipv4Addr,
+    /// Our IPv6 address inside the tunnel, with its prefix length.
+    ///
+    /// Absent by default, and then the device carries IPv4 only: the kernel
+    /// is told not to give it an IPv6 address at all, so nothing IPv6 is
+    /// read from it. Present, the tunnel forwards IPv6 the same way it
+    /// forwards IPv4 -- routes, translation and lanes all get their IPv6
+    /// halves -- which is only useful when the end that forwards has IPv6
+    /// of its own to forward onto.
+    pub(crate) address6: Option<(Ipv6Addr, u8)>,
     /// Inner MTU.
     pub(crate) mtu: u32,
     /// The outer TCP port we receive on.
@@ -500,8 +509,12 @@ pub(crate) struct Peer {
     /// Derived from `tunnel_address` when not given (D12), so there is normally
     /// nothing to configure.
     pub(crate) allowed_ips: Vec<(Ipv4Addr, u8)>,
+    /// The IPv6 ranges this peer may use, from the same list.
+    pub(crate) allowed_ips6: Vec<(Ipv6Addr, u8)>,
     /// The peer's address inside the tunnel.
     pub(crate) tunnel_address: Ipv4Addr,
+    /// The peer's IPv6 address inside the tunnel, when it carries IPv6.
+    pub(crate) tunnel_address6: Option<Ipv6Addr>,
 }
 
 impl Config {
@@ -540,6 +553,20 @@ impl TunnelConfig {
             u8::try_from(mask.count_ones()).unwrap_or(32),
         )
     }
+
+    /// The tunnel's inner IPv6 subnet, when it has one.
+    #[must_use]
+    pub(crate) fn tunnel_subnet6(&self) -> Option<(Ipv6Addr, u8)> {
+        let (addr, prefix) = self.interface.address6?;
+        let mask = mask6(prefix);
+        Some((Ipv6Addr::from_bits(addr.to_bits() & mask), prefix))
+    }
+
+    /// Whether IPv6 travels inside this tunnel.
+    #[must_use]
+    pub(crate) const fn carries_ipv6(&self) -> bool {
+        self.interface.address6.is_some()
+    }
 }
 
 impl Peer {
@@ -555,6 +582,14 @@ impl Peer {
         self.allowed_ips
             .iter()
             .any(|(net, prefix)| in_network(addr, *net, *prefix))
+    }
+
+    /// Whether an inner IPv6 source address is one this peer may use (D12).
+    #[must_use]
+    pub(crate) fn permits6(&self, addr: Ipv6Addr) -> bool {
+        self.allowed_ips6
+            .iter()
+            .any(|(net, prefix)| in_network6(addr, *net, *prefix))
     }
 }
 
@@ -584,6 +619,26 @@ pub(crate) fn in_network(addr: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
     let shift = 32 - u32::from(prefix);
     let mask = u32::MAX.checked_shl(shift).unwrap_or(0);
     (u32::from_bits(addr) & mask) == (u32::from_bits(net) & mask)
+}
+
+/// Whether `addr` is within `net/prefix`.
+#[must_use]
+pub(crate) fn in_network6(addr: Ipv6Addr, net: Ipv6Addr, prefix: u8) -> bool {
+    if prefix > 128 {
+        return false;
+    }
+    let mask = mask6(prefix);
+    (addr.to_bits() & mask) == (net.to_bits() & mask)
+}
+
+/// The mask for an IPv6 prefix length, as bits.
+fn mask6(prefix: u8) -> u128 {
+    if prefix == 0 {
+        return 0;
+    }
+    u128::MAX
+        .checked_shl(128 - u32::from(prefix.min(128)))
+        .unwrap_or(0)
 }
 
 /// Helper so the mask arithmetic reads clearly.
@@ -682,6 +737,8 @@ struct RawInterface {
     private_key: String,
     address: String,
     #[serde(default)]
+    address6: Option<String>,
+    #[serde(default)]
     mtu: Option<u32>,
     #[serde(default)]
     listen_port: Option<u16>,
@@ -738,6 +795,8 @@ struct RawInterface {
 struct RawPeer {
     public_key: String,
     tunnel_address: String,
+    #[serde(default)]
+    tunnel_address6: Option<String>,
     #[serde(default)]
     endpoint: Option<String>,
     #[serde(default)]
@@ -1068,6 +1127,11 @@ impl Config {
                 if a.interface.address == b.interface.address {
                     return Err(clash("inner address", a.interface.address.to_string()));
                 }
+                if let (Some((x, _)), Some((y, _))) = (a.interface.address6, b.interface.address6)
+                    && x == y
+                {
+                    return Err(clash("inner address", x.to_string()));
+                }
                 if let (Some(x), Some(y)) = (a.interface.route_marked, b.interface.route_marked)
                     && x == y
                 {
@@ -1138,6 +1202,11 @@ impl Config {
         let (address, prefix) =
             parse_cidr(&iface.address).map_err(|p| invalid("interface.address", p))?;
         let netmask = mask_from_prefix(prefix);
+        let address6 = iface
+            .address6
+            .as_deref()
+            .map(|a| parse_cidr6(a).map_err(|p| invalid("interface.address6", p)))
+            .transpose()?;
 
         let profile_name = iface.profile.as_deref().unwrap_or("linux-6");
         let profile = paqetz_tcpwire::profile::by_name(profile_name).ok_or_else(|| {
@@ -1211,6 +1280,14 @@ impl Config {
             return Err(invalid(
                 "interface.mtu",
                 format!("{mtu} is outside the usable range 576-9000"),
+            ));
+        }
+        // IPv6 has no fragmentation on the path, so a link narrower than
+        // this floor is not one it runs over.
+        if address6.is_some() && mtu < 1280 {
+            return Err(invalid(
+                "interface.mtu",
+                format!("{mtu} is below 1280, the least a link carrying IPv6 may offer"),
             ));
         }
         // Lowered rather than refused. A configuration that worked yesterday
@@ -1290,21 +1367,57 @@ impl Config {
             .tunnel_address
             .parse()
             .map_err(|e| invalid("peer.tunnel_address", format!("{e}")))?;
+        let tunnel_address6: Option<Ipv6Addr> = peer_raw
+            .tunnel_address6
+            .as_deref()
+            .map(|a| {
+                a.parse()
+                    .map_err(|e| invalid("peer.tunnel_address6", format!("{e}")))
+            })
+            .transpose()?;
+        // Both or neither. One without the other is an end that will read
+        // IPv6 from its device and refuse every reply, or the reverse, and
+        // either looks like a tunnel that carries IPv6 badly rather than one
+        // configured for it on one side only.
+        match (address6, tunnel_address6) {
+            (Some(_), None) => {
+                return Err(invalid(
+                    "peer.tunnel_address6",
+                    "interface.address6 is set, so the peer's IPv6 address is needed too",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(invalid(
+                    "interface.address6",
+                    "peer.tunnel_address6 is set, so this end's IPv6 address is needed too",
+                ));
+            }
+            _ => {}
+        }
 
         // Derived rather than configured (D12): the inner address is one we
         // assign, so its /32 is implied and there is nothing to write down.
-        let allowed_ips = match peer_raw.allowed_ips {
-            None => vec![(tunnel_address, 32u8)],
+        // One list for both families, told apart by their notation: a range
+        // of either kind reads as what it is, and `any` widens both.
+        let (allowed_ips, allowed_ips6) = match peer_raw.allowed_ips {
+            None => (
+                vec![(tunnel_address, 32u8)],
+                tunnel_address6.map(|a| (a, 128u8)).into_iter().collect(),
+            ),
             Some(entries) => {
-                let mut out = Vec::with_capacity(entries.len());
+                let mut v4 = Vec::with_capacity(entries.len());
+                let mut v6 = Vec::new();
                 for e in entries {
                     if e == "any" {
-                        out.push((Ipv4Addr::UNSPECIFIED, 0));
-                        continue;
+                        v4.push((Ipv4Addr::UNSPECIFIED, 0));
+                        v6.push((Ipv6Addr::UNSPECIFIED, 0));
+                    } else if e.contains(':') {
+                        v6.push(parse_cidr6(&e).map_err(|p| invalid("peer.allowed_ips", p))?);
+                    } else {
+                        v4.push(parse_cidr(&e).map_err(|p| invalid("peer.allowed_ips", p))?);
                     }
-                    out.push(parse_cidr(&e).map_err(|p| invalid("peer.allowed_ips", p))?);
                 }
-                out
+                (v4, v6)
             }
         };
 
@@ -1377,6 +1490,7 @@ impl Config {
                 private_key,
                 address,
                 netmask,
+                address6,
                 mtu,
                 listen_port,
                 device: {
@@ -1598,7 +1712,9 @@ impl Config {
                 public_key,
                 endpoint,
                 allowed_ips,
+                allowed_ips6,
                 tunnel_address,
+                tunnel_address6,
             },
         })
     }
@@ -1617,6 +1733,23 @@ fn parse_cidr(s: &str) -> core::result::Result<(Ipv4Addr, u8), String> {
         .map_err(|e| format!("{prefix:?} is not a prefix length: {e}"))?;
     if prefix > 32 {
         return Err(format!("prefix length {prefix} exceeds 32"));
+    }
+    Ok((addr, prefix))
+}
+
+/// Parses `addr/prefix` for IPv6.
+fn parse_cidr6(s: &str) -> core::result::Result<(Ipv6Addr, u8), String> {
+    let (addr, prefix) = s
+        .split_once('/')
+        .ok_or_else(|| format!("{s:?} is missing a prefix length, e.g. \"fd00:7::1/64\""))?;
+    let addr: Ipv6Addr = addr
+        .parse()
+        .map_err(|e| format!("{addr:?} is not an IPv6 address: {e}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|e| format!("{prefix:?} is not a prefix length: {e}"))?;
+    if prefix > 128 {
+        return Err(format!("prefix length {prefix} exceeds 128"));
     }
     Ok((addr, prefix))
 }
@@ -2361,6 +2494,27 @@ tunnel_address = "10.7.0.2"
                 "{what}: {err}"
             );
         }
+
+        // The same for an inner IPv6 address, on the two tunnels that have one.
+        let with6 = THREE
+            .replace(
+                "address = \"10.7.0.2/24\"",
+                "address = \"10.7.0.2/24\"\naddress6 = \"fd00:7::2/64\"",
+            )
+            .replace(
+                "tunnel_address = \"10.7.0.1\"",
+                "tunnel_address = \"10.7.0.1\"\ntunnel_address6 = \"fd00:7::1\"",
+            )
+            .replace(
+                "address = \"10.8.0.2/24\"",
+                "address = \"10.8.0.2/24\"\naddress6 = \"fd00:7::2/64\"",
+            )
+            .replace(
+                "tunnel_address = \"10.8.0.1\"",
+                "tunnel_address = \"10.8.0.1\"\ntunnel_address6 = \"fd00:8::1\"",
+            );
+        let err = Config::parse(&with6).expect_err("IPv6 address clash must be refused");
+        assert!(err.to_string().contains("fd00:7::2"), "{err}");
     }
 
     #[test]
@@ -2713,6 +2867,112 @@ tunnel_address = "10.7.0.2"
         assert!(c.peer.permits(Ipv4Addr::new(10, 7, 0, 200)));
         assert!(c.peer.permits(Ipv4Addr::new(192, 168, 9, 1)));
         assert!(!c.peer.permits(Ipv4Addr::new(192, 168, 10, 1)));
+    }
+
+    /// The client fixture with extra peer settings.
+    fn with_peer(lines: &str) -> Result<TunnelConfig> {
+        Config::parse(&format!("{CLIENT}\n{lines}\n")).map(|c| c.into_only().expect("one tunnel"))
+    }
+
+    #[test]
+    fn ipv6_inside_needs_an_address_at_both_ends() {
+        let both = Config::parse(
+            &CLIENT
+                .replace("[peer]", "address6 = \"fd00:7::2/64\"\n\n[peer]")
+                .replace(
+                    "tunnel_address = \"10.7.0.1\"",
+                    "tunnel_address = \"10.7.0.1\"\ntunnel_address6 = \"fd00:7::1\"",
+                ),
+        )
+        .expect("parses")
+        .into_only()
+        .expect("one");
+        assert!(both.carries_ipv6());
+        assert_eq!(
+            both.interface.address6,
+            Some(("fd00:7::2".parse().unwrap(), 64))
+        );
+        assert_eq!(
+            both.peer.tunnel_address6,
+            Some("fd00:7::1".parse().unwrap())
+        );
+        assert_eq!(
+            both.tunnel_subnet6(),
+            Some(("fd00:7::".parse().unwrap(), 64))
+        );
+        // Derived, as the IPv4 one is: the peer's own address and nothing more.
+        assert!(both.peer.permits6("fd00:7::1".parse().unwrap()));
+        assert!(!both.peer.permits6("fd00:7::3".parse().unwrap()));
+
+        let ours_only = with_interface("address6 = \"fd00:7::2/64\"").expect_err("half");
+        assert!(
+            ours_only.to_string().contains("tunnel_address6"),
+            "{ours_only}"
+        );
+        let theirs_only = with_peer("tunnel_address6 = \"fd00:7::1\"").expect_err("half");
+        assert!(
+            theirs_only.to_string().contains("address6"),
+            "{theirs_only}"
+        );
+
+        let plain = Config::parse(CLIENT)
+            .expect("parses")
+            .into_only()
+            .expect("one");
+        assert!(!plain.carries_ipv6());
+        assert!(plain.peer.allowed_ips6.is_empty());
+        assert_eq!(plain.tunnel_subnet6(), None);
+    }
+
+    #[test]
+    fn one_allowed_ips_list_holds_both_families() {
+        let c =
+            with_peer("allowed_ips = [\"0.0.0.0/0\", \"::/0\", \"fd00:8::/64\"]").expect("parses");
+        assert_eq!(c.peer.allowed_ips, vec![(Ipv4Addr::UNSPECIFIED, 0)]);
+        assert_eq!(
+            c.peer.allowed_ips6,
+            vec![
+                (Ipv6Addr::UNSPECIFIED, 0),
+                ("fd00:8::".parse().unwrap(), 64)
+            ]
+        );
+        assert!(c.peer.permits6("2001:db8::1".parse().unwrap()));
+
+        let any = with_peer("allowed_ips = [\"any\"]").expect("parses");
+        assert!(any.peer.permits6("2001:db8::1".parse().unwrap()));
+
+        let bad = with_peer("allowed_ips = [\"fd00:7::/129\"]").expect_err("prefix");
+        assert!(bad.to_string().contains("128"), "{bad}");
+        let bare = with_peer("allowed_ips = [\"fd00:7::1\"]").expect_err("no prefix");
+        assert!(bare.to_string().contains("prefix length"), "{bare}");
+    }
+
+    #[test]
+    fn ipv6_inside_refuses_an_mtu_below_its_floor() {
+        let text = CLIENT
+            .replace(
+                "[peer]",
+                "address6 = \"fd00:7::2/64\"\nmtu = 1200\n\n[peer]",
+            )
+            .replace(
+                "tunnel_address = \"10.7.0.1\"",
+                "tunnel_address = \"10.7.0.1\"\ntunnel_address6 = \"fd00:7::1\"",
+            );
+        let err = Config::parse(&text).expect_err("too small");
+        assert!(err.to_string().contains("1280"), "{err}");
+        // The same MTU is fine without IPv6, as it always was.
+        assert!(with_interface("mtu = 1200").is_ok());
+    }
+
+    #[test]
+    fn in_network6_masks_like_its_ipv4_twin() {
+        let net: Ipv6Addr = "fd00:7::".parse().unwrap();
+        assert!(in_network6("fd00:7::ffff".parse().unwrap(), net, 64));
+        assert!(!in_network6("fd00:8::1".parse().unwrap(), net, 64));
+        assert!(in_network6("2001:db8::1".parse().unwrap(), net, 0));
+        assert!(in_network6(net, net, 128));
+        assert!(!in_network6("fd00:7::1".parse().unwrap(), net, 128));
+        assert!(!in_network6(net, net, 129));
     }
 
     #[test]

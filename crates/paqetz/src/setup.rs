@@ -19,7 +19,7 @@
 
 use std::fmt::Write as _;
 use std::io::{self, BufRead as _, Write as _};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 use paqetz_core::KeyPair;
@@ -30,6 +30,12 @@ use paqetz_core::KeyPair;
 /// too — so a file written by `setup` and one converted from the original form
 /// come out identical rather than differing by a label nobody chose.
 const DEFAULT_NAME: &str = "paqetz0";
+
+/// The inner IPv6 addresses, when the tunnel carries IPv6: a unique-local
+/// prefix mirroring the IPv4 one, server first.
+const SERVER_INNER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 7, 0, 0, 0, 0, 0, 1);
+const CLIENT_INNER6: Ipv6Addr = Ipv6Addr::new(0xfd00, 7, 0, 0, 0, 0, 0, 2);
+const PREFIX6: u8 = 64;
 
 /// Everything the two configuration files are generated from.
 #[derive(Debug, Clone)]
@@ -54,6 +60,8 @@ pub(crate) struct Plan {
     pub(crate) route_marked: Option<u32>,
     /// An interface the server sends the forwarded traffic out by.
     pub(crate) egress: Option<String>,
+    /// Whether the tunnel carries IPv6 inside as well as IPv4.
+    pub(crate) ipv6: bool,
 }
 
 impl Default for Plan {
@@ -69,6 +77,7 @@ impl Default for Plan {
             socks5: None,
             route_marked: None,
             egress: None,
+            ipv6: false,
         }
     }
 }
@@ -198,6 +207,11 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     writeln!(s, "[tunnel.interface]")?;
     writeln!(s, "private_key = \"{}\"", server.private.to_base64())?;
     writeln!(s, "address = \"{}/{}\"", plan.server_inner, plan.prefix)?;
+    if plan.ipv6 {
+        writeln!(s, "address6 = \"{SERVER_INNER6}/{PREFIX6}\"")?;
+    } else {
+        writeln!(s, "# address6 = \"{SERVER_INNER6}/{PREFIX6}\"")?;
+    }
     writeln!(s, "listen_port = {}", plan.port)?;
     if plan.gateway {
         writeln!(s, "\n# Forward and translate the client's traffic to the")?;
@@ -219,6 +233,11 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     writeln!(s, "# The client's public key.")?;
     writeln!(s, "public_key = \"{}\"", client.public.to_base64())?;
     writeln!(s, "tunnel_address = \"{}\"", plan.client_inner)?;
+    if plan.ipv6 {
+        writeln!(s, "tunnel_address6 = \"{CLIENT_INNER6}\"")?;
+    } else {
+        writeln!(s, "# tunnel_address6 = \"{CLIENT_INNER6}\"")?;
+    }
 
     let mut c = String::new();
     writeln!(c, "# paqetz — CLIENT. This file belongs on the host that")?;
@@ -228,6 +247,11 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     writeln!(c, "[tunnel.interface]")?;
     writeln!(c, "private_key = \"{}\"", client.private.to_base64())?;
     writeln!(c, "address = \"{}/{}\"", plan.client_inner, plan.prefix)?;
+    if plan.ipv6 {
+        writeln!(c, "address6 = \"{CLIENT_INNER6}/{PREFIX6}\"")?;
+    } else {
+        writeln!(c, "# address6 = \"{CLIENT_INNER6}/{PREFIX6}\"")?;
+    }
     if plan.route_all {
         writeln!(c, "\n# Send this host's traffic through the tunnel. The")?;
         writeln!(c, "# tunnel's own packets are excepted automatically, so")?;
@@ -252,6 +276,11 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     writeln!(c, "public_key = \"{}\"", server.public.to_base64())?;
     writeln!(c, "endpoint = \"{}\"", plan.endpoint)?;
     writeln!(c, "tunnel_address = \"{}\"", plan.server_inner)?;
+    if plan.ipv6 {
+        writeln!(c, "tunnel_address6 = \"{SERVER_INNER6}\"")?;
+    } else {
+        writeln!(c, "# tunnel_address6 = \"{SERVER_INNER6}\"")?;
+    }
     if plan.gateway {
         writeln!(
             c,
@@ -270,7 +299,11 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
             "# replies arrive carrying the address of whatever site was"
         )?;
         writeln!(c, "# reached, not the server's, and would all be refused.")?;
-        writeln!(c, "allowed_ips = [\"0.0.0.0/0\"]")?;
+        if plan.ipv6 {
+            writeln!(c, "allowed_ips = [\"0.0.0.0/0\", \"::/0\"]")?;
+        } else {
+            writeln!(c, "allowed_ips = [\"0.0.0.0/0\"]")?;
+        }
     }
     if let Some(listen) = plan.socks5.as_ref() {
         writeln!(c, "\n# A SOCKS5 listener, for pointing one program at the")?;
@@ -309,6 +342,7 @@ pub(crate) fn init(
     gateway: bool,
     route_all: bool,
     socks5: Option<String>,
+    ipv6: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (host, port) = split_endpoint(endpoint)?;
     let plan = Plan {
@@ -317,6 +351,7 @@ pub(crate) fn init(
         gateway,
         route_all,
         socks5,
+        ipv6,
         ..Plan::default()
     };
     let pair = render(&plan)?;
@@ -409,7 +444,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
         if crate::service::has_systemd() {
             if yes_no(
                 &format!(
-                    "\n5. Install paqetz as a system service on this host,\n   \
+                    "\n7. Install paqetz as a system service on this host,\n   \
                      running {}, so it starts at boot and restarts on failure?",
                     role.file()
                 ),
@@ -443,7 +478,7 @@ pub(crate) fn interactive(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
         } else {
-            println!("\n5. No systemd on this host, so nothing to install.");
+            println!("\n7. No systemd on this host, so nothing to install.");
             println!("   Run it however this system starts things:");
             println!("     paqetz run -c {}", source.display());
         }
@@ -776,6 +811,15 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         None
     };
 
+    let ipv6 = yes_no(
+        "\n5. Carry IPv6 inside the tunnel as well?\n   \
+         Only useful when the server has working IPv6 of its own to send it\n   \
+         out by; without that, IPv6 destinations time out instead of being\n   \
+         refused. Off, the tunnel carries IPv4 and Xray is told to refuse\n   \
+         IPv6 rather than let it leave by the client host's own address.",
+        false,
+    )?;
+
     let plan = Plan {
         endpoint,
         port,
@@ -784,6 +828,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
         socks5: socks5.clone(),
         route_marked,
         egress: egress.clone(),
+        ipv6,
         ..Plan::default()
     };
     let pair = render(&plan)?;
@@ -810,7 +855,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
              there, so the key is only ever on the host that uses it.\n"
         );
     } else if yes_no(
-        "5. Generate an Xray REALITY inbound for the client host?\n   \
+        "6. Generate an Xray REALITY inbound for the client host?\n   \
          This is how users reach the tunnel: they connect to Xray, and\n   \
          Xray forwards what it receives through paqetz.",
         false,
@@ -854,6 +899,16 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
              arriving from the wrong country.",
             true,
         )?;
+        // Defaults to whatever the tunnel can carry: refusing IPv6 on a
+        // tunnel that forwards it wastes the setting, and allowing it on one
+        // that does not lets it leave by this host's own address.
+        let block_ipv6 = yes_no(
+            "\n   Refuse IPv6 destinations?\n   \
+             The tunnel's routing is per address family. An IPv6 address that\n   \
+             Xray is handed would otherwise be dialled from this host's own\n   \
+             IPv6, outside the tunnel, showing that address to the destination.",
+            !ipv6,
+        )?;
 
         let upstream_kind = upstream.clone();
         let generated = crate::xray::generate(&crate::xray::Plan {
@@ -862,6 +917,7 @@ fn generate(dir: &Path, role: Option<Role>) -> Result<Option<String>, Box<dyn st
             upstream,
             public_address: public,
             block_domestic,
+            block_ipv6,
         })?;
 
         // The REALITY private key is in here, so it gets the same treatment as
@@ -1112,6 +1168,51 @@ mod tests {
         let client = parsed.tunnels.first().expect("a tunnel");
         assert_eq!(client.interface.route_marked, Some(81));
         assert_eq!(client.interface.route_table, 81);
+    }
+
+    #[test]
+    fn ipv6_is_written_to_both_ends_or_shown_to_neither() {
+        let on = super::render(&Plan {
+            ipv6: true,
+            ..plan()
+        })
+        .expect("render");
+        assert!(
+            on.server.contains("address6 = \"fd00:7::1/64\""),
+            "{}",
+            on.server
+        );
+        assert!(
+            on.server.contains("tunnel_address6 = \"fd00:7::2\""),
+            "{}",
+            on.server
+        );
+        assert!(
+            on.client.contains("address6 = \"fd00:7::2/64\""),
+            "{}",
+            on.client
+        );
+        assert!(
+            on.client.contains("tunnel_address6 = \"fd00:7::1\""),
+            "{}",
+            on.client
+        );
+        // The way out has to be allowed to answer from anywhere in both
+        // families, or every IPv6 reply is refused.
+        assert!(on.client.contains("\"::/0\""), "{}", on.client);
+        for text in [&on.server, &on.client] {
+            let parsed = crate::config::Config::parse(text).expect("parses");
+            let t = parsed.tunnels.first().expect("a tunnel");
+            assert!(t.carries_ipv6());
+        }
+
+        let off = super::render(&plan()).expect("render");
+        for text in [&off.server, &off.client] {
+            assert!(text.contains("# address6 ="), "{text}");
+            assert!(text.contains("# tunnel_address6 ="), "{text}");
+            let parsed = crate::config::Config::parse(text).expect("parses");
+            assert!(!parsed.tunnels.first().expect("a tunnel").carries_ipv6());
+        }
     }
 
     #[test]

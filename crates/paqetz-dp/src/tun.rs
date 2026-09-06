@@ -7,7 +7,7 @@
 //! optimised — which is the whole reason there is none in this program (D4).
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use crate::sys::{self, IfReq};
@@ -29,6 +29,8 @@ pub(crate) mod ioctls {
     pub(crate) const SIOCSIFADDR: libc::Ioctl = 0x8916;
     /// Set the interface netmask.
     pub(crate) const SIOCSIFNETMASK: libc::Ioctl = 0x891C;
+    /// Get the interface index, which the IPv6 address ioctl names it by.
+    pub(crate) const SIOCGIFINDEX: libc::Ioctl = 0x8933;
 }
 
 /// TUN interface flags.
@@ -181,6 +183,66 @@ impl Tun {
 
         self.set_up(sfd)?;
         Ok(())
+    }
+
+    /// Assigns an IPv6 address, and turns IPv6 on for the device in case the
+    /// host has it off by default.
+    ///
+    /// Separate from [`configure`](Self::configure) because it is optional:
+    /// a tunnel carries IPv6 inside only when both ends were given an address
+    /// for it. The address ioctl is the AF_INET6 one, which names the device
+    /// by index rather than by name.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error.
+    pub fn configure6(&self, addr: Ipv6Addr, prefix: u8) -> io::Result<()> {
+        self.set_ipv6(true)?;
+
+        let sock = sys::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)?;
+        let sfd = sock.as_raw_fd();
+
+        let mut req = IfReq::new(&self.name)?;
+        // SAFETY: SIOCGIFINDEX expects an `ifreq` and writes an int into its
+        // payload.
+        unsafe { sys::ioctl_ptr(sfd, ioctls::SIOCGIFINDEX, &mut req) }?;
+        let index = req.index();
+
+        let mut req6 = libc::in6_ifreq {
+            ifr6_addr: libc::in6_addr {
+                s6_addr: addr.octets(),
+            },
+            ifr6_prefixlen: u32::from(prefix),
+            ifr6_ifindex: index,
+        };
+        // SAFETY: on an AF_INET6 socket SIOCSIFADDR expects an `in6_ifreq`,
+        // which this is.
+        unsafe { sys::ioctl_ptr(sfd, ioctls::SIOCSIFADDR, &mut req6) }?;
+        Ok(())
+    }
+
+    /// Turns IPv6 on or off for this device alone.
+    ///
+    /// Off is what a tunnel carrying only IPv4 wants: with it on, the kernel
+    /// gives the device a link-local address and starts sending neighbour and
+    /// multicast-listener traffic into it, every packet of which is encrypted,
+    /// sent, and refused at the far end.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error.
+    pub fn set_ipv6(&self, on: bool) -> io::Result<()> {
+        let path = format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", self.name);
+        let want = if on { "0" } else { "1" };
+        // Nothing to write when it is already so -- and the switch is owned
+        // by root regardless of capabilities, so a write that is not needed
+        // is a failure that is not needed either.
+        match std::fs::read_to_string(&path) {
+            Ok(current) if current.trim() == want => return Ok(()),
+            // A kernel built without IPv6 has no such file, and nothing to
+            // turn off.
+            Err(e) if !on && e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            _ => {}
+        }
+        std::fs::write(&path, format!("{want}\n"))
     }
 
     /// Brings the link up, preserving the flags already set.

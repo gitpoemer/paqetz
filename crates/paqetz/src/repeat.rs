@@ -37,7 +37,7 @@
 //!
 //! Nothing new. Control messages travel as ordinary transport packets, sealed
 //! under the same session, and are told from tunnelled traffic by their first
-//! byte: inner packets are IPv4, whose first nibble is 4, so a leading zero
+//! byte: inner packets are IP, whose first nibble is 4 or 6, so a leading zero
 //! cannot be one. An observer sees packets of the same shape as any other.
 
 use std::collections::BTreeMap;
