@@ -621,6 +621,51 @@ new five-tuple. Moving on a timer is the same cure without the outage.
 
 Turn either off if your path does not want it.
 
+### When WARP is the way out
+
+`egress = "warp"` sends everything the tunnel forwards out through Cloudflare
+instead of the server's own address. The failure mode is that it is several
+steps on a host paqetz does not control, and a step that half-succeeded leaves
+an arrangement that looks installed and carries nothing: the interface is up,
+`wgcf` is installed, an account is registered, and every packet steered into it
+is dropped.
+
+`paqetz doctor` now checks it whenever the configuration names it, and
+`paqetz warp repair` fixes what can be fixed:
+
+```
+paqetz warp status    # what is in place, and which shape is configured
+paqetz doctor         # read-only, with the rest of the host
+paqetz warp repair    # fix it
+```
+
+What it looks for, and why each one is silent from the tunnel's side:
+
+| what | what it does to traffic |
+| --- | --- |
+| the profile names no `Table` | `wg-quick` puts WARP's default route in `main`, so the host's own traffic, the tunnel's carrier and your SSH session all leave through Cloudflare |
+| the profile names a different table | the source rule steers into a table with nothing in it, the lookup falls through to `main`, and the traffic leaves by the address WARP was installed to avoid |
+| no handshake, ever | the interface is up and discards everything. Usually the endpoint is unreachable from this network |
+| WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not |
+| `wg-quick@warp` not enabled | the next reboot leaves the tunnel forwarding into an interface that is gone |
+| the selective destination table left behind | harmless, and the daily refresh fails every day trying to refresh a list nothing reads |
+
+`repair` rewrites the profile, restarts and enables the interface, and when
+there has never been a handshake it tries Cloudflare's other endpoints — the
+same anycast address on several ports — keeping the first that answers and
+writing it back to the profile. A network that drops 2408 usually leaves the
+rest alone. If none answer, that is a property of the path rather than of the
+configuration, and it says so rather than leaving you to guess.
+
+It also adds `PersistentKeepalive` to the profile, which `wgcf` does not write.
+Without it a WARP session that goes quiet loses whatever mapping the path was
+holding for it, and the traffic that wakes it is dropped rather than refused.
+
+**The MTU is advice, not a repair.** Both ends have to agree on the inner MTU,
+so lowering it on the server alone changes nothing: the client still sends
+full-size packets that the server then cannot fit into WARP. `interface.mtu`
+goes in both files, and both ends restart.
+
 ### IPv6
 
 The wire is IPv4. What travels inside it is IPv4 by default, and IPv6 as well

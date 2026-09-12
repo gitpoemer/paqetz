@@ -225,6 +225,14 @@ enum WarpAction {
     Refresh,
     /// Show what is in place.
     Status,
+    /// Check the WARP arrangement and fix what can be fixed.
+    ///
+    /// The setup is several steps on a host this program does not control, and
+    /// a step that half-succeeded leaves an arrangement that looks installed
+    /// and carries nothing. This finds what is wrong and puts it right,
+    /// including trying Cloudflare's other endpoints when the usual one is
+    /// unreachable from this network.
+    Repair,
     /// Take the routing, interface and timer out again.
     Revert {
         /// Also discard the WARP account and remove wgcf.
@@ -419,7 +427,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Warp { action } => match action {
             WarpAction::Setup => warp::setup(&cli.config),
             WarpAction::Refresh => warp::refresh(&cli.config),
-            WarpAction::Status => warp::status(),
+            WarpAction::Status => warp::status(&cli.config),
+            WarpAction::Repair => warp::repair(&cli.config),
             WarpAction::Revert { purge } => warp::revert(purge),
         },
         Command::Firewall { action } => firewall(action, &cli.config),

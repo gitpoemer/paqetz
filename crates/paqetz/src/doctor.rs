@@ -123,6 +123,7 @@ pub(crate) fn run(path: &Path) -> bool {
                 findings.push(check_lane(lane.class, interface, lane.table));
             }
         }
+        findings.extend(check_warp(t));
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));
         findings.extend(check_inner_ipv6(t));
@@ -491,6 +492,36 @@ fn check_lane(class: u8, interface: &str, written: Option<u32>) -> Finding {
             ),
         ),
     }
+}
+
+/// Whether the WARP interface this server forwards through actually works.
+///
+/// Only when the configuration names it. Everything the tunnel forwards leaves
+/// by WARP in that arrangement, so an interface that is up but has never
+/// handshaked, or a profile whose route went into the wrong table, is a server
+/// that carries traffic into a hole -- and looks, from the tunnel's side,
+/// exactly like a tunnel that is working.
+fn check_warp(cfg: &TunnelConfig) -> Vec<Finding> {
+    if cfg.interface.egress.as_deref() != Some(crate::warp::IFACE) {
+        return Vec::new();
+    }
+    let wrong = crate::warp::examine(cfg);
+    if wrong.is_empty() {
+        return vec![Finding::pass("WARP", "up, handshaked, and routed")];
+    }
+    wrong
+        .into_iter()
+        .map(|a| Finding {
+            what: a.what.to_owned(),
+            verdict: if a.blocking {
+                Verdict::Fail
+            } else {
+                Verdict::Warn
+            },
+            detail: a.detail,
+            remedy: Some(a.remedy),
+        })
+        .collect()
 }
 
 /// Whether the inner MTU leaves room for the tunnel's overhead.

@@ -34,6 +34,16 @@
 //! and starting again from nothing is what an operator does at three in the
 //! morning on a tunnel that is already down.
 //!
+//! # Why there is a repair as well as a setup
+//!
+//! Skipping what is already done makes the wizard safe to re-run, but it also
+//! means a step that half-succeeded is skipped rather than corrected: a profile
+//! whose route went into the wrong table, an interface that comes up and never
+//! handshakes, a keepalive that was never written. Every one of those looks
+//! installed and carries nothing, and from the tunnel's side they are
+//! indistinguishable from a tunnel that is working. [`diagnose`] names them and
+//! [`repair`] puts them right.
+//!
 //! So each step asks whether it has already been done and skips if so, which
 //! makes the whole thing resumable by re-running it. Nothing is rolled back on
 //! failure: a half-built WARP is closer to a working one than no WARP, and
@@ -56,7 +66,7 @@ const WGCF_BIN: &str = "/usr/local/bin/wgcf";
 const WGCF_REPO: &str = "ViRb3/wgcf";
 
 /// The interface name, and the `wg-quick` unit instance that carries it.
-const IFACE: &str = "warp";
+pub(crate) const IFACE: &str = "warp";
 
 /// The routing table holding WARP's default route.
 ///
@@ -449,7 +459,7 @@ fn generate_profile(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let text = std::fs::read_to_string(&profile)?;
-    let adjusted = profile_for_table(&text, TABLE);
+    let adjusted = with_keepalive(&profile_for_table(&text, TABLE), KEEPALIVE);
     let staged = dir.join("warp.conf");
     std::fs::write(&staged, &adjusted)?;
     let _ = std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600));
@@ -700,6 +710,7 @@ pub(crate) fn setup(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     register(dir)?;
     generate_profile(dir)?;
     bring_up()?;
+    confirm_handshake()?;
 
     if all {
         // The blanket shape is the existing `egress` setting, whose source rule
@@ -794,15 +805,62 @@ pub(crate) fn refresh(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         destinations.extend(fetch_relays()?.iter().map(ToString::to_string));
     }
     if destinations.is_empty() {
-        return Err("there is nothing configured to route through WARP".into());
+        // Not an error: this is what the daily timer runs, and a server that
+        // sends everything through WARP has no list to keep current. Failing
+        // here would put a red unit on the host every day for a tunnel that is
+        // working exactly as configured.
+        let blanket = cfg
+            .tunnels
+            .first()
+            .is_some_and(|t| t.interface.egress.as_deref() == Some(IFACE));
+        if blanket {
+            println!(
+                "Everything the tunnel forwards already goes through WARP (`egress = \"{IFACE}\"`),"
+            );
+            println!("so there is no destination list to refresh.");
+        } else {
+            println!("Nothing is configured to route through WARP.");
+            println!("`paqetz warp setup` chooses what goes through it.");
+        }
+        return Ok(());
     }
     load_set(&device, &destinations)?;
     Ok(())
 }
 
 /// What is in place.
-pub(crate) fn status() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// The shape is printed first, because the two shapes want different things
+/// installed: reading "destination table present ... no" without knowing that
+/// this server sends everything through WARP is reading a correct arrangement
+/// as a broken one.
+pub(crate) fn status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = match crate::config::Config::load(config) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            // Which shape is configured is read from the file, so a file that
+            // does not parse makes every line below it a guess.
+            println!("  {}: {e}", config.display());
+            println!("  the shape below is what is installed, not what was asked for\n");
+            None
+        }
+    };
+    let tunnel = cfg.as_ref().and_then(|c| c.tunnels.first());
+    let blanket = tunnel.is_some_and(|t| t.interface.egress.as_deref() == Some(IFACE));
+
     let say = |name: &str, yes: bool| println!("  {name:.<38} {}", if yes { "yes" } else { "no" });
+    let destinations = read_extras().len();
+    println!(
+        "  {:.<38} {}",
+        "shape",
+        if blanket {
+            format!("everything the tunnel forwards (egress = \"{IFACE}\")")
+        } else if destinations > 0 || Path::new(&format!("{STATE_DIR}/tor")).exists() {
+            "selected destinations".to_owned()
+        } else {
+            "nothing routed through WARP yet".to_owned()
+        }
+    );
     say("wgcf installed", Path::new(WGCF_BIN).exists());
     say(
         "WARP account registered",
@@ -813,21 +871,61 @@ pub(crate) fn status() -> Result<(), Box<dyn std::error::Error>> {
         Path::new(&format!("/etc/wireguard/{IFACE}.conf")).exists(),
     );
     say("interface up", interface_exists(IFACE));
-    let listed = capture("nft", &["list", "table", "inet", NFT_TABLE]).unwrap_or_default();
-    say("destination table present", !listed.is_empty());
-    let elements = listed
-        .split_once("elements = {")
-        .map_or(0, |(_, rest)| rest.matches(',').count() + 1);
-    println!("  {:.<38} {elements}", "destinations");
-    let rules = capture("ip", &["rule", "show"]).unwrap_or_default();
     say(
-        "policy rule installed",
-        rules.contains(&format!("lookup {TABLE}")),
+        "comes back after a reboot",
+        unit_enabled(&format!("wg-quick@{IFACE}")),
     );
-    say(
-        "refresh timer enabled",
-        unit_active("paqetz-warp-refresh.timer"),
+    println!(
+        "  {:.<38} {}",
+        "last handshake",
+        match handshake_age() {
+            Handshake::Never => "never".to_owned(),
+            Handshake::Ago(age) => format!("{age}s ago"),
+            Handshake::Unknown => "cannot tell without root".to_owned(),
+        }
     );
+
+    if blanket {
+        let rules = capture("ip", &["rule", "show"]).unwrap_or_default();
+        say(
+            "tunnel steered into WARP's table",
+            rules.contains(&format!(
+                "lookup {}",
+                tunnel.map_or(TABLE, |t| t.interface.egress_table)
+            )),
+        );
+    } else {
+        let listed = capture("nft", &["list", "table", "inet", NFT_TABLE]).unwrap_or_default();
+        say("destination table present", !listed.is_empty());
+        let elements = listed
+            .split_once("elements = {")
+            .map_or(0, |(_, rest)| rest.matches(',').count() + 1);
+        println!("  {:.<38} {elements}", "destinations");
+        let rules = capture("ip", &["rule", "show"]).unwrap_or_default();
+        say(
+            "policy rule installed",
+            rules.contains(&format!("lookup {TABLE}")),
+        );
+        say(
+            "refresh timer enabled",
+            unit_active("paqetz-warp-refresh.timer"),
+        );
+    }
+
+    if let Some(tunnel) = tunnel {
+        let wrong = examine(tunnel);
+        if !wrong.is_empty() {
+            println!("\n{} thing(s) are not right:", wrong.len());
+            for a in &wrong {
+                println!(
+                    "  {} {}",
+                    if a.blocking { "[FAIL]" } else { "[warn]" },
+                    a.detail
+                );
+            }
+            println!("\n`paqetz warp repair` fixes what can be fixed from here.");
+        }
+    }
     Ok(())
 }
 
@@ -862,9 +960,1060 @@ pub(crate) fn revert(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Diagnosis and repair
+// ---------------------------------------------------------------------------
+
+/// The keepalive written into the profile.
+///
+/// WireGuard sends nothing when there is nothing to send, so a WARP session
+/// that goes quiet loses whatever mapping the path was holding for it. The
+/// first packet after that is dropped, and the tunnel it was forwarded from
+/// sees a stall rather than a refusal.
+const KEEPALIVE: u32 = 25;
+
+/// Endpoints tried when the configured one never answers.
+///
+/// Cloudflare answers WARP on one anycast address across many ports, and a
+/// network that drops 2408 usually leaves the others alone. The first that
+/// completes a handshake is written back to the profile.
+const ENDPOINTS: [&str; 8] = [
+    "162.159.192.1:2408",
+    "162.159.192.1:500",
+    "162.159.192.1:1701",
+    "162.159.192.1:4500",
+    "162.159.193.10:2408",
+    "162.159.195.1:928",
+    "188.114.98.224:2408",
+    "188.114.99.7:955",
+];
+
+/// What the arrangement is meant to be, read from the configuration.
+#[derive(Debug, Clone)]
+pub(crate) struct Want {
+    /// The table the configuration steers the tunnel's traffic into.
+    pub(crate) table: u32,
+    /// Whether everything the tunnel forwards goes through WARP.
+    pub(crate) blanket: bool,
+    /// The tunnel's inner MTU.
+    pub(crate) inner_mtu: u32,
+    /// Whether the tunnel carries IPv6.
+    pub(crate) ipv6: bool,
+}
+
+/// The installed profile, or why it could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Profile {
+    /// Its text.
+    Read(String),
+    /// There is none.
+    Absent,
+    /// Whether there is one cannot be told: /etc/wireguard is root-only, so a
+    /// process that is not root cannot tell absent from unreadable.
+    Unreadable,
+}
+
+/// When WARP last completed a handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handshake {
+    /// Never, so anything sent into the interface is discarded.
+    Never,
+    /// This many seconds ago.
+    Ago(u64),
+    /// `wg` could not be asked, usually for want of privilege.
+    Unknown,
+}
+
+/// What the host shows about WARP right now. Gathered by reading only.
+#[derive(Debug, Clone)]
+pub(crate) struct Seen {
+    /// Whether the interface exists.
+    pub(crate) interface: bool,
+    /// Whether the unit is enabled, so the interface returns after a reboot.
+    pub(crate) unit_enabled: bool,
+    /// The installed profile.
+    pub(crate) profile: Profile,
+    /// When the last handshake was.
+    pub(crate) handshake: Handshake,
+    /// `ip -4 route show table <n>`.
+    pub(crate) routes: String,
+    /// The same for IPv6.
+    pub(crate) routes6: String,
+    /// The interface's MTU.
+    pub(crate) mtu: Option<u32>,
+    /// Whether the selective destination table is installed.
+    pub(crate) selective: bool,
+    /// How many destinations are written down for the selective shape.
+    pub(crate) destinations: usize,
+}
+
+/// Something a repair can put right.
+///
+/// Ordered as they must be applied: a profile is rewritten before the
+/// interface is restarted to read it, and an endpoint is only worth trying on
+/// an interface that is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Fix {
+    /// Rewrite the profile: its table, and the keepalive it was missing.
+    Profile,
+    /// Bring the interface up, and keep it up across reboots.
+    Interface,
+    /// Try Cloudflare's other endpoints until one answers.
+    Endpoint,
+    /// Take out the selective shape, which the blanket one has replaced.
+    Selective,
+    /// Load the destinations that are written down but not installed.
+    Destinations,
+}
+
+/// One thing that is not as it should be.
+#[derive(Debug, Clone)]
+pub(crate) struct Ailment {
+    /// What was checked.
+    pub(crate) what: &'static str,
+    /// What was observed.
+    pub(crate) detail: String,
+    /// What to do about it.
+    pub(crate) remedy: String,
+    /// Whether traffic is lost until it is fixed.
+    pub(crate) blocking: bool,
+    /// What `repair` would do, when it can do anything.
+    pub(crate) fix: Option<Fix>,
+}
+
+impl Ailment {
+    fn blocking(
+        what: &'static str,
+        detail: impl Into<String>,
+        remedy: impl Into<String>,
+        fix: Option<Fix>,
+    ) -> Self {
+        Self {
+            what,
+            detail: detail.into(),
+            remedy: remedy.into(),
+            blocking: true,
+            fix,
+        }
+    }
+
+    fn worth_knowing(
+        what: &'static str,
+        detail: impl Into<String>,
+        remedy: impl Into<String>,
+        fix: Option<Fix>,
+    ) -> Self {
+        Self {
+            what,
+            detail: detail.into(),
+            remedy: remedy.into(),
+            blocking: false,
+            fix,
+        }
+    }
+}
+
+/// Reads a `Key = value` out of a wg-quick profile.
+///
+/// The key appears once in the sections wgcf writes, and which section it is in
+/// is not ambiguous for any key asked about here.
+fn profile_value(profile: &str, key: &str) -> Option<String> {
+    profile.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        k.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| v.trim().to_owned())
+    })
+}
+
+/// Whether `ip route show table <n>` holds a default route by `interface`.
+fn has_default(routes: &str, interface: &str) -> bool {
+    routes.lines().any(|line| {
+        line.split_whitespace().next() == Some("default")
+            && line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w.first() == Some(&"dev") && w.get(1) == Some(&interface))
+    })
+}
+
+/// What is wrong with the WARP arrangement, given what the host shows.
+///
+/// Pure, so the awkward states -- a profile naming no table, an interface that
+/// is up but has never handshaked -- are reachable by a test rather than only
+/// by a host that is already in them.
+pub(crate) fn diagnose(seen: &Seen, want: &Want) -> Vec<Ailment> {
+    let mut out = Vec::new();
+
+    let profile = match &seen.profile {
+        Profile::Read(text) => Some(text.as_str()),
+        Profile::Absent => {
+            out.push(Ailment::blocking(
+                "WARP profile",
+                format!("/etc/wireguard/{IFACE}.conf is not there"),
+                "run `paqetz warp setup`: there is nothing installed to repair",
+                None,
+            ));
+            None
+        }
+        Profile::Unreadable => {
+            out.push(Ailment::worth_knowing(
+                "WARP profile",
+                "not checked: /etc/wireguard is readable only by root",
+                "run this as root to have the profile checked as well",
+                None,
+            ));
+            None
+        }
+    };
+
+    if let Some(profile) = profile {
+        match profile_value(profile, "Table") {
+            Some(t) if t.parse::<u32>() == Ok(want.table) => {}
+            Some(t) => out.push(Ailment::blocking(
+                "WARP routing table",
+                format!(
+                    "the profile routes into table {t}, the configuration steers into {}",
+                    want.table
+                ),
+                format!(
+                    "`paqetz warp repair` rewrites the profile to Table = {}",
+                    want.table
+                ),
+                Some(Fix::Profile),
+            )),
+            None => out.push(Ailment::blocking(
+                "WARP routing table",
+                "the profile names no table, so wg-quick puts WARP's default route in main",
+                "`paqetz warp repair` rewrites the profile. Until then everything this host \
+                 sends, the tunnel's own carrier and the session reading this included, leaves \
+                 through Cloudflare",
+                Some(Fix::Profile),
+            )),
+        }
+        if profile_value(profile, "PersistentKeepalive").is_none() {
+            out.push(Ailment::worth_knowing(
+                "WARP keepalive",
+                "the profile sets no PersistentKeepalive",
+                format!(
+                    "`paqetz warp repair` adds PersistentKeepalive = {KEEPALIVE}. Without it a \
+                     quiet WARP session loses whatever mapping the path held for it, and the \
+                     traffic that wakes it is dropped rather than refused"
+                ),
+                Some(Fix::Profile),
+            ));
+        }
+    }
+
+    if !seen.interface {
+        out.push(Ailment::blocking(
+            "WARP interface",
+            format!("there is no {IFACE} interface, so every packet steered into it is discarded"),
+            "`paqetz warp repair` brings it up",
+            Some(Fix::Interface),
+        ));
+        // Everything below is about an interface that is not there.
+        return out;
+    }
+
+    if !seen.unit_enabled {
+        out.push(Ailment::worth_knowing(
+            "WARP after a reboot",
+            format!("wg-quick@{IFACE} is not enabled, so {IFACE} does not come back on its own"),
+            "`paqetz warp repair` enables it. Until then a reboot leaves the tunnel forwarding \
+             into an interface that is gone",
+            Some(Fix::Interface),
+        ));
+    }
+
+    if !has_default(&seen.routes, IFACE) {
+        out.push(Ailment::blocking(
+            "WARP route",
+            format!("table {} holds no default route by {IFACE}", want.table),
+            format!(
+                "`paqetz warp repair` restarts {IFACE}, which reinstalls it. A lookup that finds \
+                 an empty table falls through to main, so the traffic leaves by this server's own \
+                 address instead"
+            ),
+            Some(Fix::Interface),
+        ));
+    }
+    if want.ipv6 && !has_default(&seen.routes6, IFACE) {
+        out.push(Ailment::blocking(
+            "WARP route (IPv6)",
+            format!(
+                "the tunnel carries IPv6 but table {} holds no IPv6 default by {IFACE}",
+                want.table
+            ),
+            "check that this host has IPv6 enabled, then `paqetz warp repair`",
+            Some(Fix::Interface),
+        ));
+    }
+
+    match seen.handshake {
+        Handshake::Never => out.push(Ailment::blocking(
+            "WARP handshake",
+            "WARP has never completed a handshake, so anything sent into it is discarded",
+            "`paqetz warp repair` tries Cloudflare's other endpoints. A network that drops 2408 \
+             usually leaves the rest alone",
+            Some(Fix::Endpoint),
+        )),
+        // Only suspicious when something should have been keeping it fresh: an
+        // idle session with no keepalive is meant to go quiet, and handshakes
+        // again by itself as soon as there is a packet to carry.
+        Handshake::Ago(age)
+            if age > u64::from(KEEPALIVE) * 8
+                && matches!(&seen.profile, Profile::Read(p) if profile_value(p, "PersistentKeepalive").is_some()) =>
+        {
+            out.push(Ailment::worth_knowing(
+                "WARP handshake",
+                format!("the last handshake was {age}s ago, with a keepalive set that should have refreshed it"),
+                "`paqetz warp repair` tries Cloudflare's other endpoints",
+                Some(Fix::Endpoint),
+            ));
+        }
+        Handshake::Ago(_) | Handshake::Unknown => {}
+    }
+
+    if let Some(mtu) = seen.mtu
+        && mtu < want.inner_mtu
+    {
+        out.push(Ailment::blocking(
+            "WARP MTU",
+            format!(
+                "{IFACE} carries {mtu}, the tunnel carries {}",
+                want.inner_mtu
+            ),
+            format!(
+                "set interface.mtu = {mtu} at both ends and restart both. A forwarded packet \
+                 larger than {mtu} is discarded on the way into WARP, which is why a connection \
+                 opens and then stops"
+            ),
+            None,
+        ));
+    }
+
+    if want.blanket && (seen.selective || seen.destinations > 0) {
+        out.push(Ailment::worth_knowing(
+            "WARP shape",
+            "everything the tunnel forwards goes through WARP, and the selective destination \
+             table is still installed",
+            "`paqetz warp repair` removes it. The blanket source rule already covers everything \
+             it was matching, and the daily refresh has nothing left to refresh",
+            Some(Fix::Selective),
+        ));
+    }
+    if !want.blanket && seen.destinations > 0 && !seen.selective {
+        out.push(Ailment::blocking(
+            "WARP destinations",
+            format!(
+                "{} destinations are written down but no table is installed, so none of them \
+                 leave by WARP",
+                seen.destinations
+            ),
+            "`paqetz warp repair` loads the set",
+            Some(Fix::Destinations),
+        ));
+    }
+
+    out
+}
+
+/// What the configuration asks for.
+fn want_of(tunnel: &crate::config::TunnelConfig) -> Want {
+    Want {
+        table: tunnel.interface.egress_table,
+        blanket: tunnel.interface.egress.as_deref() == Some(IFACE),
+        inner_mtu: tunnel.interface.mtu,
+        ipv6: tunnel.carries_ipv6(),
+    }
+}
+
+/// Reads the host. Changes nothing.
+fn observe(want: &Want) -> Seen {
+    let table = want.table.to_string();
+    let path = format!("/etc/wireguard/{IFACE}.conf");
+    let profile = match std::fs::read_to_string(&path) {
+        Ok(text) => Profile::Read(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Profile::Absent,
+        // Permission denied, and also the denial that reading /etc/wireguard
+        // itself produces for a process that is not root.
+        Err(_) => Profile::Unreadable,
+    };
+    Seen {
+        interface: interface_exists(IFACE),
+        unit_enabled: unit_enabled(&format!("wg-quick@{IFACE}")),
+        profile,
+        handshake: handshake_age(),
+        routes: capture("ip", &["-4", "route", "show", "table", &table]).unwrap_or_default(),
+        routes6: capture("ip", &["-6", "route", "show", "table", &table]).unwrap_or_default(),
+        mtu: std::fs::read_to_string(format!("/sys/class/net/{IFACE}/mtu"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok()),
+        selective: capture("nft", &["list", "table", "inet", NFT_TABLE]).is_ok(),
+        destinations: read_extras().len(),
+    }
+}
+
+/// Whether a systemd unit is enabled, which is a different question from
+/// whether it is running now.
+fn unit_enabled(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["is-enabled", "--quiet", unit])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Seconds since WARP last completed a handshake.
+fn handshake_age() -> Handshake {
+    let Ok(listed) = capture("wg", &["show", IFACE, "latest-handshakes"]) else {
+        return Handshake::Unknown;
+    };
+    let newest = listed
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    if newest == 0 {
+        return Handshake::Never;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Handshake::Ago(now.saturating_sub(newest))
+}
+
+/// What a host in this state needs done, in the order it must be done.
+fn fixes(ailments: &[Ailment]) -> Vec<Fix> {
+    let mut out: Vec<Fix> = ailments.iter().filter_map(|a| a.fix).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Checks the WARP arrangement without changing anything.
+///
+/// Used by `paqetz doctor`, which is read-only by contract.
+pub(crate) fn examine(tunnel: &crate::config::TunnelConfig) -> Vec<Ailment> {
+    let want = want_of(tunnel);
+    diagnose(&observe(&want), &want)
+}
+
+/// Puts the profile back the way this program installs it.
+fn rewrite_profile(want: &Want) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("/etc/wireguard/{IFACE}.conf");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {path}: {e}. This needs root."))?;
+    let fixed = with_keepalive(&profile_for_table(&text, want.table), KEEPALIVE);
+    if fixed == text {
+        return Ok(());
+    }
+    let staged = std::env::temp_dir().join("paqetz-warp-repair.conf");
+    std::fs::write(&staged, &fixed)?;
+    let _ = std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+    crate::service::run_elevated(
+        "install",
+        &["-m", "0600", &staged.display().to_string(), &path],
+    )?;
+    let _ = std::fs::remove_file(&staged);
+    println!("  rewrote {path}");
+    // The running interface still holds what the old file said.
+    restart_interface()
+}
+
+/// Brings the interface up, enables it, and restarts it if it was already up.
+fn revive_interface() -> Result<(), Box<dyn std::error::Error>> {
+    let unit = format!("wg-quick@{IFACE}");
+    crate::service::run_elevated("systemctl", &["enable", &unit])?;
+    if unit_active(&unit) && interface_exists(IFACE) {
+        return restart_interface();
+    }
+    crate::service::run_elevated("systemctl", &["start", &unit])?;
+    if !interface_exists(IFACE) {
+        return Err(format!(
+            "`{unit}` started but there is no {IFACE} interface. `journalctl -u {unit}` will say \
+             why."
+        )
+        .into());
+    }
+    println!("  {IFACE} is up, and enabled for the next boot");
+    Ok(())
+}
+
+/// Restarts the interface so it reads the profile again.
+fn restart_interface() -> Result<(), Box<dyn std::error::Error>> {
+    crate::service::run_elevated("systemctl", &["restart", &format!("wg-quick@{IFACE}")])?;
+    println!("  {IFACE} restarted");
+    Ok(())
+}
+
+/// Adds a keepalive to the peer section, leaving one that is already there.
+pub(crate) fn with_keepalive(profile: &str, every: u32) -> String {
+    if profile_value(profile, "PersistentKeepalive").is_some() {
+        return profile.to_owned();
+    }
+    let mut out = String::with_capacity(profile.len() + 32);
+    let mut in_peer = false;
+    let mut written = false;
+    for line in profile.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_peer && !written {
+                out.push_str(&format!("PersistentKeepalive = {every}\n"));
+                written = true;
+            }
+            in_peer = trimmed.eq_ignore_ascii_case("[peer]");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_peer && !written {
+        out.push_str(&format!("PersistentKeepalive = {every}\n"));
+    }
+    out
+}
+
+/// Replaces the peer's endpoint.
+pub(crate) fn with_endpoint(profile: &str, endpoint: &str) -> String {
+    let mut out = String::with_capacity(profile.len() + 32);
+    for line in profile.lines() {
+        if line
+            .split_once('=')
+            .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("Endpoint"))
+        {
+            out.push_str(&format!("Endpoint = {endpoint}\n"));
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Tries Cloudflare's other endpoints until one completes a handshake.
+///
+/// The endpoint is changed on the running interface rather than through the
+/// profile, so a candidate that does not answer costs one `wg set` instead of
+/// an interface that goes down and comes back. Only the one that works is
+/// written to the file.
+fn rotate_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let peers = capture("wg", &["show", IFACE, "peers"])?;
+    let peer = peers
+        .split_whitespace()
+        .next()
+        .ok_or("the WARP interface has no peer to move")?
+        .to_owned();
+    let current = capture("wg", &["show", IFACE, "endpoints"])
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+
+    for candidate in ENDPOINTS {
+        if candidate == current {
+            continue;
+        }
+        println!("  trying {candidate}");
+        if crate::service::run_elevated(
+            "wg",
+            &[
+                "set",
+                IFACE,
+                "peer",
+                &peer,
+                "persistent-keepalive",
+                &KEEPALIVE.to_string(),
+                "endpoint",
+                candidate,
+            ],
+        )
+        .is_err()
+        {
+            continue;
+        }
+        if handshake_within(std::time::Duration::from_secs(6)) {
+            println!("  {candidate} answered");
+            let path = format!("/etc/wireguard/{IFACE}.conf");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let staged = std::env::temp_dir().join("paqetz-warp-endpoint.conf");
+                std::fs::write(&staged, with_endpoint(&text, candidate))?;
+                let _ = std::fs::set_permissions(
+                    &staged,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                );
+                crate::service::run_elevated(
+                    "install",
+                    &["-m", "0600", &staged.display().to_string(), &path],
+                )?;
+                let _ = std::fs::remove_file(&staged);
+                println!("  written to {path}");
+            }
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "none of {} Cloudflare endpoints completed a handshake. WARP is reachable from this host \
+         on none of them, which is a property of the path rather than of this configuration. \
+         `egress` will black-hole the tunnel's traffic until that changes.",
+        ENDPOINTS.len()
+    )
+    .into())
+}
+
+/// Refuses to call the install finished until WARP has actually answered.
+///
+/// An interface that is up and has never handshaked discards everything sent
+/// into it, and every other check in `status` says yes. Learning that after
+/// `egress` has been wired up means learning it as a tunnel that stopped
+/// carrying traffic, which is the failure this whole file exists to avoid.
+fn confirm_handshake() -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(handshake_age(), Handshake::Ago(_)) {
+        println!("  WARP has handshaked");
+        return Ok(());
+    }
+    println!("  waiting for WARP to handshake");
+    if handshake_within(std::time::Duration::from_secs(8)) {
+        println!("  WARP has handshaked");
+        return Ok(());
+    }
+    println!("  no answer on the configured endpoint; trying the others");
+    rotate_endpoint()
+}
+
+/// Nudges the interface and waits for a handshake, for at most `patience`.
+fn handshake_within(patience: std::time::Duration) -> bool {
+    // A handshake only starts when there is something to send.
+    let _ = std::process::Command::new("ping")
+        .args(["-c", "1", "-W", "1", "-I", IFACE, "1.1.1.1"])
+        .output();
+    let deadline = std::time::Instant::now() + patience;
+    while std::time::Instant::now() < deadline {
+        if matches!(handshake_age(), Handshake::Ago(age) if age < 30) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
+}
+
+/// Takes out the selective shape, which the blanket one has replaced.
+fn drop_selective() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = paqetz_fw::nft_script(&nft_revert());
+    remove_rule();
+    let _ = crate::service::run_elevated(
+        "systemctl",
+        &["disable", "--now", "paqetz-warp-refresh.timer"],
+    );
+    let _ = std::fs::remove_file(format!("{STATE_DIR}/tor"));
+    let _ = std::fs::remove_file(extras_path());
+    println!("  the destination table, its rule and the daily refresh are gone");
+    Ok(())
+}
+
+/// Fixes what can be fixed, and says what is left.
+///
+/// # Errors
+/// Returns the first repair that failed. What was repaired before it stays
+/// repaired, and running this again resumes from there.
+pub(crate) fn repair(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = crate::config::Config::load(config)?;
+    let tunnel = cfg
+        .tunnels
+        .first()
+        .ok_or("the configuration has no tunnel in it")?;
+    if tunnel.peer.endpoint.is_some() {
+        return Err(
+            "this is the client end. WARP belongs on the server, which is the end that speaks to \
+             the internet."
+                .into(),
+        );
+    }
+
+    let want = want_of(tunnel);
+    let ailments = diagnose(&observe(&want), &want);
+    if ailments.is_empty() {
+        println!("Nothing to repair.");
+        return Ok(());
+    }
+
+    println!("Found:");
+    for a in &ailments {
+        println!(
+            "  {} {}",
+            if a.blocking { "[FAIL]" } else { "[warn]" },
+            a.detail
+        );
+    }
+
+    let todo = fixes(&ailments);
+    if todo.is_empty() {
+        println!("\nNothing here can be repaired automatically:");
+        for a in &ailments {
+            println!("  {}", a.remedy);
+        }
+        return Ok(());
+    }
+
+    println!("\n--- repairing ---");
+    for fix in todo {
+        match fix {
+            Fix::Profile => rewrite_profile(&want)?,
+            Fix::Interface => revive_interface()?,
+            Fix::Endpoint => rotate_endpoint()?,
+            Fix::Selective => drop_selective()?,
+            Fix::Destinations => {
+                let mut destinations = read_extras();
+                if Path::new(&format!("{STATE_DIR}/tor")).exists() {
+                    destinations.extend(fetch_relays()?.iter().map(ToString::to_string));
+                }
+                load_set(&tunnel.interface.device, &destinations)?;
+                install_rule()?;
+            }
+        }
+    }
+
+    let left = diagnose(&observe(&want), &want);
+    println!();
+    if left.is_empty() {
+        println!("WARP is in order.");
+    } else {
+        println!("Still wrong:");
+        for a in &left {
+            println!("  {}\n    {}", a.detail, a.remedy);
+        }
+    }
+    if want.blanket {
+        println!("\nThe tunnel installs its source rule when it starts, so restart it:");
+        println!("    systemctl restart paqetz");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile() -> String {
+        format!(
+            "[Interface]\n\
+             PrivateKey = abc\n\
+             Address = 172.16.0.2/32\n\
+             Table = {TABLE}\n\
+             \n\
+             [Peer]\n\
+             PublicKey = def\n\
+             AllowedIPs = 0.0.0.0/0\n\
+             Endpoint = engage.cloudflareclient.com:2408\n\
+             PersistentKeepalive = {KEEPALIVE}\n"
+        )
+    }
+
+    fn healthy() -> Seen {
+        Seen {
+            interface: true,
+            unit_enabled: true,
+            profile: Profile::Read(profile()),
+            handshake: Handshake::Ago(12),
+            routes: format!("default dev {IFACE} scope link\n"),
+            routes6: format!("default dev {IFACE} metric 1024 pref medium\n"),
+            mtu: Some(1280),
+            selective: false,
+            destinations: 0,
+        }
+    }
+
+    fn blanket() -> Want {
+        Want {
+            table: TABLE,
+            blanket: true,
+            inner_mtu: 1280,
+            ipv6: false,
+        }
+    }
+
+    fn only(seen: &Seen, want: &Want) -> Ailment {
+        let mut found = diagnose(seen, want);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        found.remove(0)
+    }
+
+    #[test]
+    fn a_working_arrangement_has_nothing_to_say() {
+        assert!(diagnose(&healthy(), &blanket()).is_empty());
+    }
+
+    #[test]
+    fn a_profile_that_names_no_table_is_the_one_that_takes_the_host_with_it() {
+        // wg-quick with no Table installs a default route in main, and then the
+        // tunnel's own carrier -- and the session reading the output -- leave
+        // through Cloudflare. Nothing else matters until it is fixed.
+        let seen = Seen {
+            profile: Profile::Read(profile().replace(&format!("Table = {TABLE}\n"), "")),
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(found.blocking);
+        assert_eq!(found.fix, Some(Fix::Profile));
+        assert!(found.detail.contains("names no table"), "{found:?}");
+    }
+
+    #[test]
+    fn a_profile_routing_into_a_table_nothing_looks_in_is_found() {
+        let seen = Seen {
+            profile: Profile::Read(profile().replace(&format!("Table = {TABLE}"), "Table = 200")),
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(found.blocking);
+        assert_eq!(found.fix, Some(Fix::Profile));
+        assert!(found.detail.contains("200"), "{found:?}");
+        assert!(found.detail.contains(&TABLE.to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn a_handshake_that_never_happened_is_a_black_hole_not_a_quiet_link() {
+        // The whole failure this exists for: the interface is up, the routing
+        // is right, and every packet steered into it is dropped because
+        // Cloudflare's endpoint is unreachable from this network.
+        let seen = Seen {
+            handshake: Handshake::Never,
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(found.blocking);
+        assert_eq!(found.fix, Some(Fix::Endpoint));
+    }
+
+    #[test]
+    fn an_idle_session_without_a_keepalive_is_not_reported_as_broken() {
+        // WireGuard sends nothing when there is nothing to send, so an old
+        // handshake on a quiet link is what working looks like. Reporting it
+        // would be inventing a fault.
+        let quiet = profile().replace(&format!("PersistentKeepalive = {KEEPALIVE}\n"), "");
+        let seen = Seen {
+            profile: Profile::Read(quiet),
+            handshake: Handshake::Ago(9_000),
+            ..healthy()
+        };
+        let found = diagnose(&seen, &blanket());
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(
+            found.first().map(|a| a.what),
+            Some("WARP keepalive"),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn an_idle_session_with_a_keepalive_that_should_have_refreshed_it_is_reported() {
+        let seen = Seen {
+            handshake: Handshake::Ago(9_000),
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(!found.blocking);
+        assert_eq!(found.fix, Some(Fix::Endpoint));
+    }
+
+    #[test]
+    fn a_tunnel_wider_than_warp_is_told_the_number_to_write() {
+        // The symptom is a connection that opens and then stops: the handshake
+        // fits, the first full-size packet does not.
+        let seen = Seen {
+            mtu: Some(1280),
+            ..healthy()
+        };
+        let want = Want {
+            inner_mtu: 1400,
+            ..blanket()
+        };
+        let found = only(&seen, &want);
+        assert!(found.blocking);
+        assert!(found.remedy.contains("interface.mtu = 1280"), "{found:?}");
+    }
+
+    #[test]
+    fn nothing_downstream_of_a_missing_interface_is_reported() {
+        // An interface that is not there has no route, no handshake and no
+        // MTU, and saying so three more times buries the one thing to do.
+        let seen = Seen {
+            interface: false,
+            unit_enabled: false,
+            handshake: Handshake::Never,
+            routes: String::new(),
+            routes6: String::new(),
+            mtu: None,
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert_eq!(found.fix, Some(Fix::Interface));
+        assert!(found.blocking);
+    }
+
+    #[test]
+    fn an_empty_table_is_a_fall_through_to_the_servers_own_address() {
+        // The quiet one. The rule matches, the lookup finds nothing, and the
+        // traffic leaves by the address WARP was installed to avoid.
+        let seen = Seen {
+            routes: String::new(),
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(found.blocking);
+        assert_eq!(found.fix, Some(Fix::Interface));
+    }
+
+    #[test]
+    fn the_ipv6_half_is_only_asked_about_when_the_tunnel_carries_it() {
+        let seen = Seen {
+            routes6: String::new(),
+            ..healthy()
+        };
+        assert!(diagnose(&seen, &blanket()).is_empty());
+        let want = Want {
+            ipv6: true,
+            ..blanket()
+        };
+        let found = only(&seen, &want);
+        assert!(found.blocking);
+    }
+
+    #[test]
+    fn a_selective_table_left_behind_by_the_blanket_shape_is_taken_out() {
+        let seen = Seen {
+            selective: true,
+            destinations: 3,
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(!found.blocking, "it steals no traffic, it only confuses");
+        assert_eq!(found.fix, Some(Fix::Selective));
+    }
+
+    #[test]
+    fn destinations_written_down_but_never_installed_are_a_fault() {
+        let want = Want {
+            blanket: false,
+            ..blanket()
+        };
+        let seen = Seen {
+            selective: false,
+            destinations: 4,
+            ..healthy()
+        };
+        let found = only(&seen, &want);
+        assert!(found.blocking);
+        assert_eq!(found.fix, Some(Fix::Destinations));
+    }
+
+    #[test]
+    fn a_profile_that_cannot_be_read_is_not_a_profile_that_is_missing() {
+        // doctor runs as whoever ran it, and /etc/wireguard is root-only.
+        // "run this as root" and "run setup" are not the same sentence.
+        let seen = Seen {
+            profile: Profile::Unreadable,
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(!found.blocking);
+        assert_eq!(found.fix, None);
+        assert!(found.remedy.contains("root"), "{found:?}");
+    }
+
+    #[test]
+    fn a_missing_profile_says_to_install_rather_than_to_repair() {
+        let seen = Seen {
+            profile: Profile::Absent,
+            ..healthy()
+        };
+        let found = only(&seen, &blanket());
+        assert!(found.blocking);
+        assert_eq!(found.fix, None, "there is nothing installed to repair");
+        assert!(found.remedy.contains("warp setup"), "{found:?}");
+    }
+
+    #[test]
+    fn repairs_run_in_an_order_that_does_not_undo_itself() {
+        // The profile is rewritten before the interface restarts to read it,
+        // and an endpoint is only worth trying on an interface that is up.
+        let ailments = vec![
+            Ailment::blocking("c", "", "", Some(Fix::Endpoint)),
+            Ailment::blocking("a", "", "", Some(Fix::Interface)),
+            Ailment::blocking("b", "", "", Some(Fix::Profile)),
+            Ailment::worth_knowing("d", "", "", Some(Fix::Profile)),
+            Ailment::worth_knowing("e", "", "", None),
+        ];
+        assert_eq!(
+            fixes(&ailments),
+            vec![Fix::Profile, Fix::Interface, Fix::Endpoint]
+        );
+    }
+
+    #[test]
+    fn a_keepalive_goes_in_the_peer_section_where_wg_quick_reads_it() {
+        let bare =
+            "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n";
+        let out = with_keepalive(bare, KEEPALIVE);
+        assert_eq!(out.matches("PersistentKeepalive").count(), 1, "{out}");
+        let at = out.find("PersistentKeepalive").expect("a keepalive");
+        assert!(at > out.find("[Peer]").expect("a peer section"), "{out}");
+        // And it lands in the section it belongs to rather than at the end of
+        // the file, which is the same place only while [Peer] happens to be
+        // last.
+        let trailing = format!("{bare}\n[Interface]\nPrivateKey = ghi\n");
+        let out = with_keepalive(&trailing, KEEPALIVE);
+        let at = out.find("PersistentKeepalive").expect("a keepalive");
+        assert!(
+            at < out.rfind("[Interface]").expect("the later section"),
+            "{out}"
+        );
+        // One that is already there was chosen by somebody, and is left.
+        let already = with_keepalive(bare, KEEPALIVE).replace(&format!("= {KEEPALIVE}"), "= 15");
+        let chosen = with_keepalive(&already, KEEPALIVE);
+        assert!(chosen.contains("PersistentKeepalive = 15"), "{chosen}");
+        assert_eq!(chosen.matches("PersistentKeepalive").count(), 1, "{chosen}");
+    }
+
+    #[test]
+    fn moving_the_endpoint_replaces_the_line_rather_than_adding_one() {
+        let out = with_endpoint(&profile(), "162.159.192.1:500");
+        assert_eq!(out.matches("Endpoint =").count(), 1, "{out}");
+        assert!(out.contains("Endpoint = 162.159.192.1:500"), "{out}");
+        assert!(!out.contains("engage.cloudflareclient.com"), "{out}");
+        // And nothing else moves.
+        assert!(out.contains("PrivateKey = abc"), "{out}");
+        assert!(out.contains(&format!("Table = {TABLE}")), "{out}");
+    }
+
+    #[test]
+    fn every_endpoint_tried_is_an_address_and_a_port() {
+        // A name that has to be resolved is one more thing that can fail on a
+        // network where the usual endpoint is already unreachable.
+        for candidate in ENDPOINTS {
+            let parsed: std::net::SocketAddr = candidate
+                .parse()
+                .unwrap_or_else(|e| panic!("{candidate}: {e}"));
+            assert!(parsed.port() > 0, "{candidate}");
+        }
+        let unique: BTreeSet<&str> = ENDPOINTS.iter().copied().collect();
+        assert_eq!(unique.len(), ENDPOINTS.len(), "a candidate is listed twice");
+    }
+
+    #[test]
+    fn a_default_route_is_read_off_the_device_it_names() {
+        assert!(has_default("default dev warp scope link\n", "warp"));
+        assert!(has_default(
+            "default via 10.0.0.1 dev warp proto static\n",
+            "warp"
+        ));
+        // Another interface's default in the same table is not this one's.
+        assert!(!has_default("default dev eth0\n", "warp"));
+        // Nor is a route to somewhere in particular that happens to use it.
+        assert!(!has_default("1.1.1.1 dev warp scope link\n", "warp"));
+        assert!(!has_default("", "warp"));
+    }
 
     #[test]
     fn relays_are_read_out_of_what_onionoo_returns() {
