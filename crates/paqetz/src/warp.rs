@@ -1286,9 +1286,13 @@ pub(crate) fn diagnose(seen: &Seen, want: &Want) -> Vec<Ailment> {
                 want.inner_mtu
             ),
             format!(
-                "set interface.mtu = {mtu} at both ends and restart both. A forwarded packet \
-                 larger than {mtu} is discarded on the way into WARP, which is why a connection \
-                 opens and then stops"
+                "a forwarded packet larger than {mtu} is discarded on the way into WARP, which \
+                 is why a connection opens and then stops. Either raise WARP (`MTU = 1420` in \
+                 /etc/wireguard/{IFACE}.conf, then restart wg-quick@{IFACE}), which keeps the \
+                 tunnel's throughput and is what wgcf's conservative default is giving up, or \
+                 set interface.mtu = {mtu} at both ends and restart both. Check whichever you \
+                 pick: `ping -M do -s <mtu minus 28> -I <this end\'s tunnel address> 1.1.1.1`, \
+                 because an MTU set too large is discarded in silence rather than refused"
             ),
             None,
         ));

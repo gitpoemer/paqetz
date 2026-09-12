@@ -646,7 +646,7 @@ What it looks for, and why each one is silent from the tunnel's side:
 | the profile names no `Table` | `wg-quick` puts WARP's default route in `main`, so the host's own traffic, the tunnel's carrier and your SSH session all leave through Cloudflare |
 | the profile names a different table | the source rule steers into a table with nothing in it, the lookup falls through to `main`, and the traffic leaves by the address WARP was installed to avoid |
 | no handshake, ever | the interface is up and discards everything. Usually the endpoint is unreachable from this network |
-| WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not |
+| WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not. `wgcf` writes 1280 and the tunnel carries 1400, so this is the common one on a server whose network is otherwise fine |
 | `wg-quick@warp` not enabled | the next reboot leaves the tunnel forwarding into an interface that is gone |
 | the selective destination table left behind | harmless, and the daily refresh fails every day trying to refresh a list nothing reads |
 
@@ -661,10 +661,24 @@ It also adds `PersistentKeepalive` to the profile, which `wgcf` does not write.
 Without it a WARP session that goes quiet loses whatever mapping the path was
 holding for it, and the traffic that wakes it is dropped rather than refused.
 
-**The MTU is advice, not a repair.** Both ends have to agree on the inner MTU,
-so lowering it on the server alone changes nothing: the client still sends
-full-size packets that the server then cannot fit into WARP. `interface.mtu`
-goes in both files, and both ends restart.
+**The MTU is advice, not a repair.** There are two fixes and they are not
+equivalent. Raising WARP (`MTU = 1420` in `/etc/wireguard/warp.conf`, then
+`systemctl restart wg-quick@warp`) keeps the tunnel's throughput and is what
+`wgcf`'s conservative 1280 gives up. Lowering `interface.mtu` to WARP's figure
+costs payload on every packet, and has to go in **both** files: the ends have
+to agree, so lowering it on the server alone leaves the client still sending
+full-size packets the server cannot fit into WARP.
+
+Whichever you pick, check it, because an MTU set too large is discarded in
+silence rather than refused:
+
+```
+ping -M do -s 1372 -I 10.7.0.1 1.1.1.1     # 1372 + 28 = 1400
+```
+
+Sourcing from the tunnel address is what makes the packet take the egress rule,
+so this measures the path the forwarded traffic actually takes rather than the
+server's own.
 
 ### IPv6
 
