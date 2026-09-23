@@ -427,7 +427,7 @@ pub(crate) fn init(
 }
 
 /// Writes a file only the owner can read, since it holds a private key.
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut f = std::fs::OpenOptions::new()
         .write(true)

@@ -239,6 +239,16 @@ enum WarpAction {
     /// account is kept in /etc/paqetz/warp/previous, and put back if the new
     /// one cannot be brought up.
     Reregister,
+    /// Check WARP on a timer, and fall back when it stops carrying traffic.
+    ///
+    /// A failed check restarts WARP, then replaces its account, and when
+    /// neither brings it back turns `egress = "warp"` off in the configuration
+    /// and restarts the tunnel, which then forwards through this server's own
+    /// address. It never turns egress back on.
+    Monitor {
+        #[command(subcommand)]
+        action: MonitorAction,
+    },
     /// Take the routing, interface and timer out again.
     Revert {
         /// Also discard the WARP account and remove wgcf.
@@ -247,6 +257,20 @@ enum WarpAction {
         #[arg(long)]
         purge: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum MonitorAction {
+    /// Start checking, every `--minutes`.
+    Enable {
+        /// Minutes between checks.
+        #[arg(long, default_value_t = 15)]
+        minutes: u32,
+    },
+    /// Stop checking. Changes nothing else.
+    Disable,
+    /// Run one check now: what the timer runs.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -436,6 +460,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WarpAction::Status => warp::status(&cli.config),
             WarpAction::Repair => warp::repair(&cli.config),
             WarpAction::Reregister => warp::reregister(&cli.config),
+            WarpAction::Monitor { action } => match action {
+                MonitorAction::Enable { minutes } => warp::monitor::enable(&cli.config, minutes),
+                MonitorAction::Disable => warp::monitor::disable(),
+                MonitorAction::Check => warp::monitor::check(&cli.config),
+            },
             WarpAction::Revert { purge } => warp::revert(purge),
         },
         Command::Firewall { action } => firewall(action, &cli.config),

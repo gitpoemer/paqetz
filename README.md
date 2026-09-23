@@ -638,7 +638,31 @@ paqetz warp status    # what is in place, and which shape is configured
 paqetz doctor         # read-only, with the rest of the host
 paqetz warp repair    # fix it
 paqetz warp reregister  # replace the WARP account, when it reaches only Cloudflare
+paqetz warp monitor enable --minutes 15   # do the above by itself, on a timer
 ```
+
+**Left unattended**, `paqetz warp monitor enable` installs a systemd timer
+that checks WARP every 15 minutes (`--minutes` to change it), counted from the
+end of the last check. When WARP has stopped carrying traffic past Cloudflare
+it does what you would, in order:
+
+1. restarts WARP, and stops there if that brings it back;
+2. replaces the account with `reregister`, unless the monitor already did that
+   within the hour, since an account that fails that quickly is not the cause
+   and replacing it again would only burn registrations;
+3. turns `egress = "warp"` off in the configuration and restarts paqetz, so the
+   tunnel keeps working through the server's own address.
+
+The line is commented out, not deleted, with a note above it saying why. The
+file is checked to still parse before it replaces the old one, keeps its
+permissions, and is swapped in whole, since it holds the private key. A lane's
+`egress` is left alone. The monitor never turns egress back on: whether
+Cloudflare can be trusted again is for someone who has looked. Put the line
+back and restart paqetz; the timer carries on watching.
+
+`journalctl -u paqetz-warp-monitor` shows what each check found and did,
+`paqetz warp monitor check` runs one by hand, and `paqetz warp monitor disable`
+removes the timer. `warp revert` removes it as well.
 
 What it looks for, and why each one is silent from the tunnel's side:
 

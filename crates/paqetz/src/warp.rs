@@ -56,6 +56,8 @@ use std::path::Path;
 
 use crate::setup::{ask, yes_no};
 
+pub(crate) mod monitor;
+
 /// Where wgcf's account and profile live.
 const STATE_DIR: &str = "/etc/paqetz/warp";
 
@@ -888,6 +890,7 @@ pub(crate) fn status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     );
     say("interface up", seen.interface);
     say("comes back after a reboot", seen.unit_enabled);
+    say("watched by `warp monitor`", monitor::enabled());
     println!(
         "  {:.<38} {}",
         "last handshake",
@@ -972,7 +975,8 @@ pub(crate) fn revert(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
         let _ = crate::service::run_elevated("rm", &["-f", file]);
     }
     let _ = crate::service::run_elevated("systemctl", &["daemon-reload"]);
-    println!("Routing, interface and timer removed.");
+    monitor::remove_units();
+    println!("Routing, interface and timers removed.");
     if purge {
         let _ = crate::service::run_elevated("rm", &["-rf", STATE_DIR]);
         let _ = crate::service::run_elevated("rm", &["-f", WGCF_BIN]);
