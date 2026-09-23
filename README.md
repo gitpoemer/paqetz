@@ -646,7 +646,8 @@ What it looks for, and why each one is silent from the tunnel's side:
 | the profile names no `Table` | `wg-quick` puts WARP's default route in `main`, so the host's own traffic, the tunnel's carrier and your SSH session all leave through Cloudflare |
 | the profile names a different table | the source rule steers into a table with nothing in it, the lookup falls through to `main`, and the traffic leaves by the address WARP was installed to avoid |
 | no handshake, ever | the interface is up and discards everything. Usually the endpoint is unreachable from this network |
-| WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not. `wgcf` writes 1280 and the tunnel carries 1400, so this is the common one on a server whose network is otherwise fine |
+| WARP reaches Cloudflare and nothing past it | every forwarded connection opens and then hangs. Cloudflare's edge completes each connect itself, so a handshake, `ping 1.1.1.1` and `cdn-cgi/trace` all still pass. Checked by fetching Google's and Fastly's connectivity pages through WARP, with `1.1.1.1` as the control, as root. A fresh registration is the way back: stop `wg-quick@warp`, move `/etc/paqetz/warp/wgcf-account.toml`, `wgcf-profile.conf` and `/etc/wireguard/warp.conf` aside, and run `paqetz warp setup`, which now refuses to finish on a WARP like this |
+| WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not. `wgcf` writes 1280 and the tunnel carries 1400, so this is the common one on a server whose network is otherwise fine. `setup` and `repair` remove that pin (see below) |
 | `wg-quick@warp` not enabled | the next reboot leaves the tunnel forwarding into an interface that is gone |
 | the server's replies to its own client leave by WARP | one-way: the server can ping the client, the client cannot ping the server, and nothing the client opens on the server's inner address is answered. The egress rule selects on the tunnel's source subnet, which includes the server's own inner address, so paqetz puts a `to <subnet> lookup main` rule in front of it. `doctor` asks the kernel which way a reply would leave; restarting paqetz reinstalls the rule |
 | the selective destination table left behind | harmless, and the daily refresh fails every day trying to refresh a list nothing reads |
@@ -662,16 +663,20 @@ It also adds `PersistentKeepalive` to the profile, which `wgcf` does not write.
 Without it a WARP session that goes quiet loses whatever mapping the path was
 holding for it, and the traffic that wakes it is dropped rather than refused.
 
-**The MTU is advice, not a repair.** There are two fixes and they are not
-equivalent. Raising WARP (`MTU = 1420` in `/etc/wireguard/warp.conf`, then
-`systemctl restart wg-quick@warp`) keeps the tunnel's throughput and is what
-`wgcf`'s conservative 1280 gives up. Lowering `interface.mtu` to WARP's figure
-costs payload on every packet, and has to go in **both** files: the ends have
-to agree, so lowering it on the server alone leaves the client still sending
-full-size packets the server cannot fit into WARP.
+**The MTU is taken from the uplink, not from `wgcf`.** `wgcf` pins
+`MTU = 1280`, which is what Cloudflare's own client uses on networks it knows
+nothing about, and narrower than the 1400 the tunnel carries. `warp setup`
+writes the profile without that pin, and `warp repair` removes it from one
+written before, so `wg-quick` sizes WARP the way it sizes any WireGuard
+interface: the MTU of the route to the endpoint, less 80. That is 1420 on an
+ordinary 1500 uplink. A pin you set yourself at or above the tunnel's MTU is
+left alone.
 
-Whichever you pick, check it, because an MTU set too large is discarded in
-silence rather than refused:
+If `doctor` still reports it afterwards, with the profile pinning nothing, the
+uplink itself is narrow and the tunnel has to fit inside it: lower
+`interface.mtu` to WARP's figure in **both** files, since the ends have to
+agree. Check the result either way, because an MTU set too large is discarded
+in silence rather than refused:
 
 ```
 ping -M do -s 1372 -I 10.7.0.1 1.1.1.1     # 1372 + 28 = 1400
@@ -680,6 +685,13 @@ ping -M do -s 1372 -I 10.7.0.1 1.1.1.1     # 1372 + 28 = 1400
 Sourcing from the tunnel address is what makes the packet take the egress rule,
 so this measures the path the forwarded traffic actually takes rather than the
 server's own.
+
+**A WARP fault does not stop the tunnel.** The service runs `paqetz doctor`
+before it starts and stays down on a failure. WARP's faults are still printed
+as failures, but they no longer count toward that: refusing to start over the
+egress takes the tunnel down with it, and the tunnel is the way in to fix the
+egress. The report ends by saying how many problems concern where forwarded
+traffic goes, separately from any that stop the tunnel.
 
 ### IPv6
 

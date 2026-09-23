@@ -437,7 +437,7 @@ fn register(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Step three: generate the WireGuard profile and put it where wg-quick reads.
-fn generate_profile(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_profile(dir: &Path, inner_mtu: u32) -> Result<(), Box<dyn std::error::Error>> {
     let installed = format!("/etc/wireguard/{IFACE}.conf");
     if Path::new(&installed).exists() {
         println!("  {installed} is already in place");
@@ -459,7 +459,10 @@ fn generate_profile(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let text = std::fs::read_to_string(&profile)?;
-    let adjusted = with_keepalive(&profile_for_table(&text, TABLE), KEEPALIVE);
+    let adjusted = without_narrow_mtu(
+        &with_keepalive(&profile_for_table(&text, TABLE), KEEPALIVE),
+        inner_mtu,
+    );
     let staged = dir.join("warp.conf");
     std::fs::write(&staged, &adjusted)?;
     let _ = std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o600));
@@ -708,9 +711,10 @@ pub(crate) fn setup(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     crate::service::run_elevated("install", &["-d", "-m", "0700", STATE_DIR])?;
     install_wgcf()?;
     register(dir)?;
-    generate_profile(dir)?;
+    generate_profile(dir, tunnel.interface.mtu)?;
     bring_up()?;
     confirm_handshake()?;
+    confirm_reach()?;
 
     if all {
         // The blanket shape is the existing `egress` setting, whose source rule
@@ -847,6 +851,18 @@ pub(crate) fn status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     };
     let tunnel = cfg.as_ref().and_then(|c| c.tunnels.first());
     let blanket = tunnel.is_some_and(|t| t.interface.egress.as_deref() == Some(IFACE));
+    // Read once: the reach check fetches through WARP, and a broken one takes
+    // seconds to say so.
+    let want = tunnel.map_or(
+        Want {
+            table: TABLE,
+            blanket: false,
+            inner_mtu: 0,
+            ipv6: false,
+        },
+        want_of,
+    );
+    let seen = observe(&want);
 
     let say = |name: &str, yes: bool| println!("  {name:.<38} {}", if yes { "yes" } else { "no" });
     let destinations = read_extras().len();
@@ -870,18 +886,26 @@ pub(crate) fn status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         "profile installed",
         Path::new(&format!("/etc/wireguard/{IFACE}.conf")).exists(),
     );
-    say("interface up", interface_exists(IFACE));
-    say(
-        "comes back after a reboot",
-        unit_enabled(&format!("wg-quick@{IFACE}")),
-    );
+    say("interface up", seen.interface);
+    say("comes back after a reboot", seen.unit_enabled);
     println!(
         "  {:.<38} {}",
         "last handshake",
-        match handshake_age() {
+        match seen.handshake {
             Handshake::Never => "never".to_owned(),
             Handshake::Ago(age) => format!("{age}s ago"),
             Handshake::Unknown => "cannot tell without root".to_owned(),
+        }
+    );
+    println!(
+        "  {:.<38} {}",
+        "reaches past Cloudflare",
+        match seen.reach {
+            Reach::Beyond => "yes",
+            Reach::OnlyCloudflare => "no, only Cloudflare answers",
+            Reach::Nothing => "no, nothing answers",
+            Reach::Unknown if !crate::service::is_root() => "cannot tell without root",
+            Reach::Unknown => "not checked",
         }
     );
 
@@ -912,8 +936,8 @@ pub(crate) fn status(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if let Some(tunnel) = tunnel {
-        let wrong = examine(tunnel);
+    if tunnel.is_some() {
+        let wrong = diagnose(&seen, &want);
         if !wrong.is_empty() {
             println!("\n{} thing(s) are not right:", wrong.len());
             for a in &wrong {
@@ -1024,6 +1048,29 @@ pub(crate) enum Handshake {
     Unknown,
 }
 
+/// How far past Cloudflare WARP carries traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// Sites outside Cloudflare answer through it.
+    Beyond,
+    /// Cloudflare answers through it and nothing else does: the edge accepts
+    /// each connection and never delivers it.
+    OnlyCloudflare,
+    /// Nothing answers through it, Cloudflare included.
+    Nothing,
+    /// Not asked: no interface, no handshake, no root, or no curl.
+    Unknown,
+}
+
+/// What one request through the interface came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    Answered,
+    Silent,
+    /// Could not be asked, for a reason that is this host's rather than WARP's.
+    Unrunnable,
+}
+
 /// What the host shows about WARP right now. Gathered by reading only.
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {
@@ -1045,6 +1092,8 @@ pub(crate) struct Seen {
     pub(crate) selective: bool,
     /// How many destinations are written down for the selective shape.
     pub(crate) destinations: usize,
+    /// Whether anything past Cloudflare answers through it.
+    pub(crate) reach: Reach,
 }
 
 /// Something a repair can put right.
@@ -1276,26 +1325,79 @@ pub(crate) fn diagnose(seen: &Seen, want: &Want) -> Vec<Ailment> {
         Handshake::Ago(_) | Handshake::Unknown => {}
     }
 
+    match seen.reach {
+        Reach::OnlyCloudflare => out.push(Ailment::blocking(
+            "WARP egress",
+            "WARP reaches Cloudflare and nothing past it: the edge accepts each connection \
+             and never delivers it",
+            format!(
+                "every forwarded connection opens and then hangs, so turn egress off to stay \
+                 online while this lasts. Whether Cloudflare is limiting this account or \
+                 refusing what it carries, a fresh registration is the way to find out: stop \
+                 wg-quick@{IFACE}, move {STATE_DIR}/wgcf-account.toml, \
+                 {STATE_DIR}/wgcf-profile.conf and /etc/wireguard/{IFACE}.conf aside, then \
+                 `paqetz warp setup`"
+            ),
+            None,
+        )),
+        Reach::Nothing => out.push(Ailment::blocking(
+            "WARP egress",
+            "WARP has handshaked and carries nothing, not even to Cloudflare",
+            format!("`paqetz warp repair` restarts {IFACE}"),
+            Some(Fix::Interface),
+        )),
+        Reach::Beyond | Reach::Unknown => {}
+    }
+
     if let Some(mtu) = seen.mtu
         && mtu < want.inner_mtu
     {
-        out.push(Ailment::blocking(
-            "WARP MTU",
-            format!(
-                "{IFACE} carries {mtu}, the tunnel carries {}",
-                want.inner_mtu
+        let detail = format!(
+            "{IFACE} carries {mtu}, the tunnel carries {}",
+            want.inner_mtu
+        );
+        let symptom = format!(
+            "a forwarded packet larger than {mtu} is discarded on the way into WARP, which is \
+             why a connection opens and then stops"
+        );
+        let narrow_uplink = format!(
+            "this host's uplink is what is narrow, and the tunnel has to fit inside it: set \
+             interface.mtu = {mtu} at both ends and restart both. Check it with `ping -M do -s \
+             <mtu minus 28> -I <this end\'s tunnel address> 1.1.1.1`, because an MTU set too \
+             large is discarded in silence rather than refused"
+        );
+        let pinned = match &seen.profile {
+            Profile::Read(p) => profile_value(p, "MTU")
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|pin| *pin < want.inner_mtu),
+            Profile::Absent | Profile::Unreadable => None,
+        };
+        out.push(match (pinned, &seen.profile) {
+            (Some(pin), _) => Ailment::blocking(
+                "WARP MTU",
+                format!("{detail}, because the profile pins MTU = {pin}"),
+                format!(
+                    "`paqetz warp repair` removes the pin, so wg-quick sizes {IFACE} from this \
+                     host's uplink: 1420 on an ordinary 1500 link. Until then {symptom}"
+                ),
+                Some(Fix::Profile),
             ),
-            format!(
-                "a forwarded packet larger than {mtu} is discarded on the way into WARP, which \
-                 is why a connection opens and then stops. Either raise WARP (`MTU = 1420` in \
-                 /etc/wireguard/{IFACE}.conf, then restart wg-quick@{IFACE}), which keeps the \
-                 tunnel's throughput and is what wgcf's conservative default is giving up, or \
-                 set interface.mtu = {mtu} at both ends and restart both. Check whichever you \
-                 pick: `ping -M do -s <mtu minus 28> -I <this end\'s tunnel address> 1.1.1.1`, \
-                 because an MTU set too large is discarded in silence rather than refused"
+            (None, Profile::Read(_)) => Ailment::blocking(
+                "WARP MTU",
+                detail,
+                format!("{symptom}. The profile pins nothing, so {narrow_uplink}"),
+                None,
             ),
-            None,
-        ));
+            (None, _) => Ailment::blocking(
+                "WARP MTU",
+                detail,
+                format!(
+                    "{symptom}. If /etc/wireguard/{IFACE}.conf pins an MTU, `paqetz warp repair` \
+                     removes it. If not, {narrow_uplink}"
+                ),
+                None,
+            ),
+        });
     }
 
     if want.blanket && (seen.selective || seen.destinations > 0) {
@@ -1345,11 +1447,13 @@ fn observe(want: &Want) -> Seen {
         // itself produces for a process that is not root.
         Err(_) => Profile::Unreadable,
     };
+    let interface = interface_exists(IFACE);
+    let handshake = handshake_age();
     Seen {
-        interface: interface_exists(IFACE),
+        interface,
         unit_enabled: unit_enabled(&format!("wg-quick@{IFACE}")),
         profile,
-        handshake: handshake_age(),
+        handshake,
         routes: capture("ip", &["-4", "route", "show", "table", &table]).unwrap_or_default(),
         routes6: capture("ip", &["-6", "route", "show", "table", &table]).unwrap_or_default(),
         mtu: std::fs::read_to_string(format!("/sys/class/net/{IFACE}/mtu"))
@@ -1357,6 +1461,99 @@ fn observe(want: &Want) -> Seen {
             .and_then(|s| s.trim().parse().ok()),
         selective: capture("nft", &["list", "table", "inet", NFT_TABLE]).is_ok(),
         destinations: read_extras().len(),
+        // Only asked of a link that could answer. A silent probe waits out its
+        // timeout, and the checks before this one already say why a missing or
+        // never-handshaked interface carries nothing.
+        reach: if interface && matches!(handshake, Handshake::Ago(_)) {
+            reach()
+        } else {
+            Reach::Unknown
+        },
+    }
+}
+
+/// Fetched through WARP to see whether it reaches past Cloudflare.
+///
+/// Neither is on Cloudflare's network, which is the point: anything that is
+/// answers from the same edge that terminates the tunnel. Two operators, so
+/// one having a bad day is not reported as WARP having one. Plain HTTP, since
+/// any answer at all proves the path.
+const BEYOND: [&str; 2] = [
+    "http://connectivitycheck.gstatic.com/generate_204",
+    "http://detectportal.firefox.com/success.txt",
+];
+
+/// The control: Cloudflare's own edge, by address so no lookup is involved.
+const CLOUDFLARE: &str = "http://1.1.1.1/";
+
+/// Whether WARP carries anything past Cloudflare's edge.
+///
+/// A handshake proves only the leg to Cloudflare. The edge terminates each
+/// connection itself, so a WARP that has stopped delivering still completes
+/// every connect at once and then says nothing: to the tunnel, a forwarded
+/// connection that opens and hangs. Only fetching something that is not
+/// Cloudflare's shows it.
+fn reach() -> Reach {
+    // Binding to an interface can need privilege, and when it is refused curl
+    // falls back to binding the interface's address, which routes out this
+    // host's own uplink and answers a different question.
+    if !crate::service::is_root() {
+        return Reach::Unknown;
+    }
+    let mut beyond = Vec::with_capacity(BEYOND.len());
+    for url in BEYOND {
+        let answer = probe(url);
+        if answer == Probe::Answered {
+            return Reach::Beyond;
+        }
+        beyond.push(answer);
+    }
+    reach_of(&beyond, probe(CLOUDFLARE))
+}
+
+/// What the answers add up to.
+fn reach_of(beyond: &[Probe], cloudflare: Probe) -> Reach {
+    if beyond.contains(&Probe::Answered) {
+        return Reach::Beyond;
+    }
+    if beyond.iter().all(|p| *p == Probe::Unrunnable) {
+        return Reach::Unknown;
+    }
+    match cloudflare {
+        Probe::Answered => Reach::OnlyCloudflare,
+        Probe::Silent => Reach::Nothing,
+        Probe::Unrunnable => Reach::Unknown,
+    }
+}
+
+/// One request through the interface, reading only whether anything answered.
+fn probe(url: &str) -> Probe {
+    let Ok(out) = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-m",
+            "5",
+            "-w",
+            "%{http_code}",
+            "--interface",
+            IFACE,
+            url,
+        ])
+        .output()
+    else {
+        return Probe::Unrunnable;
+    };
+    match (
+        String::from_utf8_lossy(&out.stdout).trim(),
+        out.status.code(),
+    ) {
+        (code, _) if !code.is_empty() && code != "000" => Probe::Answered,
+        // The name did not resolve, or the interface could not be bound: both
+        // about this host rather than about WARP.
+        (_, Some(6 | 45)) => Probe::Unrunnable,
+        _ => Probe::Silent,
     }
 }
 
@@ -1409,7 +1606,10 @@ fn rewrite_profile(want: &Want) -> Result<(), Box<dyn std::error::Error>> {
     let path = format!("/etc/wireguard/{IFACE}.conf");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {path}: {e}. This needs root."))?;
-    let fixed = with_keepalive(&profile_for_table(&text, want.table), KEEPALIVE);
+    let fixed = without_narrow_mtu(
+        &with_keepalive(&profile_for_table(&text, want.table), KEEPALIVE),
+        want.inner_mtu,
+    );
     if fixed == text {
         return Ok(());
     }
@@ -1453,6 +1653,35 @@ fn restart_interface() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Adds a keepalive to the peer section, leaving one that is already there.
+/// Drops an MTU the profile pins below what the tunnel carries.
+///
+/// wgcf writes 1280, which is what Cloudflare's own client picks for networks
+/// it knows nothing about, and narrower than a tunnel carrying 1400: every
+/// forwarded packet between the two sizes is discarded on the way in. Without
+/// the line, wg-quick sizes the interface from the route to the endpoint, less
+/// 80 for WireGuard over IPv6, which is 1420 on an ordinary 1500 uplink. A pin
+/// at or above what the tunnel carries was put there on purpose, and stays.
+pub(crate) fn without_narrow_mtu(profile: &str, inner_mtu: u32) -> String {
+    let mut out = String::with_capacity(profile.len());
+    let mut in_interface = false;
+    for line in profile.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_interface = trimmed.eq_ignore_ascii_case("[interface]");
+        }
+        let narrow = in_interface
+            && trimmed.split_once('=').is_some_and(|(k, v)| {
+                k.trim().eq_ignore_ascii_case("mtu")
+                    && v.trim().parse::<u32>().is_ok_and(|m| m < inner_mtu)
+            });
+        if !narrow {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 pub(crate) fn with_keepalive(profile: &str, every: u32) -> String {
     if profile_value(profile, "PersistentKeepalive").is_some() {
         return profile.to_owned();
@@ -1584,6 +1813,34 @@ fn confirm_handshake() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("  no answer on the configured endpoint; trying the others");
     rotate_endpoint()
+}
+
+/// Refuses to finish on a WARP that carries nothing past Cloudflare, which
+/// would otherwise be found as a tunnel whose connections open and hang.
+fn confirm_reach() -> Result<(), Box<dyn std::error::Error>> {
+    match reach() {
+        Reach::Beyond => {
+            println!("  WARP reaches past Cloudflare");
+            Ok(())
+        }
+        Reach::Unknown => {
+            println!("  could not check whether WARP reaches past Cloudflare");
+            Ok(())
+        }
+        Reach::OnlyCloudflare => Err(format!(
+            "WARP reaches Cloudflare and nothing past it, so anything forwarded into it \
+             would open and hang.\n  A fresh registration is the way to find out whether \
+             it is this account: stop wg-quick@{IFACE}, move {STATE_DIR}/wgcf-account.toml, \
+             {STATE_DIR}/wgcf-profile.conf and /etc/wireguard/{IFACE}.conf aside, and run \
+             this again."
+        )
+        .into()),
+        Reach::Nothing => Err(format!(
+            "WARP has handshaked but carries nothing, not even to Cloudflare. \
+             Try `paqetz warp repair`, which restarts {IFACE}."
+        )
+        .into()),
+    }
 }
 
 /// Nudges the interface and waits for a handshake, for at most `patience`.
@@ -1725,6 +1982,7 @@ mod tests {
             mtu: Some(1280),
             selective: false,
             destinations: 0,
+            reach: Reach::Beyond,
         }
     }
 
@@ -1741,6 +1999,46 @@ mod tests {
         let mut found = diagnose(seen, want);
         assert_eq!(found.len(), 1, "{found:#?}");
         found.remove(0)
+    }
+
+    #[test]
+    fn a_warp_that_answers_only_for_cloudflare_is_found() {
+        // What a Stockholm server showed: 1.1.1.1 answered through WARP,
+        // Telegram and every website opened a connection and heard nothing.
+        let found = only(
+            &Seen {
+                reach: Reach::OnlyCloudflare,
+                ..healthy()
+            },
+            &blanket(),
+        );
+        assert!(found.blocking);
+        assert!(found.detail.contains("nothing past it"), "{found:?}");
+        assert!(found.remedy.contains("wgcf-account.toml"), "{found:?}");
+    }
+
+    #[test]
+    fn what_the_probes_add_up_to() {
+        use Probe::{Answered, Silent, Unrunnable};
+        assert_eq!(reach_of(&[Silent, Answered], Silent), Reach::Beyond);
+        assert_eq!(reach_of(&[Silent, Silent], Answered), Reach::OnlyCloudflare);
+        assert_eq!(reach_of(&[Silent, Silent], Silent), Reach::Nothing);
+        // A host whose own resolver is broken has not shown anything about
+        // WARP, and saying WARP is broken would send the operator the wrong way.
+        assert_eq!(
+            reach_of(&[Unrunnable, Unrunnable], Answered),
+            Reach::Unknown
+        );
+        assert_eq!(reach_of(&[Silent, Silent], Unrunnable), Reach::Unknown);
+    }
+
+    #[test]
+    fn a_reach_that_could_not_be_checked_is_not_reported() {
+        let seen = Seen {
+            reach: Reach::Unknown,
+            ..healthy()
+        };
+        assert!(diagnose(&seen, &blanket()).is_empty());
     }
 
     #[test]
@@ -1819,6 +2117,46 @@ mod tests {
         let found = only(&seen, &blanket());
         assert!(!found.blocking);
         assert_eq!(found.fix, Some(Fix::Endpoint));
+    }
+
+    #[test]
+    fn wgcf_s_narrow_mtu_is_repaired_rather_than_worked_around() {
+        let seen = Seen {
+            mtu: Some(1280),
+            profile: Profile::Read(profile().replace(
+                "Address = 172.16.0.2/32\n",
+                "Address = 172.16.0.2/32\nMTU = 1280\n",
+            )),
+            ..healthy()
+        };
+        let want = Want {
+            inner_mtu: 1400,
+            ..blanket()
+        };
+        let found = only(&seen, &want);
+        assert!(found.blocking);
+        assert_eq!(found.fix, Some(Fix::Profile));
+        assert!(found.detail.contains("MTU = 1280"), "{found:?}");
+    }
+
+    #[test]
+    fn only_an_mtu_narrower_than_the_tunnel_is_taken_out() {
+        let pinned = |mtu: &str| {
+            format!(
+                "[Interface]\nPrivateKey = abc\nMTU = {mtu}\n\n[Peer]\nPublicKey = def\nMTU = 1\n"
+            )
+        };
+        let out = without_narrow_mtu(&pinned("1280"), 1400);
+        assert!(!out.contains("MTU = 1280"), "{out}");
+        // An operator's own wider value was chosen on purpose.
+        assert_eq!(without_narrow_mtu(&pinned("1420"), 1400), pinned("1420"));
+        // Only [Interface] sets the interface's MTU; a key of the same name
+        // elsewhere is not this program's to touch.
+        assert!(out.contains("MTU = 1\n"), "{out}");
+        assert!(out.contains("PrivateKey = abc"), "{out}");
+        // Run again, it changes nothing, so a repair does not restart WARP
+        // for no reason.
+        assert_eq!(without_narrow_mtu(&out, 1400), out);
     }
 
     #[test]

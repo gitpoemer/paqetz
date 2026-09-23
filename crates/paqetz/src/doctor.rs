@@ -22,6 +22,12 @@ pub(crate) enum Verdict {
     Pass,
     /// Works, but something is worth knowing.
     Warn,
+    /// The tunnel runs, but part of what it forwards will not get through.
+    ///
+    /// Kept apart from [`Fail`](Self::Fail) because this report also gates the
+    /// service's start. Refusing to start over the egress takes down the tunnel
+    /// itself, and with it the way in to fix the egress.
+    Degraded,
     /// The tunnel will not work until this is fixed.
     Fail,
 }
@@ -31,7 +37,7 @@ impl fmt::Display for Verdict {
         match self {
             Self::Pass => write!(f, "\x1b[32m ok \x1b[0m"),
             Self::Warn => write!(f, "\x1b[33mwarn\x1b[0m"),
-            Self::Fail => write!(f, "\x1b[31mFAIL\x1b[0m"),
+            Self::Degraded | Self::Fail => write!(f, "\x1b[31mFAIL\x1b[0m"),
         }
     }
 }
@@ -63,6 +69,19 @@ impl Finding {
         Self {
             what: what.into(),
             verdict: Verdict::Warn,
+            detail: detail.into(),
+            remedy: Some(remedy.into()),
+        }
+    }
+
+    fn degraded(
+        what: impl Into<String>,
+        detail: impl Into<String>,
+        remedy: impl Into<String>,
+    ) -> Self {
+        Self {
+            what: what.into(),
+            verdict: Verdict::Degraded,
             detail: detail.into(),
             remedy: Some(remedy.into()),
         }
@@ -157,13 +176,26 @@ fn print(findings: &[Finding]) -> bool {
         .iter()
         .filter(|f| f.verdict == Verdict::Warn)
         .count();
+    let degraded = findings
+        .iter()
+        .filter(|f| f.verdict == Verdict::Degraded)
+        .count();
     println!();
     if fails > 0 {
         println!("{fails} problem(s) will stop the tunnel working.");
-    } else if warns > 0 {
-        println!("Nothing blocking, {warns} thing(s) worth knowing.");
-    } else {
-        println!("Everything checks out.");
+    }
+    if degraded > 0 {
+        println!(
+            "{degraded} problem(s) with where the tunnel sends what it forwards. The tunnel \
+             will start, but that traffic will not get through."
+        );
+    }
+    if fails == 0 && degraded == 0 {
+        if warns > 0 {
+            println!("Nothing blocking, {warns} thing(s) worth knowing.");
+        } else {
+            println!("Everything checks out.");
+        }
     }
     worst_ok
 }
@@ -515,7 +547,7 @@ fn check_warp(cfg: &TunnelConfig) -> Vec<Finding> {
         .map(|a| Finding {
             what: a.what.to_owned(),
             verdict: if a.blocking {
-                Verdict::Fail
+                Verdict::Degraded
             } else {
                 Verdict::Warn
             },
@@ -621,7 +653,7 @@ fn check_return_path(cfg: &TunnelConfig) -> Option<Finding> {
     Some(if via == device {
         Finding::pass("return path", format!("{ours} → {theirs} by {device}"))
     } else {
-        Finding::fail(
+        Finding::degraded(
             "return path",
             format!(
                 "{ours} → {theirs} leaves by {via}, so the peer's pings to this end go \
@@ -798,6 +830,20 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+
+    #[test]
+    fn a_broken_egress_is_reported_without_keeping_the_tunnel_down() {
+        // The service runs this report before it starts and stays down on a
+        // failure. A WARP fault that did that took the tunnel with it, and the
+        // tunnel is the way in to fix WARP.
+        let warp = Finding::degraded("WARP MTU", "warp carries 1280", "repair");
+        assert!(
+            super::print(std::slice::from_ref(&warp)),
+            "an egress fault kept the service down"
+        );
+        let broken = Finding::fail("configuration", "does not parse", "fix it");
+        assert!(!super::print(&[warp, broken]));
+    }
 
     #[test]
     fn a_reply_swept_into_the_egress_table_is_read_off_the_route() {
