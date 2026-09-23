@@ -1177,12 +1177,24 @@ fn xray_command(
         }
         XrayAction::Update { prefix } => {
             let before = xray::installed_version(&prefix);
-            let after = xray::install(None, &prefix)?;
-            match before {
-                Some(b) if b == after => println!("\nAlready at {after}."),
-                Some(b) => println!("\nUpdated {b} to {after}."),
-                None => println!("\nInstalled {after}."),
+            let latest = xray::latest_version()?;
+            if before.as_deref() == Some(latest.as_str()) {
+                // Nothing to download, but the routing data moves faster than
+                // Xray does, and this was the command that refreshed it.
+                xray::install_rules(&prefix)?;
+                println!(
+                    "\nAlready at {latest}, the latest stable release. Routing data refreshed."
+                );
+            } else {
+                xray::install(Some(&latest), &prefix)?;
+                match before {
+                    Some(b) => println!("\nUpdated {b} to {latest}."),
+                    None => println!("\nInstalled {latest}."),
+                }
             }
+            // Neither is read again until Xray restarts, and restarting drops
+            // every connection it is carrying, so that is left to the operator.
+            println!("Restart Xray to use it: systemctl restart xray");
             Ok(())
         }
     }

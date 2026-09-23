@@ -109,12 +109,7 @@ pub(crate) fn install_rules(prefix: &str) -> Result<(), Box<dyn std::error::Erro
             Err(_) => println!("    no published checksum; installed unverified"),
         }
 
-        std::fs::copy(&tmp, &target)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))?;
-        }
+        replace(&tmp, &target, 0o644)?;
         let _ = std::fs::remove_file(&tmp);
         println!("    installed {target}");
     }
@@ -419,6 +414,44 @@ pub(crate) const SUGGESTED_DESTINATIONS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_in_use_is_replaced_under_its_reader_not_rewritten_beneath_it() {
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("paqetz-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let target = dir.join("xray");
+        let fresh = dir.join("fresh");
+        std::fs::write(&target, "old binary").expect("write");
+        std::fs::write(&fresh, "new binary").expect("write");
+
+        // Stands in for the running Xray: it opened the file before the update.
+        let mut held = std::fs::File::open(&target).expect("open");
+        replace(&fresh, &target.display().to_string(), 0o755).expect("replace");
+
+        let mut seen = String::new();
+        held.read_to_string(&mut seen).expect("read");
+        assert_eq!(
+            seen, "old binary",
+            "the running process had its file rewritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read"),
+            "new binary"
+        );
+        let mode = std::fs::metadata(&target)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+        assert!(
+            !dir.join("xray.paqetz-new").exists(),
+            "the staged copy was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn plan() -> Plan {
         Plan {
@@ -884,7 +917,7 @@ fn capture(program: &str, args: &[&str]) -> Result<String, Box<dyn std::error::E
 }
 
 /// The latest published version tag.
-fn latest_version() -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn latest_version() -> Result<String, Box<dyn std::error::Error>> {
     let body = capture(
         "curl",
         &[
@@ -1012,12 +1045,7 @@ pub(crate) fn install(
 
     let target = format!("{prefix}/xray");
     std::fs::create_dir_all(prefix)?;
-    std::fs::copy(dir.join("xray"), &target)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
-    }
+    replace(&dir.join("xray"), &target, 0o755)?;
     let _ = std::fs::remove_dir_all(&dir);
 
     println!("  installed {version} to {target}");
@@ -1029,6 +1057,24 @@ pub(crate) fn install(
     install_rules(prefix)?;
 
     Ok(version)
+}
+
+/// Puts a copy of `source` at `target` by renaming it over the old one.
+///
+/// Copying onto the target rewrites the file in place, and the target is in
+/// use: the kernel refuses to rewrite the binary a running Xray is executing
+/// ("Text file busy"), and the data files belong to that same process. A
+/// rename swaps which file the name points at in one step, so the running
+/// process keeps what it opened and the next start gets the new one. Staged
+/// beside the target so the rename never crosses a filesystem.
+fn replace(source: &std::path::Path, target: &str, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let staged = format!("{target}.paqetz-new");
+    std::fs::copy(source, &staged)?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&staged, target).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })
 }
 
 /// A systemd unit that runs Xray with the generated configuration.
