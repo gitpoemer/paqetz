@@ -1330,14 +1330,10 @@ pub(crate) fn diagnose(seen: &Seen, want: &Want) -> Vec<Ailment> {
             "WARP egress",
             "WARP reaches Cloudflare and nothing past it: the edge accepts each connection \
              and never delivers it",
-            format!(
-                "every forwarded connection opens and then hangs, so turn egress off to stay \
-                 online while this lasts. Whether Cloudflare is limiting this account or \
-                 refusing what it carries, a fresh registration is the way to find out: stop \
-                 wg-quick@{IFACE}, move {STATE_DIR}/wgcf-account.toml, \
-                 {STATE_DIR}/wgcf-profile.conf and /etc/wireguard/{IFACE}.conf aside, then \
-                 `paqetz warp setup`"
-            ),
+            "every forwarded connection opens and then hangs, so turn egress off to stay \
+             online while this lasts. Whether Cloudflare is limiting this account or refusing \
+             what it carries, a fresh registration is the way to find out: \
+             `paqetz warp reregister`",
             None,
         )),
         Reach::Nothing => out.push(Ailment::blocking(
@@ -1827,14 +1823,10 @@ fn confirm_reach() -> Result<(), Box<dyn std::error::Error>> {
             println!("  could not check whether WARP reaches past Cloudflare");
             Ok(())
         }
-        Reach::OnlyCloudflare => Err(format!(
-            "WARP reaches Cloudflare and nothing past it, so anything forwarded into it \
-             would open and hang.\n  A fresh registration is the way to find out whether \
-             it is this account: stop wg-quick@{IFACE}, move {STATE_DIR}/wgcf-account.toml, \
-             {STATE_DIR}/wgcf-profile.conf and /etc/wireguard/{IFACE}.conf aside, and run \
-             this again."
-        )
-        .into()),
+        Reach::OnlyCloudflare => Err("WARP reaches Cloudflare and nothing past it, so anything \
+             forwarded into it would open and hang.\n  A fresh registration is the way to \
+             find out whether it is this account: `paqetz warp reregister`."
+            .into()),
         Reach::Nothing => Err(format!(
             "WARP has handshaked but carries nothing, not even to Cloudflare. \
              Try `paqetz warp repair`, which restarts {IFACE}."
@@ -1952,9 +1944,180 @@ pub(crate) fn repair(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Replaces the WARP account with a fresh one.
+///
+/// Cloudflare can stop carrying an account's traffic past its own edge while
+/// the account still handshakes, and a new registration is what brings it
+/// back. The old files are kept one registration deep, and put back if the new
+/// one cannot be brought up at all, so a refused registration costs nothing
+/// but the attempt.
+pub(crate) fn reregister(config: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Up front rather than per step: a run that could move the old account
+    // aside but not register a new one would leave nothing working.
+    if !crate::service::is_root() {
+        return Err("this replaces WARP's credentials, so it needs root: \
+                    sudo paqetz warp reregister"
+            .into());
+    }
+    let cfg = crate::config::Config::load(config)?;
+    let tunnel = cfg
+        .tunnels
+        .first()
+        .ok_or("the configuration has no tunnel in it")?;
+    let files = registration_files();
+    if !files
+        .iter()
+        .any(|f| f.ends_with("wgcf-account.toml") && Path::new(f).exists())
+    {
+        return Err(
+            "there is no WARP registration to replace. `paqetz warp setup` makes the \
+                    first one."
+                .into(),
+        );
+    }
+    preflight()?;
+    install_wgcf()?;
+
+    let unit = format!("wg-quick@{IFACE}");
+    let previous = Path::new(STATE_DIR).join("previous");
+    // One step back, not a history: an account that has been replaced is not
+    // coming back into use.
+    let _ = std::fs::remove_dir_all(&previous);
+    std::fs::create_dir_all(&previous)?;
+    let _ = crate::service::run_elevated("systemctl", &["stop", &unit]);
+    set_aside(&files, &previous)?;
+    println!("  the old registration is in {}", previous.display());
+
+    let fresh = || -> Result<(), Box<dyn std::error::Error>> {
+        let dir = Path::new(STATE_DIR);
+        register(dir)?;
+        generate_profile(dir, tunnel.interface.mtu)?;
+        bring_up()?;
+        confirm_handshake()
+    };
+    if let Err(e) = fresh() {
+        let _ = crate::service::run_elevated("systemctl", &["stop", &unit]);
+        put_back(&files, &previous)?;
+        crate::service::run_elevated("systemctl", &["start", &unit])?;
+        return Err(format!(
+            "{e}\n  The previous registration is back in place, and {IFACE} is running on it."
+        )
+        .into());
+    }
+
+    match reach() {
+        Reach::Beyond => println!("\nWARP has a new registration, and reaches past Cloudflare."),
+        Reach::Unknown => println!(
+            "\nWARP has a new registration. Whether it reaches past Cloudflare could not be \
+             checked."
+        ),
+        // Kept rather than rolled back: the old one was being replaced for
+        // failing the same way, and a fresh account is no worse.
+        Reach::OnlyCloudflare => {
+            return Err(format!(
+                "the new registration reaches only Cloudflare as well, so it is not the \
+                 account: Cloudflare is not carrying what this server sends through it. Turn \
+                 egress off to stay online. The previous registration is in {}.",
+                previous.display()
+            )
+            .into());
+        }
+        Reach::Nothing => {
+            return Err(
+                "the new registration handshakes and carries nothing. `paqetz warp repair` \
+                 restarts it."
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The files one registration consists of: the account, the profile wgcf
+/// generated from it, and the profile wg-quick reads.
+fn registration_files() -> [String; 3] {
+    [
+        format!("{STATE_DIR}/wgcf-account.toml"),
+        format!("{STATE_DIR}/wgcf-profile.conf"),
+        format!("/etc/wireguard/{IFACE}.conf"),
+    ]
+}
+
+/// Moves each of `files` that exists into `into`, under its own name.
+fn set_aside(files: &[String], into: &Path) -> std::io::Result<()> {
+    for file in files {
+        let from = Path::new(file);
+        if let Some(name) = from.file_name()
+            && from.exists()
+        {
+            move_file(from, &into.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// Undoes [`set_aside`]: whatever is at each path now goes, and the kept copy
+/// comes back. A file the attempt created where there was none before goes too,
+/// or it would sit beside an account it does not belong to.
+fn put_back(files: &[String], from: &Path) -> std::io::Result<()> {
+    for file in files {
+        let to = Path::new(file);
+        let _ = std::fs::remove_file(to);
+        if let Some(name) = to.file_name() {
+            let kept = from.join(name);
+            if kept.exists() {
+                move_file(&kept, to)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A rename, or a copy and delete where the two paths are on different
+/// filesystems and a rename cannot cross.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to).or_else(|_| {
+        std::fs::copy(from, to)?;
+        std::fs::remove_file(from)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_registration_puts_the_old_one_back_exactly() {
+        let root = std::env::temp_dir().join(format!("paqetz-rereg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let previous = root.join("previous");
+        std::fs::create_dir_all(&previous).expect("temp dir");
+        let at = |name: &str| root.join(name).display().to_string();
+        let files = [
+            at("wgcf-account.toml"),
+            at("wgcf-profile.conf"),
+            at("warp.conf"),
+        ];
+        std::fs::write(&files[0], "old account").expect("write");
+        std::fs::write(&files[2], "old profile").expect("write");
+
+        set_aside(&files, &previous).expect("set aside");
+        assert!(!Path::new(&files[0]).exists() && !Path::new(&files[2]).exists());
+
+        // The attempt got as far as a new account and a wgcf profile.
+        std::fs::write(&files[0], "new account").expect("write");
+        std::fs::write(&files[1], "new wgcf profile").expect("write");
+
+        put_back(&files, &previous).expect("put back");
+        let read = |f: &String| std::fs::read_to_string(f).expect("read");
+        assert_eq!(read(&files[0]), "old account");
+        assert_eq!(read(&files[2]), "old profile");
+        assert!(
+            !Path::new(&files[1]).exists(),
+            "a profile generated for the refused account was left beside the old one"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn profile() -> String {
         format!(
@@ -2014,7 +2177,7 @@ mod tests {
         );
         assert!(found.blocking);
         assert!(found.detail.contains("nothing past it"), "{found:?}");
-        assert!(found.remedy.contains("wgcf-account.toml"), "{found:?}");
+        assert!(found.remedy.contains("warp reregister"), "{found:?}");
     }
 
     #[test]

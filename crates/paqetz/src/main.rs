@@ -233,6 +233,12 @@ enum WarpAction {
     /// including trying Cloudflare's other endpoints when the usual one is
     /// unreachable from this network.
     Repair,
+    /// Replace the WARP account with a freshly registered one.
+    ///
+    /// For when WARP handshakes but carries nothing past Cloudflare. The old
+    /// account is kept in /etc/paqetz/warp/previous, and put back if the new
+    /// one cannot be brought up.
+    Reregister,
     /// Take the routing, interface and timer out again.
     Revert {
         /// Also discard the WARP account and remove wgcf.
@@ -429,6 +435,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WarpAction::Refresh => warp::refresh(&cli.config),
             WarpAction::Status => warp::status(&cli.config),
             WarpAction::Repair => warp::repair(&cli.config),
+            WarpAction::Reregister => warp::reregister(&cli.config),
             WarpAction::Revert { purge } => warp::revert(purge),
         },
         Command::Firewall { action } => firewall(action, &cli.config),

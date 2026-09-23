@@ -637,6 +637,7 @@ is dropped.
 paqetz warp status    # what is in place, and which shape is configured
 paqetz doctor         # read-only, with the rest of the host
 paqetz warp repair    # fix it
+paqetz warp reregister  # replace the WARP account, when it reaches only Cloudflare
 ```
 
 What it looks for, and why each one is silent from the tunnel's side:
@@ -646,7 +647,7 @@ What it looks for, and why each one is silent from the tunnel's side:
 | the profile names no `Table` | `wg-quick` puts WARP's default route in `main`, so the host's own traffic, the tunnel's carrier and your SSH session all leave through Cloudflare |
 | the profile names a different table | the source rule steers into a table with nothing in it, the lookup falls through to `main`, and the traffic leaves by the address WARP was installed to avoid |
 | no handshake, ever | the interface is up and discards everything. Usually the endpoint is unreachable from this network |
-| WARP reaches Cloudflare and nothing past it | every forwarded connection opens and then hangs. Cloudflare's edge completes each connect itself, so a handshake, `ping 1.1.1.1` and `cdn-cgi/trace` all still pass. Checked by fetching Google's and Fastly's connectivity pages through WARP, with `1.1.1.1` as the control, as root. A fresh registration is the way back: stop `wg-quick@warp`, move `/etc/paqetz/warp/wgcf-account.toml`, `wgcf-profile.conf` and `/etc/wireguard/warp.conf` aside, and run `paqetz warp setup`, which now refuses to finish on a WARP like this |
+| WARP reaches Cloudflare and nothing past it | every forwarded connection opens and then hangs. Cloudflare's edge completes each connect itself, so a handshake, `ping 1.1.1.1` and `cdn-cgi/trace` all still pass. Checked by fetching Google's and Fastly's connectivity pages through WARP, with `1.1.1.1` as the control, as root. A fresh registration is the way back: `paqetz warp reregister` keeps the old account in `/etc/paqetz/warp/previous`, registers a new one, and puts the old one back if the new one cannot be brought up. `warp setup` refuses to finish on a WARP like this |
 | WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not. `wgcf` writes 1280 and the tunnel carries 1400, so this is the common one on a server whose network is otherwise fine. `setup` and `repair` remove that pin (see below) |
 | `wg-quick@warp` not enabled | the next reboot leaves the tunnel forwarding into an interface that is gone |
 | the server's replies to its own client leave by WARP | one-way: the server can ping the client, the client cannot ping the server, and nothing the client opens on the server's inner address is answered. The egress rule selects on the tunnel's source subnet, which includes the server's own inner address, so paqetz puts a `to <subnet> lookup main` rule in front of it. `doctor` asks the kernel which way a reply would leave; restarting paqetz reinstalls the rule |
