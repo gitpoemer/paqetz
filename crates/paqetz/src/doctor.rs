@@ -124,6 +124,7 @@ pub(crate) fn run(path: &Path) -> bool {
             }
         }
         findings.extend(check_warp(t));
+        findings.extend(check_return_path(t));
         findings.push(check_peer_route(t));
         findings.push(check_inner_addresses(t));
         findings.extend(check_inner_ipv6(t));
@@ -596,6 +597,49 @@ fn check_peer_route(cfg: &TunnelConfig) -> Finding {
     }
 }
 
+/// Whether what this end sends the peer from its own inner address goes back
+/// through the tunnel.
+///
+/// An egress rule selecting on the tunnel's source subnet also catches this
+/// end's own inner address, and then every reply to the peer leaves by the
+/// egress interface. This end can still ping the peer, because that lookup
+/// happens before a source is chosen, while the peer's pings go unanswered.
+///
+/// Asked of the kernel as a route lookup rather than read off `ip rule`, so
+/// the answer holds however the rules were arrived at.
+fn check_return_path(cfg: &TunnelConfig) -> Option<Finding> {
+    cfg.interface.egress.as_ref()?;
+    let device = &cfg.interface.device;
+    // Not running: there is no inner address to answer from yet.
+    if !Path::new(&format!("/sys/class/net/{device}")).exists() {
+        return None;
+    }
+    let ours = cfg.interface.address.to_string();
+    let theirs = cfg.peer.tunnel_address.to_string();
+    let route = capture("ip", &["-4", "route", "get", &theirs, "from", &ours])?;
+    let via = leaves_by(&route)?;
+    Some(if via == device {
+        Finding::pass("return path", format!("{ours} → {theirs} by {device}"))
+    } else {
+        Finding::fail(
+            "return path",
+            format!(
+                "{ours} → {theirs} leaves by {via}, so the peer's pings to this end go \
+                 unanswered and nothing it opens here gets a reply"
+            ),
+            "restart paqetz, which installs the rule that keeps the tunnel's own subnet out \
+             of the egress table",
+        )
+    })
+}
+
+/// The interface an `ip route get` answer names.
+fn leaves_by(route: &str) -> Option<&str> {
+    let mut words = route.split_whitespace();
+    words.find(|w| *w == "dev")?;
+    words.next()
+}
+
 /// Whether the inner addresses make sense together.
 fn check_inner_addresses(cfg: &TunnelConfig) -> Finding {
     let ours = cfg.interface.address;
@@ -754,6 +798,17 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
+
+    #[test]
+    fn a_reply_swept_into_the_egress_table_is_read_off_the_route() {
+        // Both taken from `ip -4 route get 10.7.0.2 from 10.7.0.1` on a server
+        // with WARP as its egress, before and after the exception rule.
+        let swept = "10.7.0.2 from 10.7.0.1 dev warp table 51820 uid 0 \n    cache \n";
+        let kept = "10.7.0.2 from 10.7.0.1 dev paqetz0 uid 0 \n    cache \n";
+        assert_eq!(super::leaves_by(swept), Some("warp"));
+        assert_eq!(super::leaves_by(kept), Some("paqetz0"));
+        assert_eq!(super::leaves_by(""), None);
+    }
 
     #[test]
     fn a_dropping_forward_chain_with_no_rule_for_us_is_a_failure() {

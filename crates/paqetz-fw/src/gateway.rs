@@ -80,6 +80,18 @@ pub struct Egress {
 /// table. Below the SOCKS5 mark rule so the two do not interleave.
 const EGRESS_RULE_PRIORITY: u32 = 9100;
 
+/// Priority of the rule that keeps the tunnel's own subnet out of the egress
+/// table. Consulted first, or the rule below it sweeps the subnet up.
+const EGRESS_LOCAL_PRIORITY: u32 = EGRESS_RULE_PRIORITY - 1;
+
+// Rules are consulted lowest number first, and these three have to stay in
+// this order: a lane picks its own way out, then the tunnel's own subnet stays
+// on the tunnel, and only then is the rest swept to the egress. Swap the last
+// two and the server's replies to its own client leave by the egress
+// interface, which is the failure the rule above exists for.
+const _: () = assert!(LANE_RULE_PRIORITY < EGRESS_LOCAL_PRIORITY);
+const _: () = assert!(EGRESS_LOCAL_PRIORITY < EGRESS_RULE_PRIORITY);
+
 impl Gateway {
     /// The commands and settings [`apply`](Self::apply) would put in place.
     #[must_use]
@@ -191,6 +203,7 @@ table ip6 {TABLE} {{
         // it, including the tunnel's, which would collapse the tunnel.
         if let Some(e) = self.egress.as_ref() {
             let (net, prefix) = self.subnet;
+            keep_inner_local("-4", &format!("{net}/{prefix}"))?;
             point_source_at("-4", &format!("{net}/{prefix}"), e.table)?;
         }
 
@@ -201,6 +214,7 @@ table ip6 {TABLE} {{
             }
             nft_script(&rules)?;
             if let (Some(e), Some((net, prefix))) = (self.egress.as_ref(), self.subnet6) {
+                keep_inner_local("-6", &format!("{net}/{prefix}"))?;
                 point_source_at("-6", &format!("{net}/{prefix}"), e.table)?;
             }
         }
@@ -212,8 +226,10 @@ table ip6 {TABLE} {{
         if let Some(e) = self.egress.as_ref() {
             let (net, prefix) = self.subnet;
             unpoint_source("-4", &format!("{net}/{prefix}"), e.table);
+            unkeep_inner_local("-4", &format!("{net}/{prefix}"));
             if let Some((net, prefix)) = self.subnet6 {
                 unpoint_source("-6", &format!("{net}/{prefix}"), e.table);
+                unkeep_inner_local("-6", &format!("{net}/{prefix}"));
             }
         }
         let _ = nft_script(&format!("add table ip {TABLE}\ndelete table ip {TABLE}\n"));
@@ -241,6 +257,43 @@ fn point_source_at(family: &str, from: &str, table: u32) -> Result<()> {
     run_ip(&[
         family, "rule", "add", "from", from, "lookup", &table, "priority", &prio,
     ])
+}
+
+/// Keeps traffic to the tunnel's own subnet out of the egress table.
+///
+/// The rule below this one selects on source, and the server's own inner
+/// address is inside the subnet it names. So a packet the server originates
+/// from that address is swept into the egress table, whose only route is a
+/// default out of the egress interface, and the client is not reachable that
+/// way.
+///
+/// What that looks like is a tunnel that carries traffic one way. The server
+/// can ping the client, because `ping` leaves the source unset and a rule
+/// selecting on source does not match an unset one, so the lookup falls
+/// through to the main table. The reply to a ping *from* the client is built
+/// with the source already decided, matches, and leaves by the egress
+/// interface instead of the tunnel. Nothing reports an error at either end.
+///
+/// Selecting on destination rather than source, which also settles the reverse
+/// path check: that lookup swaps the two addresses, so without this rule it
+/// answers with the egress interface and strict `rp_filter` drops the packet
+/// before anything can reply to it at all.
+fn keep_inner_local(family: &str, subnet: &str) -> Result<()> {
+    unkeep_inner_local(family, subnet);
+    let prio = EGRESS_LOCAL_PRIORITY.to_string();
+    run_ip(&[
+        family, "rule", "add", "to", subnet, "lookup", "main", "priority", &prio,
+    ])
+}
+
+/// Removes such a rule, however many times it was added.
+fn unkeep_inner_local(family: &str, subnet: &str) {
+    let prio = EGRESS_LOCAL_PRIORITY.to_string();
+    while run_ip(&[
+        family, "rule", "del", "to", subnet, "lookup", "main", "priority", &prio,
+    ])
+    .is_ok()
+    {}
 }
 
 /// Removes such a rule, however many times it was added.

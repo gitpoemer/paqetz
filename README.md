@@ -313,7 +313,7 @@ its own, which `paqetz doctor` works out for you:
 | --- | --- | --- |
 | client with `route_marked` or `[socks5]` | `ip rule fwmark …` | yes |
 | client with `route_all` | routes, not rules | yes — `ManageForeignRoutes` defaults to yes too |
-| server with `egress` (WARP) | `ip rule from <subnet> …` | yes |
+| server with `egress` (WARP) | `ip rule to <subnet> lookup main`, `ip rule from <subnet> …` | yes |
 | plain point-to-point server | nothing | no |
 
 `paqetz setup` offers this, and `paqetz doctor` reports it as a **failure** when
@@ -648,6 +648,7 @@ What it looks for, and why each one is silent from the tunnel's side:
 | no handshake, ever | the interface is up and discards everything. Usually the endpoint is unreachable from this network |
 | WARP's MTU is below the tunnel's | a connection opens and then stops: the handshake fits, the first full-size packet does not. `wgcf` writes 1280 and the tunnel carries 1400, so this is the common one on a server whose network is otherwise fine |
 | `wg-quick@warp` not enabled | the next reboot leaves the tunnel forwarding into an interface that is gone |
+| the server's replies to its own client leave by WARP | one-way: the server can ping the client, the client cannot ping the server, and nothing the client opens on the server's inner address is answered. The egress rule selects on the tunnel's source subnet, which includes the server's own inner address, so paqetz puts a `to <subnet> lookup main` rule in front of it. `doctor` asks the kernel which way a reply would leave; restarting paqetz reinstalls the rule |
 | the selective destination table left behind | harmless, and the daily refresh fails every day trying to refresh a list nothing reads |
 
 `repair` rewrites the profile, restarts and enables the interface, and when
