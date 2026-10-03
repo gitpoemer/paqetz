@@ -790,11 +790,13 @@ allowed_ips    = ["0.0.0.0/0"]
 
 Each tunnel needs its **own device, inner subnet and mark** — sharing any of
 them would have two tunnels undoing each other's routing, so the configuration
-is refused rather than run. Each also has its own key, which is what you want
-when three different people run those servers: a compromise of one teaches
-nothing about the others. Everything else is per-tunnel too, including `mtu`,
-`profile` and `sequencing`, so a path that needs a smaller MTU gets one without
-touching the rest.
+is refused rather than run. The same goes for the routing table a mark uses,
+which is the mark's own number unless `route_table` (or `socks5.table`) says
+otherwise, so the example above needs none. Each also has its own key, which
+is what you want when three different people run those servers: a compromise of
+one teaches nothing about the others. Everything else is per-tunnel too,
+including `mtu`, `profile` and `sequencing`, so a path that needs a smaller MTU
+gets one without touching the rest.
 
 One process runs them all. Their status lines are prefixed with the tunnel name,
 and one `nft` table carries the rules for every outer port:

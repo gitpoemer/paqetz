@@ -139,7 +139,8 @@ pub(crate) struct Interface {
     /// the host's ordinary path. `route_all` cannot express that: it would
     /// capture the replies to the proxy's own users too, and break them.
     pub(crate) route_marked: Option<u32>,
-    /// The routing table the mark rule points at.
+    /// The routing table the mark rule points at. The mark's own number
+    /// unless written, so several tunnels never share one by default.
     pub(crate) route_table: u32,
     /// Send the peer's forwarded traffic out this interface instead of the
     /// default route, so the destination sees that interface's address.
@@ -219,7 +220,8 @@ pub(crate) struct Socks5 {
     pub(crate) listen: SocketAddr,
     /// The firewall mark stamped on its outbound connections.
     pub(crate) mark: u32,
-    /// The routing table the policy rule points at.
+    /// The routing table the policy rule points at. The mark's own number
+    /// unless written.
     pub(crate) table: u32,
     /// Credentials clients must present, if any.
     pub(crate) credentials: Option<(String, String)>,
@@ -581,6 +583,29 @@ impl TunnelConfig {
     #[must_use]
     pub(crate) const fn carries_ipv6(&self) -> bool {
         self.interface.address6.is_some()
+    }
+
+    /// Every mark this end steers into the tunnel, with the table it consults.
+    ///
+    /// Each pair is installed as a rule and a default route through this
+    /// tunnel's device. A listener sharing the interface's mark uses the
+    /// interface's table, as `attach` arranges, so the two count once.
+    #[must_use]
+    pub(crate) fn marked_routes(&self) -> Vec<(u32, u32)> {
+        let table = self.interface.route_table;
+        let mut routes: Vec<(u32, u32)> = self
+            .interface
+            .route_marked
+            .into_iter()
+            .chain(self.lanes.iter().filter_map(|l| l.mark))
+            .map(|mark| (mark, table))
+            .collect();
+        if let Some(s5) = &self.socks5
+            && self.interface.route_marked != Some(s5.mark)
+        {
+            routes.push((s5.mark, s5.table));
+        }
+        routes
     }
 }
 
@@ -1015,6 +1040,50 @@ fn interface_name(field: &'static str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The table a marked route uses when it has no number of its own and no mark
+/// to borrow one from: a tunnel whose lanes are marked while `route_marked` is
+/// not.
+const FALLBACK_TABLE: u32 = 51;
+
+/// The routing table a policy route is written into: the one given, or else
+/// the number of the mark that points at it.
+///
+/// The mark rather than one fixed number, because the route in a table is
+/// replaced by whichever tunnel writes it last. A shared default made every
+/// tunnel of a several-server client leave by the one that started last, while
+/// each looked correctly configured on its own.
+///
+/// The tables the kernel already uses are refused, written or borrowed: a
+/// tunnel's default route in `main` replaces the host's own.
+fn policy_table(
+    field: &'static str,
+    written: Option<u32>,
+    mark_field: &str,
+    mark: Option<u32>,
+) -> Result<u32> {
+    let table = written.or(mark).unwrap_or(FALLBACK_TABLE);
+    let kernel = match table {
+        0 => "unspec",
+        253 => "default",
+        254 => "main",
+        255 => "local",
+        _ => return Ok(table),
+    };
+    let problem = if written.is_some() {
+        format!(
+            "{table} is the kernel's `{kernel}` table, which holds this host's own routes; \
+             the tunnel's default route would replace them"
+        )
+    } else {
+        format!(
+            "not set, so it takes the number of {mark_field} = {table} -- and that is the \
+             kernel's `{kernel}` table, which holds this host's own routes. Set {field} \
+             to an unused number"
+        )
+    };
+    Err(invalid(field, problem))
+}
+
 fn invalid(field: &'static str, problem: impl Into<String>) -> Error {
     Error::Invalid {
         field,
@@ -1149,10 +1218,32 @@ impl Config {
                 {
                     return Err(clash("inner address", x.to_string()));
                 }
-                if let (Some(x), Some(y)) = (a.interface.route_marked, b.interface.route_marked)
-                    && x == y
+                // Each marked route is a rule and a default route through one
+                // device. Two rules for one mark leave the choice to insertion
+                // order, and two routes in one table replace each other, so
+                // both tunnels' traffic leaves by whichever started last.
+                // Marks first: a shared mark usually shares its table too, and
+                // the mark is the line to change.
+                let (ours, theirs) = (a.marked_routes(), b.marked_routes());
+                if let Some((mark, _)) = ours
+                    .iter()
+                    .find(|(m, _)| theirs.iter().any(|(n, _)| n == m))
                 {
-                    return Err(clash("mark", x.to_string()));
+                    return Err(clash("mark", mark.to_string()));
+                }
+                if let Some((_, table)) = ours
+                    .iter()
+                    .find(|(_, t)| theirs.iter().any(|(_, u)| u == t))
+                {
+                    return Err(invalid(
+                        "tunnel",
+                        format!(
+                            "{:?} and {:?} both route marked traffic through table {table}, \
+                             and a table holds one tunnel's route. Give one of them its own \
+                             route_table, or socks5.table if the listener is the one sharing it",
+                            a.name, b.name
+                        ),
+                    ));
                 }
                 // The key is the identity. Two tunnels for one peer have
                 // nothing to tell their traffic apart by, so each handshake
@@ -1481,7 +1572,7 @@ impl Config {
                     dns,
                     listen,
                     mark,
-                    table: r.table.unwrap_or(51),
+                    table: policy_table("socks5.table", r.table, "socks5.mark", Some(mark))?,
                     credentials,
                 })
             }
@@ -1499,6 +1590,23 @@ impl Config {
         // After the mark and the listener, because a lane sharing either
         // means the ordinary path is tagged as well and every packet takes it.
         let lanes = lanes(&lane_raw, iface.route_marked, socks5.as_ref())?;
+
+        let route_marked = match iface.route_marked {
+            Some(0) => {
+                return Err(invalid(
+                    "interface.route_marked",
+                    "zero is not a usable mark: an unmarked socket is every \
+                     socket, so the rule would capture the host's own traffic",
+                ));
+            }
+            other => other,
+        };
+        let route_table = policy_table(
+            "interface.route_table",
+            iface.route_table,
+            "interface.route_marked",
+            route_marked,
+        )?;
 
         Ok(TunnelConfig {
             name,
@@ -1715,17 +1823,8 @@ impl Config {
                 },
                 gateway: iface.gateway.unwrap_or(false),
                 route_all: iface.route_all.unwrap_or(false),
-                route_marked: match iface.route_marked {
-                    Some(0) => {
-                        return Err(invalid(
-                            "interface.route_marked",
-                            "zero is not a usable mark: an unmarked socket is every \
-                             socket, so the rule would capture the host's own traffic",
-                        ));
-                    }
-                    other => other,
-                },
-                route_table: iface.route_table.unwrap_or(51),
+                route_marked,
+                route_table,
                 egress: match iface.egress {
                     Some(name) => {
                         interface_name("interface.egress", &name)?;
@@ -2548,6 +2647,108 @@ tunnel_address = "10.7.0.2"
     }
 
     #[test]
+    fn each_tunnel_routes_through_a_table_of_its_own_by_default() {
+        // The several-server example writes no table. With one shared default
+        // the last tunnel to start replaced the others' routes, and every mark
+        // left by it.
+        let c = Config::parse(THREE).expect("parse");
+        let tables: Vec<u32> = c.tunnels.iter().map(|t| t.interface.route_table).collect();
+        assert_eq!(tables, [81, 82, 83]);
+    }
+
+    #[test]
+    fn two_tunnels_writing_one_table_are_refused() {
+        let text = THREE.replace("route_marked = 82", "route_marked = 82\nroute_table = 81");
+        let err = Config::parse(&text).expect_err("a shared table must be refused");
+        let err = err.to_string();
+        assert!(err.contains("\"de\" and \"nl\""), "{err}");
+        assert!(err.contains("table 81"), "{err}");
+    }
+
+    /// `THREE`, with `extra` added to the end of the named tunnel.
+    fn three_with(tunnel: &str, extra: &str) -> String {
+        let end = match tunnel {
+            "de" => "tunnel_address = \"10.7.0.1\"\n",
+            "nl" => "tunnel_address = \"10.8.0.1\"\n",
+            other => panic!("no tunnel {other} in THREE"),
+        };
+        THREE.replace(end, &format!("{end}{extra}"))
+    }
+
+    #[test]
+    fn a_listener_on_another_tunnel_s_mark_is_refused() {
+        // The listener's mark defaults to 81, which is "de"'s. Installed under
+        // "nl" it would point mark 81 at "nl"'s device.
+        let text = three_with("nl", "\n[tunnel.socks5]\nlisten = \"127.0.0.1:1080\"\n");
+        let err = Config::parse(&text).expect_err("a shared mark must be refused");
+        assert!(err.to_string().contains("both use mark 81"), "{err}");
+    }
+
+    #[test]
+    fn a_listener_on_its_own_tunnel_s_mark_shares_its_table() {
+        let text = three_with("de", "\n[tunnel.socks5]\nlisten = \"127.0.0.1:1080\"\n");
+        let c = Config::parse(&text).expect("the same mark on the same device is one route");
+        let de = c.named("de").expect("de");
+        assert_eq!(de.marked_routes(), [(81, 81)]);
+    }
+
+    #[test]
+    fn a_lane_mark_in_two_tunnels_is_refused() {
+        let lane = "\n[[tunnel.lane]]\nclass = 10\nmark = 79\n";
+        let text = three_with("de", lane);
+        let text = text.replace(
+            "tunnel_address = \"10.8.0.1\"\n",
+            &format!("tunnel_address = \"10.8.0.1\"\n{lane}"),
+        );
+        let err = Config::parse(&text).expect_err("a shared lane mark must be refused");
+        assert!(err.to_string().contains("both use mark 79"), "{err}");
+    }
+
+    #[test]
+    fn tunnels_with_only_lanes_must_name_their_tables() {
+        // No `route_marked` to borrow a number from, so both fall back to the
+        // same table, and the operator has to choose.
+        let text = three_with("de", "\n[[tunnel.lane]]\nclass = 10\nmark = 79\n")
+            .replace("route_marked = 81\n", "")
+            .replace("route_marked = 82\n", "")
+            .replace(
+                "tunnel_address = \"10.8.0.1\"\n",
+                "tunnel_address = \"10.8.0.1\"\n\n[[tunnel.lane]]\nclass = 10\nmark = 78\n",
+            );
+        let err = Config::parse(&text).expect_err("a shared fallback table must be refused");
+        let err = err.to_string();
+        assert!(err.contains("table 51"), "{err}");
+        assert!(err.contains("route_table"), "says what to change: {err}");
+    }
+
+    #[test]
+    fn the_kernel_s_own_tables_are_refused() {
+        // A tunnel's default route written into `main` replaces the host's own.
+        for table in [0, 253, 254, 255] {
+            let text = CLIENT.replace(
+                "[peer]",
+                &format!("route_marked = 81\nroute_table = {table}\n\n[peer]"),
+            );
+            let err = Config::parse(&text).expect_err(&format!("table {table}"));
+            assert!(
+                err.to_string().starts_with("interface.route_table"),
+                "{err}"
+            );
+        }
+
+        // And when the number is only borrowed from the mark.
+        let text = CLIENT.replace("[peer]", "route_marked = 254\n\n[peer]");
+        let err = Config::parse(&text).expect_err("borrowed main table");
+        let err = err.to_string();
+        assert!(err.contains("`main`"), "{err}");
+        assert!(err.contains("Set interface.route_table"), "{err}");
+
+        let text = format!("{CLIENT}\n[socks5]\nlisten = \"127.0.0.1:1080\"\nmark = 255\n");
+        let err = Config::parse(&text).expect_err("borrowed local table");
+        assert!(err.to_string().starts_with("socks5.table"), "{err}");
+    }
+
+    #[test]
     fn the_two_forms_cannot_be_mixed() {
         // The tunnel sections only; a stray top-level key appended after
         // `[peer]` would belong to the peer table and fail for another reason.
@@ -2659,7 +2860,7 @@ tunnel_address = "10.7.0.2"
             .into_only()
             .expect("one tunnel");
         assert_eq!(c.interface.route_marked, Some(81));
-        assert_eq!(c.interface.route_table, 51);
+        assert_eq!(c.interface.route_table, 81, "the mark's own number");
         assert!(c.socks5.is_none(), "no listener is needed for this");
         assert!(!c.interface.route_all, "and the whole host is not captured");
     }
@@ -2754,6 +2955,7 @@ tunnel_address = "10.7.0.2"
         assert_eq!(s.listen.port(), 1080);
         assert!(s.listen.ip().is_loopback());
         assert_ne!(s.mark, 0, "a zero mark would steer nothing");
+        assert_eq!(s.table, s.mark, "the mark's own number");
         assert!(s.credentials.is_none());
     }
 
