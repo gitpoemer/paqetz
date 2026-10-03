@@ -583,9 +583,33 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Every tunnel's lanes are planned before any is attached, because their
+    // firewall rules share one table that is written whole: installed tunnel
+    // by tunnel, each would replace the one before.
+    let plans: Vec<Vec<LanePlan>> = (0..)
+        .zip(&process.tunnels)
+        .map(|(slot, cfg)| {
+            lane_plans(cfg, slot).unwrap_or_else(|e| {
+                log::error!("{}: {e}", cfg.name);
+                log::error!("the tunnel will run, but its lanes are not installed");
+                Vec::new()
+            })
+        })
+        .collect();
+    let lanes_installed = install_lanes(&process.tunnels, &plans);
+
+    // A tunnel that cannot be attached stops the process, and what is already
+    // installed goes with it: the lanes' table is in place before any tunnel
+    // is attached, so even the first failing would otherwise leave it behind.
     let mut attached = Vec::with_capacity(tunnels.len());
-    for (cfg, tunnel) in process.tunnels.iter().zip(&tunnels) {
-        attached.push(attach(cfg, tunnel)?);
+    for ((cfg, tunnel), plans) in process.tunnels.iter().zip(&tunnels).zip(plans) {
+        match attach(cfg, tunnel, plans) {
+            Ok(a) => attached.push(a),
+            Err(e) => {
+                tear_down(attached, lanes_installed, fw.as_ref());
+                return Err(e);
+            }
+        }
     }
 
     // Each tunnel blocks in its own loop until shutdown, so they run in
@@ -613,18 +637,26 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Leave the host as we found it, whether or not the tunnels ended cleanly.
+    tear_down(attached, lanes_installed, fw.as_ref());
+
+    result.map_err(Into::into)
+}
+
+/// Removes what `start` installed: each tunnel's arrangements, then the
+/// lanes' table they share, then the firewall rules.
+fn tear_down(attached: Vec<Attached>, lanes_installed: bool, fw: Option<&Firewall>) {
     for a in attached {
         a.revert();
     }
-
-    // Leave the host as we found it, whether or not the tunnels ended cleanly.
+    if lanes_installed {
+        let _ = paqetz_fw::nft_script(&paqetz_fw::rules::lane_revert());
+    }
     if let Some(fw) = fw
         && let Err(e) = fw.revert()
     {
         log::warn_!("could not remove firewall rules: {e}");
     }
-
-    result.map_err(Into::into)
 }
 
 /// The host-level state one tunnel installs, so it can be undone.
@@ -634,9 +666,10 @@ struct Attached {
     listener: Option<paqetz_net4::route::Policy>,
     gateway: Option<(paqetz_fw::gateway::Gateway, paqetz_fw::gateway::TurnedOn)>,
     routes: Option<paqetz_fw::gateway::TunnelRoutes>,
-    /// What the lanes installed: their tagging table, and one rule each on the
-    /// end that forwards. Empty for a tunnel with no lanes, which then leaves
-    /// exactly as much behind as it did before they existed: nothing.
+    /// What the lanes installed: one rule each on the end that forwards. Empty
+    /// for a tunnel with no lanes, which then leaves exactly as much behind as
+    /// it did before they existed: nothing. Their tagging table is the
+    /// process's, and `start` removes it.
     lanes: Vec<LanePlan>,
     /// The policy routes that put each lane's marked traffic into the tunnel,
     /// on the end that sends.
@@ -646,16 +679,13 @@ struct Attached {
 impl Attached {
     /// Leaves the host as it was found.
     fn revert(self) {
-        if !self.lanes.is_empty() {
-            let _ = paqetz_fw::nft_script(&paqetz_fw::rules::lane_revert());
-            for plan in &self.lanes {
-                if let (Some(table), Some(_)) = (plan.egress_table, plan.rule.egress.as_ref()) {
-                    paqetz_fw::gateway::unpoint_mark(
-                        plan.rule.route_mark,
-                        table,
-                        paqetz_fw::gateway::LANE_RULE_PRIORITY,
-                    );
-                }
+        for plan in &self.lanes {
+            if let (Some(table), Some(_)) = (plan.egress_table, plan.rule.egress.as_ref()) {
+                paqetz_fw::gateway::unpoint_mark(
+                    plan.rule.route_mark,
+                    table,
+                    paqetz_fw::gateway::LANE_RULE_PRIORITY,
+                );
             }
         }
         for policy in &self.lane_marks {
@@ -684,6 +714,7 @@ impl Attached {
 fn attach(
     cfg: &config::TunnelConfig,
     tunnel: &Tunnel,
+    plans: Vec<LanePlan>,
 ) -> Result<Attached, Box<dyn std::error::Error>> {
     // Sockets and the device come up first, because the port the rules must
     // name is only settled here: the initiating side takes an ephemeral one.
@@ -730,22 +761,10 @@ fn attach(
     }
 
     // Lanes, if any. Absent, nothing below runs and the tunnel behaves exactly
-    // as it did before they existed.
-    let plans = match lane_plans(cfg) {
-        Ok(plans) => plans,
-        Err(e) => {
-            log::error!("{e}");
-            log::error!("the tunnel will run, but its lanes are not installed");
-            Vec::new()
-        }
-    };
+    // as it did before they existed. Their firewall rules are already in
+    // place: `start` installs every tunnel's at once.
     let mut lane_marks = Vec::new();
     if !plans.is_empty() {
-        let rules: Vec<_> = plans.iter().map(|p| p.rule.clone()).collect();
-        if let Err(e) = paqetz_fw::nft_script(&paqetz_fw::rules::lane_script(&device, &rules, ipv6))
-        {
-            log::error!("could not install the lane rules: {e}");
-        }
         for plan in &plans {
             // The sending end: the mark has to reach the tunnel as well as be
             // tagged, or the traffic leaves this host the ordinary way and the
@@ -1528,7 +1547,7 @@ struct LanePlan {
 /// routing table derived from where that interface's default route actually
 /// lives, because a number kept in step by hand produces a lane that looks
 /// configured and quietly routes nowhere.
-fn lane_plans(cfg: &config::TunnelConfig) -> Result<Vec<LanePlan>, String> {
+fn lane_plans(cfg: &config::TunnelConfig, slot: u32) -> Result<Vec<LanePlan>, String> {
     let mut out = Vec::with_capacity(cfg.lanes.len());
     for lane in &cfg.lanes {
         let egress_table = match (lane.egress.as_deref(), lane.table) {
@@ -1541,12 +1560,38 @@ fn lane_plans(cfg: &config::TunnelConfig) -> Result<Vec<LanePlan>, String> {
                 class: lane.class,
                 mark: lane.mark,
                 egress: lane.egress.clone(),
-                route_mark: config::lane_mark(lane.class),
+                route_mark: config::lane_mark(slot, lane.class),
             },
             egress_table,
         });
     }
     Ok(out)
+}
+
+/// Installs every tunnel's lane rules in one transaction, and says whether
+/// there were any to install.
+fn install_lanes(tunnels: &[config::TunnelConfig], plans: &[Vec<LanePlan>]) -> bool {
+    let rules: Vec<Vec<paqetz_fw::rules::Lane>> = plans
+        .iter()
+        .map(|p| p.iter().map(|p| p.rule.clone()).collect())
+        .collect();
+    let sets: Vec<paqetz_fw::rules::Lanes<'_>> = tunnels
+        .iter()
+        .zip(&rules)
+        .filter(|(_, lanes)| !lanes.is_empty())
+        .map(|(cfg, lanes)| paqetz_fw::rules::Lanes {
+            device: &cfg.interface.device,
+            ipv6: cfg.carries_ipv6(),
+            lanes,
+        })
+        .collect();
+    if sets.is_empty() {
+        return false;
+    }
+    if let Err(e) = paqetz_fw::nft_script(&paqetz_fw::rules::lane_script(&sets)) {
+        log::error!("could not install the lane rules: {e}");
+    }
+    true
 }
 
 fn effective_port(cfg: &Config) -> Option<u16> {
@@ -1562,6 +1607,52 @@ fn effective_port(cfg: &Config) -> Option<u16> {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
+
+    #[test]
+    fn one_class_in_two_tunnels_routes_under_two_marks() {
+        // Two clients may use class 10 for different ways out. One mark per
+        // class sent both by whichever rule was installed first.
+        let tunnel = |name: &str, net: u8, key: &str, egress: &str, table: u32| {
+            format!(
+                r#"
+[[tunnel]]
+name = "{name}"
+[tunnel.interface]
+private_key = "QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y="
+address = "10.{net}.0.1/24"
+device = "paqetz-{name}"
+listen_port = 90{net}
+[tunnel.peer]
+public_key = "{key}"
+tunnel_address = "10.{net}.0.2"
+[[tunnel.lane]]
+class = 10
+egress = "{egress}"
+table = {table}
+"#
+            )
+        };
+        let text = tunnel(
+            "a",
+            7,
+            "Nk1lHhVE3SPuLvZ3XDvJZkH8xkCPMlTPvGZ0S2qXeXo=",
+            "warp",
+            51_820,
+        ) + &tunnel(
+            "b",
+            8,
+            "TmwuUmwHVDe4Q0z0PmVEZ0wYyBIDN0kUq5xkQzk0T3E=",
+            "wg1",
+            100,
+        );
+        let c = Config::parse(&text).expect("parse");
+        let marks: Vec<u32> = (0..)
+            .zip(&c.tunnels)
+            .flat_map(|(slot, t)| lane_plans(t, slot).expect("plans"))
+            .map(|p| p.rule.route_mark)
+            .collect();
+        assert_eq!(marks, [0x10a, 0x14a]);
+    }
 
     #[test]
     fn the_firewall_command_names_what_the_carrier_actually_sends() {

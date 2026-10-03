@@ -273,6 +273,15 @@ mod tests {
 
     use super::*;
 
+    /// The script for one tunnel's lanes on `paqetz0`.
+    fn one(lanes: &[Lane], ipv6: bool) -> String {
+        lane_script(&[Lanes {
+            device: "paqetz0",
+            ipv6,
+            lanes,
+        }])
+    }
+
     #[test]
     fn a_sending_end_tags_and_a_forwarding_end_reads() {
         // A firewall mark cannot cross a tunnel, so the intent travels in the
@@ -284,7 +293,7 @@ mod tests {
             egress: None,
             route_mark: 0x10a,
         }];
-        let script = lane_script("paqetz0", &lanes, false);
+        let script = one(&lanes, false);
         assert!(
             script.contains("oifname \"paqetz0\" meta mark 0x4f counter ip dscp set 10"),
             "{script}"
@@ -298,7 +307,7 @@ mod tests {
             egress: Some("warp".to_owned()),
             route_mark: 0x10a,
         }];
-        let script = lane_script("paqetz0", &lanes, false);
+        let script = one(&lanes, false);
         assert!(
             script.contains("iifname \"paqetz0\" ip dscp 10 counter meta mark set 0x10a"),
             "{script}"
@@ -327,7 +336,7 @@ mod tests {
             egress: Some("warp".to_owned()),
             route_mark: 0x10a,
         }];
-        let script = lane_script("paqetz0", &lanes, true);
+        let script = one(&lanes, true);
         assert!(
             script.contains("meta mark 0x4f counter ip6 dscp set 10"),
             "{script}"
@@ -343,7 +352,7 @@ mod tests {
         // Translation is not per family in an inet table: once.
         assert_eq!(script.matches("counter masquerade").count(), 1, "{script}");
         // And without it, not a trace.
-        assert!(!lane_script("paqetz0", &lanes, false).contains("ip6"));
+        assert!(!one(&lanes, false).contains("ip6"));
     }
 
     #[test]
@@ -370,7 +379,7 @@ mod tests {
                 route_mark: 0x10c,
             },
         ];
-        let script = lane_script("paqetz0", &lanes, false);
+        let script = one(&lanes, false);
         assert_eq!(
             script
                 .matches("oifname \"warp\" counter masquerade")
@@ -394,10 +403,60 @@ mod tests {
     }
 
     #[test]
+    fn every_tunnel_s_lanes_are_in_the_one_table() {
+        // The script replaces the table whole, so each tunnel installing its
+        // own left only the last one's lanes.
+        let warp = |class, route_mark| Lane {
+            class,
+            mark: None,
+            egress: Some("warp".to_owned()),
+            route_mark,
+        };
+        let first = [warp(10, 0x10a)];
+        let second = [warp(10, 0x14a)];
+        let script = lane_script(&[
+            Lanes {
+                device: "paqetz0",
+                ipv6: false,
+                lanes: &first,
+            },
+            Lanes {
+                device: "paqetz1",
+                ipv6: true,
+                lanes: &second,
+            },
+        ]);
+        assert!(
+            script.contains("iifname \"paqetz0\" ip dscp 10 counter meta mark set 0x10a"),
+            "{script}"
+        );
+        assert!(
+            script.contains("iifname \"paqetz1\" ip dscp 10 counter meta mark set 0x14a"),
+            "{script}"
+        );
+        assert_eq!(script.matches("counter masquerade").count(), 1, "{script}");
+        // Cleared for each family any tunnel leaving by it carries.
+        assert_eq!(
+            script
+                .matches("oifname \"warp\" counter ip dscp set 0")
+                .count(),
+            1,
+            "{script}"
+        );
+        assert_eq!(
+            script
+                .matches("oifname \"warp\" counter ip6 dscp set 0")
+                .count(),
+            1,
+            "{script}"
+        );
+    }
+
+    #[test]
     fn no_lanes_is_an_empty_table_rather_than_absent_rules() {
         // The table is still replaced, so a file that had lanes and no longer
         // does leaves nothing of them behind.
-        let script = lane_script("paqetz0", &[], false);
+        let script = one(&[], false);
         assert!(script.starts_with(&format!(
             "add table inet {LANE_TABLE}\ndelete table inet {LANE_TABLE}\n"
         )));
@@ -641,14 +700,28 @@ pub struct Lane {
     pub route_mark: u32,
 }
 
+/// One tunnel's lanes, with what their rules need to know about the tunnel.
+#[derive(Debug, Clone, Copy)]
+pub struct Lanes<'a> {
+    /// The tunnel's device, which every rule is scoped to.
+    pub device: &'a str,
+    /// Whether the tunnel carries IPv6, so the other family's header is read
+    /// and written as well.
+    pub ipv6: bool,
+    /// The lanes themselves.
+    pub lanes: &'a [Lane],
+}
+
 /// The nftables table lanes own.
 pub const LANE_TABLE: &str = "paqetz_lane";
 
-/// The script that installs whatever halves these lanes describe.
+/// The script that installs whatever halves these tunnels' lanes describe.
 ///
 /// One table, one transaction, `add` then `delete` then define, as everything
 /// here is written: the same result whether or not anything was there before,
-/// and no lane can be half-installed.
+/// and no lane can be half-installed. Every tunnel's lanes go in the one
+/// script, because it replaces the table whole: a script per tunnel leaves
+/// only the last one's.
 ///
 /// Both directions carry counters. Without them "is this lane working" has no
 /// answer, and on a feature whose entire job is to send *some* traffic
@@ -659,40 +732,50 @@ pub const LANE_TABLE: &str = "paqetz_lane";
 /// destination and every network between, which says something about the
 /// traffic to anyone who looks and does nothing for anybody.
 ///
-/// `ipv6` adds the same rules for the other family's header. The table is
-/// `inet` already, so it is one more line per rule rather than another table.
+/// A tunnel carrying IPv6 gets the same rules for the other family's header.
+/// The table is `inet` already, so it is one more line per rule rather than
+/// another table.
 #[must_use]
-pub fn lane_script(device: &str, lanes: &[Lane], ipv6: bool) -> String {
-    let families: &[&str] = if ipv6 { &["ip", "ip6"] } else { &["ip"] };
+pub fn lane_script(tunnels: &[Lanes<'_>]) -> String {
     let mut tag = String::new();
     let mut pick = String::new();
     let mut out = String::new();
-    let mut seen: Vec<&str> = Vec::new();
-    for lane in lanes {
-        let dscp = lane.class;
-        if let Some(mark) = lane.mark {
-            for family in families {
-                tag.push_str(&format!(
-                    "        oifname \"{device}\" meta mark {mark:#x} counter {family} dscp set {dscp}\n"
-                ));
+    let mut cleared: Vec<(&str, &str)> = Vec::new();
+    let mut translated: Vec<&str> = Vec::new();
+    for tunnel in tunnels {
+        let device = tunnel.device;
+        let families: &[&str] = if tunnel.ipv6 { &["ip", "ip6"] } else { &["ip"] };
+        for lane in tunnel.lanes {
+            let dscp = lane.class;
+            if let Some(mark) = lane.mark {
+                for family in families {
+                    tag.push_str(&format!(
+                        "        oifname \"{device}\" meta mark {mark:#x} counter {family} dscp set {dscp}\n"
+                    ));
+                }
             }
-        }
-        if let Some(egress) = lane.egress.as_deref() {
+            let Some(egress) = lane.egress.as_deref() else {
+                continue;
+            };
             for family in families {
                 pick.push_str(&format!(
                     "        iifname \"{device}\" {family} dscp {dscp} counter meta mark set {:#x}\n",
                     lane.route_mark
                 ));
             }
-            // One rule per interface however many classes leave by it, or a
-            // packet is translated once per lane that names the same way out.
-            if !seen.contains(&egress) {
-                seen.push(egress);
-                for family in families {
+            // One rule per interface however many classes and tunnels leave
+            // by it, or a packet is translated once per lane that names the
+            // same way out.
+            for family in families {
+                if !cleared.contains(&(egress, *family)) {
+                    cleared.push((egress, family));
                     out.push_str(&format!(
                         "        oifname \"{egress}\" counter {family} dscp set 0\n"
                     ));
                 }
+            }
+            if !translated.contains(&egress) {
+                translated.push(egress);
                 out.push_str(&format!(
                     "        oifname \"{egress}\" counter masquerade\n"
                 ));

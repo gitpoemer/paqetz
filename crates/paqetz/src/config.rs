@@ -420,9 +420,19 @@ const LANE_CLASSES: std::ops::RangeInclusive<u8> = 1..=63;
 /// configuration or on the wire.
 const LANE_MARK_BASE: u32 = 0x100;
 
-/// The internal mark a class routes under, on the server.
-pub(crate) const fn lane_mark(class: u8) -> u32 {
-    LANE_MARK_BASE + class as u32
+/// How many marks each tunnel's lanes take: one per value six bits of DSCP
+/// can hold.
+const LANE_MARKS_PER_TUNNEL: u32 = 64;
+
+/// The internal mark a class routes under, on the server, for the tunnel at
+/// `slot` in the file.
+///
+/// Per tunnel because the classes are not. Two clients may both use class 10
+/// for different ways out, and one mark per class would route both by
+/// whichever rule was installed first. The first tunnel keeps the marks it had
+/// before this was per tunnel.
+pub(crate) const fn lane_mark(slot: u32, class: u8) -> u32 {
+    LANE_MARK_BASE + slot * LANE_MARKS_PER_TUNNEL + class as u32
 }
 
 /// Reads and checks the lanes.
@@ -2064,15 +2074,23 @@ mod tests {
         // the routing mark, the listener's, or the WARP destinations' would be
         // one feature silently taking another's traffic.
         for class in 1..=63u8 {
-            let mark = lane_mark(class);
+            let mark = lane_mark(0, class);
             assert!(mark >= LANE_MARK_BASE, "class {class}");
             for taken in [81u32, 0x51, 0x57] {
                 assert_ne!(mark, taken, "class {class} collides with {taken:#x}");
             }
         }
-        // And distinct per class, or two lanes would route as one.
-        let marks: std::collections::BTreeSet<u32> = (1..=63u8).map(lane_mark).collect();
-        assert_eq!(marks.len(), 63);
+        // And distinct per class and per tunnel, or two lanes would route as
+        // one: the same class in two tunnels may leave by different ways out.
+        let marks: std::collections::BTreeSet<u32> = (0..4)
+            .flat_map(|slot| (1..=63u8).map(move |class| lane_mark(slot, class)))
+            .collect();
+        assert_eq!(marks.len(), 4 * 63);
+        assert_eq!(
+            lane_mark(0, 10),
+            0x10a,
+            "the first tunnel's marks are unchanged"
+        );
     }
 
     #[test]
