@@ -111,18 +111,26 @@ impl Stats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Adds `n` to a counter.
-    #[inline]
     /// Takes back a count that turned out not to have happened.
     ///
     /// Saturating, so a correction can never wrap a counter into a number that
-    /// reads as an enormous one.
+    /// reads as an enormous one. Written as the loop `fetch_update` runs,
+    /// because current toolchains deprecate that name for one the oldest
+    /// supported toolchain does not have.
     pub(crate) fn sub(counter: &AtomicU64, n: u64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(n))
-        });
+        let mut seen = counter.load(Ordering::Relaxed);
+        while let Err(now) = counter.compare_exchange_weak(
+            seen,
+            seen.saturating_sub(n),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            seen = now;
+        }
     }
 
+    /// Adds `n` to a counter.
+    #[inline]
     pub(crate) fn add(counter: &AtomicU64, n: u64) {
         counter.fetch_add(n, Ordering::Relaxed);
     }
