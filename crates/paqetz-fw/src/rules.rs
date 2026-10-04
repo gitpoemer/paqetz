@@ -37,13 +37,21 @@ pub const COMMENT: &str = "paqetz-tunnel";
 #[must_use]
 pub fn nft_apply(guard: &Guard) -> String {
     let (pre, out, rst) = match guard {
+        // One rule each, matching every port as a set: the kernel looks a port
+        // up rather than walking a rule per port. With a rule per port, a pool
+        // of two hundred cost each packet six hundred rules, and halved what
+        // the tunnel could carry.
+        Guard::Ports(ports) if ports.is_empty() => (String::new(), String::new(), String::new()),
         Guard::Ports(ports) => {
-            let lines =
-                |f: &dyn Fn(u16) -> String| -> String { ports.iter().map(|p| f(*p)).collect() };
+            let set = ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
             (
-                lines(&|p| format!("        tcp dport {p} notrack\n")),
-                lines(&|p| format!("        tcp sport {p} notrack\n")),
-                lines(&|p| format!("        tcp sport {p} tcp flags & rst == rst drop\n")),
+                format!("        tcp dport {{ {set} }} notrack\n"),
+                format!("        tcp sport {{ {set} }} notrack\n"),
+                format!("        tcp sport {{ {set} }} tcp flags & rst == rst drop\n"),
             )
         }
         Guard::Protocol(proto) => (
@@ -528,18 +536,15 @@ mod tests {
             3,
             "add, delete, define"
         );
-        for port in [1111, 2222, 3333] {
-            assert!(
-                script.contains(&format!("tcp dport {port} notrack")),
-                "{script}"
-            );
-            assert!(
-                script.contains(&format!("tcp sport {port} notrack")),
-                "{script}"
-            );
-            assert!(
-                script.contains(&format!("tcp sport {port} tcp flags & rst == rst drop")),
-                "{script}"
+        for rule in [
+            "tcp dport { 1111, 2222, 3333 } notrack",
+            "tcp sport { 1111, 2222, 3333 } notrack",
+            "tcp sport { 1111, 2222, 3333 } tcp flags & rst == rst drop",
+        ] {
+            assert_eq!(
+                script.matches(rule).count(),
+                1,
+                "one rule for every port: {script}"
             );
         }
     }
@@ -572,9 +577,9 @@ mod tests {
     #[test]
     fn the_nft_script_covers_all_three_rules() {
         let script = nft_apply(&Guard::Ports(vec![9999]));
-        assert!(script.contains("tcp dport 9999 notrack"));
-        assert!(script.contains("tcp sport 9999 notrack"));
-        assert!(script.contains("tcp sport 9999 tcp flags & rst == rst drop"));
+        assert!(script.contains("tcp dport { 9999 } notrack"));
+        assert!(script.contains("tcp sport { 9999 } notrack"));
+        assert!(script.contains("tcp sport { 9999 } tcp flags & rst == rst drop"));
     }
 
     #[test]

@@ -336,7 +336,7 @@ mod tests {
         let plan = fw.plan();
         assert_eq!(plan.len(), 1, "nft applies the whole ruleset atomically");
         assert!(plan[0].contains("nft -f -"));
-        assert!(plan[0].contains("tcp dport 9999 notrack"));
+        assert!(plan[0].contains("tcp dport { 9999 } notrack"));
     }
 
     #[test]
