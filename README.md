@@ -346,6 +346,42 @@ numbering for a path that rejects implausible sequence numbers outright instead
 of tracking them. The two ends need not agree — nothing validates an inbound
 `seq` or `ack` — so this can be changed on one host at a time.
 
+Under `stream` the acknowledgement is read off the wire: it names the byte
+after the furthest segment that arrived, so the next segment past a hole moves
+it on instead of leaving it frozen, and a peer that restarted or moved to a new
+port is followed instead of acknowledged at a stream it abandoned.
+
+### A connection that opens
+
+Some networks will not carry a TCP flow they never saw open: everything coming
+back is dropped a few packets in, while the handshake, the counters and the
+other direction all look fine. Two carriers open the connection first, and both
+must be set the same at each end:
+
+```toml
+# under [tunnel.interface], on both hosts
+carrier = "midstream-fh"   # or "handshake"
+```
+
+- **`midstream-fh`** announces it without waiting. The end that connects sends a
+  SYN and carries straight on; the end that waits sends its SYN+ACK once the
+  first message has authenticated, ahead of its reply. No round trip, and
+  nothing is ever said to a stranger. The cost is that the first data reaches
+  the network before the SYN+ACK does, which a strict filter may refuse.
+- **`handshake`** does it properly: SYN, SYN+ACK, ACK, and only then anything
+  else, with the SYN repeated after 1, 2, 4 and 8 seconds until answered. It
+  costs a round trip per new connection, and the waiting end now answers a
+  segment before anything has authenticated. So the SYN's sequence number
+  proves its sender knows the waiting end's public key, within a couple of
+  minutes either side of the time it was sent, and anything else gets silence;
+  a SYN seen once is answered again only from where it first came, so one
+  copied off the wire draws nothing. It needs a profile that sends TCP
+  timestamps (`linux-6` or `android-14`), because the proof is bound to one.
+
+Both number the segments by the bytes they carry (`sequencing = "stream"`)
+unless told otherwise: after an opening, numbers that describe no stream would
+contradict it. Every new outer port is a new connection, opened the same way.
+
 ### Putting Xray in front of it
 
 On the client host, one command installs Xray, configures it, and starts it:

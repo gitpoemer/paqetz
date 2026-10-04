@@ -1340,7 +1340,23 @@ impl Config {
 
         let shape = match iface.carrier.as_deref().unwrap_or("midstream") {
             "midstream" => Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
-            "handshake" => Shape::Tcp(paqetz_tcpwire::Carrier::Handshake),
+            "midstream-fh" => Shape::Tcp(paqetz_tcpwire::Carrier::FakeHandshake),
+            "handshake" => {
+                // The SYN proves itself with its timestamp, so a profile that
+                // sends none has nothing to prove it with.
+                if !profile.timestamps {
+                    return Err(invalid(
+                        "interface.carrier",
+                        format!(
+                            "\"handshake\" needs a profile that sends TCP timestamps, \
+                             because the SYN's timestamp is what lets the server answer \
+                             it without answering a scanner; {profile_name:?} sends none. \
+                             Use linux-6 or android-14."
+                        ),
+                    ));
+                }
+                Shape::Tcp(paqetz_tcpwire::Carrier::Handshake)
+            }
             "gre" => Shape::Raw(paqetz_tcpwire::rawip::Shell::Gre),
             "rawip" => {
                 let Some(proto) = iface.carrier_protocol else {
@@ -1358,8 +1374,8 @@ impl Config {
                 return Err(invalid(
                     "interface.carrier",
                     format!(
-                        "expected \"midstream\", \"handshake\", \"gre\" or \"rawip\", \
-                         got {other:?}"
+                        "expected \"midstream\", \"midstream-fh\", \"handshake\", \"gre\" \
+                         or \"rawip\", got {other:?}"
                     ),
                 ));
             }
@@ -1425,16 +1441,26 @@ impl Config {
             mtu
         };
 
-        let sequencing = match iface.sequencing.as_deref().unwrap_or("opaque") {
-            "opaque" => paqetz_tcpwire::Sequencing::Opaque,
-            "stream" => paqetz_tcpwire::Sequencing::Stream,
-            other => {
-                return Err(invalid(
-                    "interface.sequencing",
-                    format!("expected \"opaque\" or \"stream\", got {other:?}"),
-                ));
-            }
-        };
+        // A connection seen to open is one a middlebox can track from its
+        // first byte, and numbers that describe no stream would contradict
+        // the opening they follow. So a carrier that opens defaults to honest
+        // numbering; one that does not keeps the numbers nothing can track.
+        let opens = matches!(shape, Shape::Tcp(c) if c.opens());
+        let sequencing =
+            match iface
+                .sequencing
+                .as_deref()
+                .unwrap_or(if opens { "stream" } else { "opaque" })
+            {
+                "opaque" => paqetz_tcpwire::Sequencing::Opaque,
+                "stream" => paqetz_tcpwire::Sequencing::Stream,
+                other => {
+                    return Err(invalid(
+                        "interface.sequencing",
+                        format!("expected \"opaque\" or \"stream\", got {other:?}"),
+                    ));
+                }
+            };
 
         let datapath = match iface.datapath.as_deref().unwrap_or("simple") {
             "batched" => Datapath::Batched,
@@ -2090,6 +2116,42 @@ mod tests {
             lane_mark(0, 10),
             0x10a,
             "the first tunnel's marks are unchanged"
+        );
+    }
+
+    #[test]
+    fn a_carrier_that_opens_numbers_honestly_unless_told_otherwise() {
+        // A connection seen to open can be tracked from its first byte, and
+        // numbers that describe no stream would contradict the opening.
+        use paqetz_tcpwire::{Carrier, Sequencing};
+        for (carrier, shape, sequencing) in [
+            ("midstream", Carrier::Midstream, Sequencing::Opaque),
+            ("midstream-fh", Carrier::FakeHandshake, Sequencing::Stream),
+            ("handshake", Carrier::Handshake, Sequencing::Stream),
+        ] {
+            let c = with_interface(&format!("carrier = {carrier:?}")).expect(carrier);
+            assert_eq!(c.interface.shape, Shape::Tcp(shape), "{carrier}");
+            assert_eq!(c.interface.sequencing, sequencing, "{carrier}");
+        }
+        let c =
+            with_interface("carrier = \"midstream-fh\"\nsequencing = \"opaque\"").expect("parses");
+        assert_eq!(
+            c.interface.sequencing,
+            Sequencing::Opaque,
+            "a written choice stands"
+        );
+    }
+
+    #[test]
+    fn a_real_handshake_needs_a_profile_with_timestamps() {
+        // The SYN proves itself with its timestamp; without one the server
+        // could only answer every SYN, scanners included, or none.
+        let err = with_interface("carrier = \"handshake\"\nprofile = \"windows-11\"")
+            .expect_err("windows-11 sends no timestamps");
+        assert!(err.to_string().contains("timestamps"), "{err}");
+        assert!(
+            with_interface("carrier = \"midstream-fh\"\nprofile = \"windows-11\"").is_ok(),
+            "a fake handshake proves nothing, so needs nothing"
         );
     }
 

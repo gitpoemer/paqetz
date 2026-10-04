@@ -81,6 +81,24 @@ pub const ISN_RESPONDER_LABEL: &[u8] = b"paqetz-isn-responder-v1";
 /// Domain-separation label for the carrier's TCP timestamp offset.
 pub const TS_BASE_LABEL: &[u8] = b"paqetz-tsbase-v1";
 
+/// Domain-separation label for the number that proves a SYN.
+pub const SYN_TAG_LABEL: &[u8] = b"paqetz-syn-tag-v1";
+
+/// Domain-separation label for the responder's SYN+ACK sequence number.
+pub const SYN_ACK_ISN_LABEL: &[u8] = b"paqetz-synack-isn-v1";
+
+/// Domain-separation label for the responder's timestamp clock under a real
+/// handshake.
+pub const RESPONDER_TS_LABEL: &[u8] = b"paqetz-responder-ts-v1";
+
+/// Seconds in one period of the clock a SYN's proof is bound to.
+///
+/// A SYN proves itself for the period it was sent in and the ones either side,
+/// so two hosts may disagree about the time by up to this much. Long enough for
+/// a clock nobody synchronises; short enough that a SYN captured off the wire
+/// stops working within minutes.
+pub const SYN_PERIOD_SECS: u64 = 120;
+
 /// Length of the `mac1` field.
 pub const MAC1_LEN: usize = 16;
 
@@ -182,6 +200,92 @@ pub fn carrier_numbers(
         derive(ISN_RESPONDER_LABEL),
         derive(TS_BASE_LABEL),
     )
+}
+
+/// The first four bytes of a BLAKE2s hash over `parts`, as a number.
+fn hash32(parts: &[&[u8]]) -> u32 {
+    let mut h = Blake2s256::new();
+    for part in parts {
+        h.update(part);
+    }
+    let out: [u8; 32] = h.finalize().into();
+    let (first, _) = out.split_first_chunk::<4>().unwrap_or((&[0; 4], &[]));
+    u32::from_le_bytes(*first)
+}
+
+/// The sequence number a SYN carries to prove its sender knows the
+/// responder's public key.
+///
+/// A real handshake has the responder answer a SYN before the tunnel handshake
+/// can say who sent it, and answering every SYN would tell any scanner that
+/// something listens on the port -- which is what mid-stream operation exists
+/// to avoid. So the SYN's sequence number is this tag, and the responder
+/// answers only a SYN whose number it can recompute. Keyed on the responder's
+/// public key, as `mac1` is: it keeps out whoever does not have the key, not
+/// whoever does.
+///
+/// `period` is the time ([`SYN_PERIOD_SECS`] to a period), so a captured SYN
+/// stops working within minutes. `ts_val` is the SYN's own TCP timestamp,
+/// which makes every SYN's tag different. Nothing about either address is
+/// mixed in, because a NAT on either side changes them in transit and the
+/// initiator cannot know what the responder will see.
+#[must_use]
+pub fn syn_tag(responder_static: &PublicKey, period: u64, ts_val: u32) -> u32 {
+    hash32(&[
+        SYN_TAG_LABEL,
+        responder_static.as_bytes(),
+        &period.to_le_bytes(),
+        &ts_val.to_le_bytes(),
+    ])
+}
+
+/// Whether `seq` is the tag of a SYN sent in a period next to `period`.
+#[must_use]
+pub fn syn_tag_matches(responder_static: &PublicKey, period: u64, ts_val: u32, seq: u32) -> bool {
+    [period.wrapping_sub(1), period, period.wrapping_add(1)]
+        .into_iter()
+        .any(|p| syn_tag(responder_static, p, ts_val) == seq)
+}
+
+/// The responder's sequence number for the SYN+ACK answering a SYN numbered
+/// `syn_seq` from `from`.
+///
+/// Keyed on the private key, so nobody else can predict it, and computed from
+/// the SYN alone, so a repeated SYN draws the identical answer without
+/// anything having been kept.
+#[must_use]
+pub fn syn_ack_isn(responder_private: &PrivateKey, syn_seq: u32, from: ([u8; 4], u16)) -> u32 {
+    hash32(&[
+        SYN_ACK_ISN_LABEL,
+        responder_private.as_bytes(),
+        &syn_seq.to_le_bytes(),
+        &from.0,
+        &from.1.to_le_bytes(),
+    ])
+}
+
+/// Where the responder's TCP timestamp clock starts for one connection under a
+/// real handshake.
+///
+/// Computed rather than kept, so the SYN+ACK it sends without remembering
+/// anything and the segments that follow, once the peer authenticates, read
+/// the same clock. Per connection, as a real stack's is, so two connections
+/// cannot be linked by a clock they share; and mixed with `process`, a number
+/// drawn when the process starts, so a restart does not put every clock back
+/// where it began and announce when it happened.
+#[must_use]
+pub fn responder_ts_base(
+    responder_private: &PrivateKey,
+    process: u32,
+    from: ([u8; 4], u16),
+) -> u32 {
+    hash32(&[
+        RESPONDER_TS_LABEL,
+        responder_private.as_bytes(),
+        &process.to_le_bytes(),
+        &from.0,
+        &from.1.to_le_bytes(),
+    ])
 }
 
 /// Parses the fixed Noise pattern.
@@ -1246,6 +1350,69 @@ mod tests {
         assert_ne!(
             carrier_numbers(7, &one.public, &two.public),
             carrier_numbers(7, &one.public, &three.public)
+        );
+    }
+
+    #[test]
+    fn a_syn_proves_itself_for_its_own_period_and_the_ones_beside_it() {
+        let server = KeyPair::generate().expect("generate");
+        let seq = syn_tag(&server.public, 1_000, 55);
+        for period in [999, 1_000, 1_001] {
+            assert!(syn_tag_matches(&server.public, period, 55, seq), "{period}");
+        }
+        // A captured SYN stops working: two periods on, it is refused.
+        assert!(!syn_tag_matches(&server.public, 1_002, 55, seq));
+        assert!(!syn_tag_matches(&server.public, 998, 55, seq));
+    }
+
+    #[test]
+    fn a_syn_proves_nothing_to_another_responder_or_with_another_timestamp() {
+        let server = KeyPair::generate().expect("generate");
+        let other = KeyPair::generate().expect("generate");
+        let seq = syn_tag(&server.public, 1_000, 55);
+        assert!(!syn_tag_matches(&other.public, 1_000, 55, seq));
+        assert!(
+            !syn_tag_matches(&server.public, 1_000, 56, seq),
+            "the timestamp is part of what is proved"
+        );
+    }
+
+    #[test]
+    fn a_responders_clock_is_its_own_for_each_connection_and_each_run() {
+        // Shared, it would link every connection to every other; fixed across
+        // restarts, it would announce each restart by starting again.
+        let server = KeyPair::generate().expect("generate");
+        let from = ([203, 0, 113, 7], 40_000);
+        let base = responder_ts_base(&server.private, 1, from);
+        assert_eq!(base, responder_ts_base(&server.private, 1, from));
+        assert_ne!(
+            base,
+            responder_ts_base(&server.private, 2, from),
+            "another run"
+        );
+        assert_ne!(
+            base,
+            responder_ts_base(&server.private, 1, ([203, 0, 113, 7], 40_001)),
+            "another connection"
+        );
+    }
+
+    #[test]
+    fn a_repeated_syn_draws_the_same_answer_and_another_syn_does_not() {
+        let server = KeyPair::generate().expect("generate");
+        let from = ([203, 0, 113, 7], 40_000);
+        let isn = syn_ack_isn(&server.private, 9, from);
+        assert_eq!(isn, syn_ack_isn(&server.private, 9, from));
+        assert_ne!(isn, syn_ack_isn(&server.private, 10, from));
+        assert_ne!(
+            isn,
+            syn_ack_isn(&server.private, 9, ([203, 0, 113, 7], 40_001))
+        );
+        let other = KeyPair::generate().expect("generate");
+        assert_ne!(
+            isn,
+            syn_ack_isn(&other.private, 9, from),
+            "keyed on the private key"
         );
     }
 

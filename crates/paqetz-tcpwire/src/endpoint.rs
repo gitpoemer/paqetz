@@ -28,10 +28,17 @@
 //!
 //! Numbers that were never coherent cannot become incoherent. Nothing
 //! reassembles them, so nothing builds the state that honest numbering later
-//! violates. [`Sequencing::Opaque`] is therefore the default;
-//! [`Sequencing::Stream`] remains for a path that rejects implausible sequence
-//! numbers outright rather than tracking them, where the trade runs the other
-//! way.
+//! violates. [`Sequencing::Opaque`] is therefore the default for a carrier that
+//! never opens its connection; [`Sequencing::Stream`] remains for a path that
+//! rejects implausible sequence numbers outright rather than tracking them,
+//! where the trade runs the other way, and is the default for one that does
+//! open it, whose SYN invites exactly that tracking.
+//!
+//! The acknowledgement no longer freezes, though. It is read off the wire --
+//! the end of the furthest segment that arrived -- rather than counted, so the
+//! next segment past a hole moves it on, and a peer that restarts or moves to a
+//! new port is followed rather than acknowledged at a stream it has abandoned.
+//! The hole itself stays, for anything reassembling the stream to wait on.
 //!
 //! Neither end needs to agree with the other: nothing here validates an inbound
 //! `seq` or `ack`. They are read only to compose our own.
@@ -64,13 +71,44 @@ pub enum Carrier {
     #[default]
     Midstream,
 
-    /// Emit a real SYN / SYN+ACK / ACK exchange before any data.
+    /// Announce each connection with a SYN and a SYN+ACK, but wait for neither.
+    ///
+    /// The initiator sends its SYN and carries straight on; the responder sends
+    /// its SYN+ACK only once the peer has authenticated, so a stranger still
+    /// draws nothing. For a middlebox that will not carry a flow it never saw
+    /// open, at no cost in round trips -- though the first segments reach it
+    /// before the SYN+ACK does, which a strict one may refuse.
+    FakeHandshake,
+
+    /// Emit a real SYN / SYN+ACK / ACK exchange, and wait for it, before any
+    /// data.
     ///
     /// Preferable against a middlebox that *drops* mid-stream flows rather than
-    /// ignoring them. Costs a round trip at startup, and means the responder
-    /// answers a segment it cannot authenticate — see the decision record.
+    /// ignoring them. Costs a round trip on every new connection, and means the
+    /// responder answers a segment before the tunnel handshake could
+    /// authenticate it -- which the tunnel makes safe by answering only a SYN
+    /// whose sequence number proves the sender knows its public key.
     Handshake,
 }
+
+impl Carrier {
+    /// Whether connections open with a SYN, so the window scale it declares is
+    /// in force afterwards.
+    #[must_use]
+    pub const fn opens(self) -> bool {
+        !matches!(self, Self::Midstream)
+    }
+}
+
+/// How far behind the newest byte seen a segment may start and still be the
+/// same stream arriving out of order.
+///
+/// Anything further back is not reordering but a peer that started numbering
+/// afresh -- a restart, or a carrier rebuilt on a new port -- and is taken as
+/// the new position. A real stream reorders across a window or two; a megabyte
+/// is well past that, and a fresh random base lands inside it once in four
+/// thousand.
+const REORDER_SPAN: u32 = 1 << 20;
 
 /// Which side of the synthetic connection this endpoint is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,8 +157,10 @@ pub struct Config {
     pub isn: u32,
     /// The peer's initial sequence number.
     ///
-    /// Required under [`Carrier::Midstream`]. Ignored under
-    /// [`Carrier::Handshake`], where it is learned from the peer's SYN.
+    /// The starting guess under [`Carrier::Midstream`] and
+    /// [`Carrier::FakeHandshake`], corrected by the first segment the peer
+    /// sends. Ignored under [`Carrier::Handshake`], where it is learned from
+    /// the peer's SYN+ACK.
     pub peer_isn: u32,
     /// Offset added to the clock to form the TCP timestamp, so the timestamp
     /// clock does not start near zero and reveal process start.
@@ -161,11 +201,26 @@ pub struct Endpoint {
     sequencing: Sequencing,
 
     local_isn: u32,
-    remote_isn: Option<u32>,
     /// Payload bytes sent, plus one for each SYN or FIN we have sent.
     sent: u32,
-    /// Payload bytes received, plus one for each SYN or FIN the peer sent.
-    received: u32,
+    /// The next byte expected from the peer: the end of the furthest segment
+    /// it has sent that arrived. `None` until its numbering is known.
+    ///
+    /// Read off the wire rather than counted. A count of bytes received falls
+    /// behind for good at the first lost segment, because nothing here is ever
+    /// sent again; and it describes a stream the peer may no longer be
+    /// numbering, once the peer restarts or moves to a new port.
+    peer_next: Option<u32>,
+    /// Whether the next segment from the peer sets `peer_next` outright, rather
+    /// than only moving it forward.
+    ///
+    /// Set when where the peer's numbering stands is a guess: at the start,
+    /// where it was derived rather than seen, and after the peer moves.
+    relearn: bool,
+    /// The sequence number of our SYN, once one has been sent.
+    syn_seq: Option<u32>,
+    /// The timestamp our SYN carried, repeated in every retransmission.
+    syn_ts: Option<u32>,
 
     /// Milliseconds added to the caller's clock to form `ts_val`, so the
     /// timestamp clock does not start at zero and reveal process start.
@@ -187,31 +242,37 @@ impl Endpoint {
     /// Creates an endpoint.
     #[must_use]
     pub const fn new(cfg: Config) -> Self {
-        // Under Midstream there is no SYN to send, none to wait for, and none
-        // to account for in the sequence space: both ends already know where
-        // the other's numbering starts.
-        let midstream = matches!(cfg.carrier, Carrier::Midstream);
+        // Only a real handshake waits. Under Midstream there is no SYN at all,
+        // and a fake one is announced and not waited for: either way both ends
+        // already know where the other's numbering starts, and a SYN sent for
+        // show sits one below the first data byte rather than taking a number
+        // of its own.
+        let waits = matches!(cfg.carrier, Carrier::Handshake);
         Self {
             local: cfg.local,
             remote: cfg.remote,
             profile: cfg.profile,
             role: cfg.role,
             carrier: cfg.carrier,
-            phase: if midstream {
-                Phase::Established
-            } else {
+            phase: if waits {
                 Phase::Idle
+            } else {
+                Phase::Established
             },
             sequencing: cfg.sequencing,
             dont_fragment: cfg.dont_fragment,
             local_isn: cfg.isn,
-            remote_isn: if midstream { Some(cfg.peer_isn) } else { None },
             sent: 0,
-            received: 0,
+            peer_next: if waits { None } else { Some(cfg.peer_isn) },
+            // Derived, not seen: right for a peer that started when we did,
+            // and wrong for one that restarted or moved since.
+            relearn: true,
+            syn_seq: None,
+            syn_ts: None,
             ts_base: cfg.ts_base,
             peer_ts_val: 0,
             counter: 0,
-            syn_counted: midstream,
+            syn_counted: !waits,
         }
     }
 
@@ -221,10 +282,37 @@ impl Endpoint {
         self.phase
     }
 
-    /// Whether data may be sent.
+    /// Whether the handshake, if there is one, has completed.
     #[must_use]
     pub const fn is_established(&self) -> bool {
         matches!(self.phase, Phase::Established)
+    }
+
+    /// Whether a data segment may go out now.
+    ///
+    /// Later than [`Self::is_established`] for an initiator announcing itself
+    /// without waiting: it is established from the start, but its SYN has to be
+    /// on the wire before anything follows it.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        match (self.carrier, self.role) {
+            (Carrier::FakeHandshake, Role::Initiator) => self.syn_seq.is_some(),
+            _ => self.is_established(),
+        }
+    }
+
+    /// Whether this end still owes the network the SYN that opens its
+    /// connection.
+    ///
+    /// Once under a fake handshake, and until answered under a real one.
+    #[must_use]
+    pub const fn wants_opening(&self) -> bool {
+        matches!(self.role, Role::Initiator)
+            && match self.carrier {
+                Carrier::Midstream => false,
+                Carrier::FakeHandshake => self.syn_seq.is_none(),
+                Carrier::Handshake => !self.is_established(),
+            }
     }
 
     /// The peer's address and port.
@@ -233,13 +321,57 @@ impl Endpoint {
         self.remote
     }
 
+    /// Our own address and port.
+    #[must_use]
+    pub const fn local(&self) -> (Ipv4Addr, u16) {
+        self.local
+    }
+
+    /// Whether `seg` is a SYN+ACK answering the SYN this end sent.
+    ///
+    /// The only test an unauthenticated segment gets before it may touch any
+    /// state here, so it refuses anything else a SYN+ACK might carry: a reset
+    /// or a FIN folded into one would close the connection on the word of
+    /// whoever forged it.
+    #[must_use]
+    pub fn answers_syn(&self, seg: &Segment<'_>) -> bool {
+        use segment::flags::{ACK, FIN, RST, SYN};
+        seg.flags & (SYN | ACK | RST | FIN) == SYN | ACK
+            && self
+                .syn_seq
+                .is_some_and(|ours| seg.ack == ours.wrapping_add(1))
+    }
+
+    /// Whether the peer's acknowledgement in `seg` describes some other
+    /// connection's numbering than this end's.
+    ///
+    /// A peer that restarted on the same addresses and ports opened a new
+    /// connection the tuple cannot show, and acknowledges what it was told in
+    /// that connection's SYN+ACK. Far from where this end is numbering --
+    /// further than anything in flight could be -- is the sign. Never under
+    /// opaque numbering, whose acknowledgements describe nothing.
+    #[must_use]
+    pub fn names_another_connection(&self, seg: &Segment<'_>) -> bool {
+        if self.sequencing == Sequencing::Opaque || !self.is_established() {
+            return false;
+        }
+        let ahead = seg.ack.wrapping_sub(self.next_seq());
+        ahead > REORDER_SPAN && ahead.wrapping_neg() > REORDER_SPAN
+    }
+
     /// Updates the peer's address and port, for roaming (D5).
     ///
-    /// Called only once a packet from the new address has authenticated. The
-    /// sequence state is deliberately preserved: from TCP's point of view this
-    /// is the same conversation seen from a new vantage point, and resetting it
-    /// would produce exactly the mid-stream jump the design is avoiding.
-    pub const fn set_remote(&mut self, remote: (Ipv4Addr, u16)) {
+    /// Called only once a packet from the new address has authenticated. Our
+    /// own numbering is deliberately preserved: from TCP's point of view this
+    /// may be the same conversation seen from a new vantage point, and
+    /// resetting it would produce exactly the mid-stream jump the design is
+    /// avoiding. The peer's is relearned from its next segment instead, because
+    /// a peer arriving from a new port has usually restarted or rebuilt its
+    /// carrier, and is numbering from somewhere new.
+    pub fn set_remote(&mut self, remote: (Ipv4Addr, u16)) {
+        if remote != self.remote {
+            self.relearn = true;
+        }
         self.remote = remote;
     }
 
@@ -272,56 +404,146 @@ impl Endpoint {
     /// composed.
     #[must_use]
     pub const fn next_ack(&self) -> Option<u32> {
-        match (self.sequencing, self.remote_isn) {
+        match self.sequencing {
             // Near our own sequence and drifting, which is what an
             // acknowledgement looks like from the outside, without claiming
             // anything about what arrived.
-            (Sequencing::Opaque, _) => Some(
+            Sequencing::Opaque => Some(
                 self.local_isn
                     .wrapping_add(self.counter << 7)
                     .wrapping_sub(self.counter & 0x3FF)
                     .wrapping_add(1400),
             ),
-            (Sequencing::Stream, Some(isn)) => Some(isn.wrapping_add(self.received)),
-            (Sequencing::Stream, None) => None,
+            Sequencing::Stream => self.peer_next,
         }
     }
 
-    /// Writes the segment that should be sent next for the handshake, if any.
+    /// Writes the segment that should be sent next to open the connection, if
+    /// any.
     ///
     /// Always `Ok(None)` under [`Carrier::Midstream`], which is the point of
-    /// that mode. Otherwise returns `Ok(None)` when the handshake needs nothing
-    /// from this side right now. The caller drives retransmission: a lost SYN simply means calling
-    /// this again, which is why the phase does not advance on a repeat.
+    /// that mode, and for a fake handshake's initiator once its one SYN is out.
+    /// A real handshake's initiator gets its SYN for as long as it is
+    /// unanswered: the caller drives retransmission, and a repeat carries the
+    /// same number and timestamp as the first, which is why the phase does not
+    /// advance on one.
     ///
     /// # Errors
     /// Returns [`Error::Short`] if `out` cannot hold the segment.
     pub fn handshake(&mut self, out: &mut [u8], now: u64) -> Result<Option<usize>> {
-        if matches!(self.carrier, Carrier::Midstream) {
-            return Ok(None);
+        match (self.carrier, self.role, self.phase) {
+            (Carrier::FakeHandshake, Role::Initiator, _) if self.syn_seq.is_none() => {
+                // One below the first data byte, which is where a real SYN sits.
+                let seq = self.next_seq().wrapping_sub(1);
+                self.syn(seq, out, now).map(Some)
+            }
+            (Carrier::Handshake, Role::Initiator, Phase::Idle | Phase::SynSent) => {
+                // The SYN's own sequence byte is not counted here. Every
+                // retransmission must carry the ISN itself; the byte is
+                // accounted for when the handshake completes, in `establish`.
+                let n = self.syn(self.local_isn, out, now)?;
+                self.phase = Phase::SynSent;
+                Ok(Some(n))
+            }
+            (Carrier::Handshake, Role::Responder, Phase::SynReceived) => {
+                self.emit_raw(Kind::SynAck, &[], out, now).map(Some)
+            }
+            _ => Ok(None),
         }
-        let kind = match (self.role, self.phase) {
-            (Role::Initiator, Phase::Idle | Phase::SynSent) => Kind::Syn,
-            (Role::Responder, Phase::SynReceived) => Kind::SynAck,
-            _ => return Ok(None),
+    }
+
+    /// Numbers the SYN about to be sent from the timestamp it will carry.
+    ///
+    /// For a responder that checks the one against the other: `isn_for` turns
+    /// the timestamp into the sequence number, and both are fixed here, at the
+    /// moment of sending, so neither can drift from the other. Nothing once a
+    /// SYN has gone out, because a repeat must be the same SYN.
+    pub fn number_syn(&mut self, now: u64, isn_for: impl FnOnce(u32) -> u32) {
+        if self.syn_seq.is_some() {
+            return;
+        }
+        let ts = timestamp(self.ts_base, now);
+        self.syn_ts = Some(ts);
+        self.local_isn = isn_for(ts);
+    }
+
+    /// Writes a SYN at `seq`.
+    ///
+    /// The timestamp is fixed by the first one and repeated by every
+    /// retransmission, because a responder that checks the SYN checks it
+    /// against both numbers together.
+    fn syn(&mut self, seq: u32, out: &mut [u8], now: u64) -> Result<usize> {
+        let ts_val = *self.syn_ts.get_or_insert(timestamp(self.ts_base, now));
+        let fields = Fields {
+            seq,
+            // A SYN acknowledges nothing, and carries no ACK flag to say so.
+            ack: 0,
+            ts_val,
+            ts_ecr: 0,
+            ..self.fields(Kind::Syn, now)
         };
-        let n = self.emit_raw(kind, &[], out, now)?;
-        // The SYN's own sequence byte is not counted here. Every retransmission
-        // must carry the ISN itself; the byte is accounted for when the
-        // handshake completes, in `establish`.
-        if self.phase == Phase::Idle {
-            self.phase = Phase::SynSent;
+        let n = segment::emit(Kind::Syn, &self.profile, &fields, &[], out)?;
+        self.counter = self.counter.wrapping_add(1);
+        self.syn_seq = Some(seq);
+        Ok(n)
+    }
+
+    /// Writes the SYN+ACK announcing this end's side of a connection the peer
+    /// opened with a fake handshake, acknowledging its first byte at `ack`.
+    ///
+    /// It sits one below this end's next sequence number, where a real SYN+ACK
+    /// sits, so what follows it reads as though it had been the start.
+    ///
+    /// # Errors
+    /// Returns [`Error::Short`] if `out` cannot hold the segment.
+    pub fn answer(&mut self, ack: u32, out: &mut [u8], now: u64) -> Result<usize> {
+        let fields = Fields {
+            seq: self.next_seq().wrapping_sub(1),
+            ack,
+            ..self.fields(Kind::SynAck, now)
+        };
+        let n = segment::emit(Kind::SynAck, &self.profile, &fields, &[], out)?;
+        self.counter = self.counter.wrapping_add(1);
+        Ok(n)
+    }
+
+    /// Writes a bare acknowledgement: how an initiator completes the
+    /// handshake once the SYN+ACK arrives.
+    ///
+    /// # Errors
+    /// Returns [`Error::Short`] if `out` cannot hold the segment.
+    pub fn ack(&mut self, out: &mut [u8], now: u64) -> Result<usize> {
+        self.emit_raw(Kind::Ack, &[], out, now)
+    }
+
+    /// Takes up a connection the peer opened against a SYN+ACK this end sent
+    /// without remembering it.
+    ///
+    /// Nothing here knows that SYN+ACK's number -- it was composed from the SYN
+    /// alone, by [`answer_syn`] -- but the peer's acknowledgement names the next
+    /// byte this end is to send, which is the same thing. `seg` is the peer's
+    /// first authenticated segment on the connection, and `ts_base` the clock
+    /// the SYN+ACK read, which every segment after it must read too.
+    pub fn rejoin(&mut self, seg: &Segment<'_>, ts_base: u32) {
+        self.ts_base = ts_base;
+        self.local_isn = seg.ack.wrapping_sub(self.sent);
+        self.syn_counted = true;
+        self.phase = Phase::Established;
+        self.remote = seg.src;
+        self.peer_next = Some(seg.seq.wrapping_add(occupied(seg)));
+        self.relearn = false;
+        if let Some(ts) = seg.ts_val {
+            self.peer_ts_val = ts;
         }
-        Ok(Some(n))
     }
 
     /// Writes one data segment carrying `payload`.
     ///
     /// # Errors
     /// - [`Error::Short`] if `out` cannot hold the segment.
-    /// - [`Error::NotEstablished`] if the handshake has not completed.
+    /// - [`Error::NotEstablished`] if the connection is not yet open.
     pub fn data(&mut self, payload: &[u8], out: &mut [u8], now: u64) -> Result<usize> {
-        if !self.is_established() {
+        if !self.is_ready() {
             return Err(Error::NotEstablished);
         }
         let n = self.emit_raw(Kind::Data, payload, out, now)?;
@@ -409,9 +631,10 @@ impl Endpoint {
         // from us rather than dropped by us. It is also implausible in itself:
         // an established connection advertising half a kilobyte is not what a
         // real one looks like.
-        let scaled = match self.carrier {
-            Carrier::Midstream => self.profile.window.min(u32::from(u16::MAX)),
-            Carrier::Handshake => self.profile.window >> self.profile.window_scale,
+        let scaled = if self.carrier.opens() {
+            self.profile.window >> self.profile.window_scale
+        } else {
+            self.profile.window.min(u32::from(u16::MAX))
         };
         // Vary within about ±6% using a cheap hash of the packet counter.
         //
@@ -449,12 +672,7 @@ impl Endpoint {
 
     /// The RFC 7323 timestamp to send.
     fn ts_val(&self, now: u64) -> u32 {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the TCP timestamp clock is defined to wrap at 32 bits"
-        )]
-        let ms = now as u32;
-        self.ts_base.wrapping_add(ms)
+        timestamp(self.ts_base, now)
     }
 
     /// Folds an inbound segment into the connection state.
@@ -478,30 +696,45 @@ impl Endpoint {
             return None;
         }
 
-        // The peer's initial sequence number is learned from its SYN.
         if seg.has(segment::flags::SYN) {
-            if self.remote_isn.is_none() {
-                self.remote_isn = Some(seg.seq);
-                // The SYN itself occupies one sequence number.
-                self.received = 1;
-            }
-            match self.role {
-                Role::Initiator => self.establish(),
-                Role::Responder => self.phase = Phase::SynReceived,
+            if seg.has(segment::flags::ACK) {
+                // A SYN+ACK answers our SYN only if it acknowledges it, and is
+                // where the peer's numbering starts.
+                if self
+                    .syn_seq
+                    .is_some_and(|ours| seg.ack == ours.wrapping_add(1))
+                {
+                    // A late copy of one already taken must not pull the
+                    // acknowledgement back to where the connection began.
+                    if self.peer_next.is_none() {
+                        self.peer_next = Some(seg.seq.wrapping_add(1));
+                        self.relearn = false;
+                    } else {
+                        self.advance(seg.seq.wrapping_add(1));
+                    }
+                    if self.phase == Phase::SynSent {
+                        self.establish();
+                    }
+                }
+            } else if self.role == Role::Responder && self.peer_next.is_none() {
+                // The peer's initial sequence number is learned from its SYN.
+                self.peer_next = Some(seg.seq.wrapping_add(1));
+                self.phase = Phase::SynReceived;
             }
             return None;
         }
 
         // Data before any SYN. The peer is out of step with us; there is nothing
         // coherent to say about its sequence space.
-        self.remote_isn?;
+        self.peer_next?;
 
         if self.phase == Phase::SynReceived && seg.has(segment::flags::ACK) {
             self.establish();
         }
 
+        self.advance(seg.seq.wrapping_add(occupied(seg)));
+
         if seg.has(segment::flags::FIN) {
-            self.received = self.received.wrapping_add(1);
             self.phase = Phase::Closed;
             return None;
         }
@@ -509,11 +742,93 @@ impl Endpoint {
         if seg.payload.is_empty() {
             return None;
         }
-
-        let len = u32::try_from(seg.payload.len()).unwrap_or(u32::MAX);
-        self.received = self.received.wrapping_add(len);
         Some(seg.payload)
     }
+
+    /// Moves the acknowledgement to `end`, the byte after a segment that
+    /// arrived.
+    ///
+    /// Forward always: a byte past the furthest one seen is acknowledged even
+    /// when something before it never arrived, because nothing here sends
+    /// anything twice, and holding the acknowledgement at the hole is a
+    /// receiver that stopped acknowledging for good -- which no real connection
+    /// survives for more than a moment. Backward only when the jump is too far
+    /// to be reordering: then the peer is numbering from somewhere new.
+    fn advance(&mut self, end: u32) {
+        let Some(next) = self.peer_next else {
+            return;
+        };
+        // Serial-number arithmetic: less than half the space ahead is forward.
+        let ahead = end.wrapping_sub(next);
+        let forward = ahead != 0 && ahead < 1 << 31;
+        let restarted = !forward && next.wrapping_sub(end) > REORDER_SPAN;
+        if self.relearn || forward || restarted {
+            self.peer_next = Some(end);
+            self.relearn = false;
+        }
+    }
+}
+
+/// The RFC 7323 timestamp for a clock reading of `now` milliseconds, on a
+/// clock that starts at `ts_base`.
+///
+/// Public so a caller can know a SYN's timestamp before sending it: the real
+/// handshake's sequence number is computed from it.
+#[must_use]
+pub const fn timestamp(ts_base: u32, now: u64) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the TCP timestamp clock is defined to wrap at 32 bits"
+    )]
+    let ms = now as u32;
+    ts_base.wrapping_add(ms)
+}
+
+/// How much sequence space a segment occupies: its payload, and one more for a
+/// FIN.
+fn occupied(seg: &Segment<'_>) -> u32 {
+    let len = u32::try_from(seg.payload.len()).unwrap_or(u32::MAX);
+    if seg.has(segment::flags::FIN) {
+        len.wrapping_add(1)
+    } else {
+        len
+    }
+}
+
+/// The SYN+ACK answering `syn`, composed from it alone.
+///
+/// Nothing is kept, so a repeated SYN draws the same answer and a flood of them
+/// costs nothing but the replies -- which is what lets a responder answer
+/// before it knows who is asking. The responder supplies its own sequence
+/// number and timestamp; the acknowledgement and the echoed timestamp come from
+/// the SYN, and the window is the profile's unscaled SYN window, as on any
+/// SYN. Once the peer answers, [`Endpoint::rejoin`] takes up the connection.
+///
+/// # Errors
+/// Returns [`Error::Short`] if `out` cannot hold the segment.
+pub fn answer_syn(
+    profile: &OsProfile,
+    local: (Ipv4Addr, u16),
+    syn: &Segment<'_>,
+    isn: u32,
+    ts_val: u32,
+    dont_fragment: bool,
+    out: &mut [u8],
+) -> Result<usize> {
+    let fields = Fields {
+        src: local,
+        dst: syn.src,
+        seq: isn,
+        ack: syn.seq.wrapping_add(1),
+        window: profile.syn_window,
+        // Knuth's multiplicative hash, as for every other segment, of the one
+        // varying number this has.
+        ip_id: u16::try_from(isn.wrapping_mul(0x9E37_79B9) >> 16).unwrap_or(0),
+        ts_val,
+        ts_ecr: syn.ts_val.unwrap_or(0),
+        dont_fragment,
+    };
+    segment::emit(Kind::SynAck, profile, &fields, &[], out)
 }
 
 #[cfg(test)]
@@ -762,9 +1077,9 @@ mod tests {
     }
 
     #[test]
-    fn stream_numbering_stalls_on_loss_which_is_why_it_is_not_the_default() {
-        // Pinning the behaviour that motivated the change, so that if anyone
-        // makes `Stream` the default again this test says what that costs.
+    fn stream_numbering_acknowledges_only_what_arrives() {
+        // With nothing arriving, nothing more is acknowledged: the
+        // acknowledgement describes the peer's bytes, not our own sending.
         let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
@@ -778,10 +1093,7 @@ mod tests {
             .expect("parse")
             .ack;
 
-        assert_eq!(
-            first, second,
-            "nothing arrived, so the acknowledgement does not move -- for ever"
-        );
+        assert_eq!(first, second);
     }
 
     /// A handshaking client, since most tests here exercise the handshake path.
@@ -1264,10 +1576,11 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_packet_leaves_a_gap_rather_than_a_false_acknowledgement() {
-        // The documented limitation, pinned so it cannot change silently: with
-        // no retransmission, a dropped packet means our acknowledgement falls
-        // permanently behind the peer's sequence. It must never run ahead.
+    fn a_lost_packet_does_not_freeze_the_acknowledgement() {
+        // Nothing here sends anything twice, so an acknowledgement held at a
+        // hole is held there for good -- a receiver that stopped acknowledging,
+        // which is the one thing a real connection never is for long. The next
+        // segment that arrives moves it past the hole.
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
@@ -1278,19 +1591,351 @@ mod tests {
         let _lost = emitted(|b| c.data(&[2u8; 300], b, 1));
 
         let third = emitted(|b| c.data(&[3u8; 100], b, 2));
-        let third_seg = parse_ipv4(&third).expect("parse");
-        s.on_receive(&third_seg);
+        s.on_receive(&parse_ipv4(&third).expect("parse"));
 
-        let peer_next_seq = c.next_seq();
-        let our_ack = s.next_ack().expect("established");
+        assert_eq!(s.next_ack(), Some(c.next_seq()));
+    }
+
+    #[test]
+    fn a_reordered_segment_does_not_pull_the_acknowledgement_back() {
+        let (mut c, mut s) = midstream_pair();
+        let early = emitted(|b| c.data(&[1u8; 500], b, 0));
+        let late = emitted(|b| c.data(&[2u8; 500], b, 1));
+
+        s.on_receive(&parse_ipv4(&late).expect("parse"));
+        let ack = s.next_ack();
+        s.on_receive(&parse_ipv4(&early).expect("parse"));
+
+        assert_eq!(s.next_ack(), ack, "the older segment changes nothing");
+        assert_eq!(s.next_ack(), Some(c.next_seq()));
+    }
+
+    #[test]
+    fn a_peer_numbering_from_somewhere_new_is_followed() {
+        // A peer that restarted or rebuilt its carrier starts again from a new
+        // base, which may lie behind the old position as easily as ahead of
+        // it. Acknowledging the old stream would describe nothing on the wire.
+        for base in [
+            CLIENT_ISN.wrapping_sub(50_000_000),
+            CLIENT_ISN.wrapping_add(50_000_000),
+        ] {
+            let (mut c, mut s) = midstream_pair();
+            let packet = emitted(|b| c.data(&[1u8; 100], b, 0));
+            s.on_receive(&parse_ipv4(&packet).expect("parse"));
+
+            let mut fresh = Endpoint::new(Config {
+                isn: base,
+                ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+            });
+            let packet = emitted(|b| fresh.data(&[2u8; 100], b, 1));
+            s.on_receive(&parse_ipv4(&packet).expect("parse"));
+
+            assert_eq!(s.next_ack(), Some(base.wrapping_add(100)), "base {base}");
+        }
+    }
+
+    #[test]
+    fn a_peer_at_a_new_address_is_learned_from_its_first_segment() {
+        let (mut c, mut s) = midstream_pair();
+        let packet = emitted(|b| c.data(&[1u8; 100], b, 0));
+        s.on_receive(&parse_ipv4(&packet).expect("parse"));
+
+        // Close behind, so only the move explains taking it.
+        let mut moved = Endpoint::new(Config {
+            isn: CLIENT_ISN.wrapping_sub(1_000),
+            local: (Ipv4Addr::new(198, 51, 100, 77), 55555),
+            ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+        });
+        s.set_remote(moved.local);
+        let packet = emitted(|b| moved.data(&[2u8; 10], b, 1));
+        s.on_receive(&parse_ipv4(&packet).expect("parse"));
+
+        assert_eq!(s.next_ack(), Some(moved.next_seq()));
+    }
+
+    #[test]
+    fn the_first_segment_settles_a_derived_position() {
+        // Where the peer's numbering starts is derived from the tunnel
+        // handshake -- right for a peer that started when we did, wrong for
+        // one that restarted since. Its first segment says which.
+        let mut s = Endpoint::new(cfg(Role::Responder, Carrier::Midstream, LINUX_6));
+        let mut stranger = Endpoint::new(Config {
+            isn: CLIENT_ISN.wrapping_sub(5_000),
+            ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+        });
+        let packet = emitted(|b| stranger.data(&[1u8; 10], b, 0));
+        s.on_receive(&parse_ipv4(&packet).expect("parse"));
+        assert_eq!(s.next_ack(), Some(stranger.next_seq()));
+    }
+
+    /// An endpoint announcing itself without waiting.
+    fn announced(role: Role) -> Endpoint {
+        Endpoint::new(cfg(role, Carrier::FakeHandshake, LINUX_6))
+    }
+
+    #[test]
+    fn a_fake_handshake_opens_with_one_syn_just_below_its_data() {
+        let mut c = announced(Role::Initiator);
+        let mut buf = vec![0u8; MAX_OVERHEAD + 64];
+        assert!(c.wants_opening());
+        assert!(!c.is_ready(), "nothing may go ahead of the SYN");
+        assert!(matches!(
+            c.data(b"early", &mut buf, 0),
+            Err(Error::NotEstablished)
+        ));
+
+        let n = c.handshake(&mut buf, 0).expect("syn").expect("some");
+        let syn = parse_ipv4(&buf[..n]).expect("parse");
+        assert_eq!(syn.flags, segment::flags::SYN);
+        assert_eq!(syn.seq, CLIENT_ISN.wrapping_sub(1));
+        assert_eq!(syn.ack, 0);
+        assert_eq!(syn.window, LINUX_6.syn_window);
+
+        assert!(!c.wants_opening(), "announced once");
+        assert_eq!(c.handshake(&mut buf, 1).expect("again"), None);
+        assert!(c.is_ready(), "and nothing waits for an answer");
+
+        let n = c.data(b"first", &mut buf, 2).expect("data");
+        let data = parse_ipv4(&buf[..n]).expect("parse");
+        assert_eq!(data.seq, CLIENT_ISN, "the byte after the SYN");
         assert!(
-            our_ack != peer_next_seq,
-            "the gap should still be visible, not papered over"
+            u32::from(data.window) < LINUX_6.window,
+            "scaled, as the SYN declared"
         );
+    }
+
+    #[test]
+    fn a_fake_handshake_answer_sits_just_below_the_responders_data() {
+        let mut s = announced(Role::Responder);
+        let mut buf = vec![0u8; MAX_OVERHEAD + 64];
+        assert!(!s.wants_opening(), "a responder only ever answers");
+        assert_eq!(s.handshake(&mut buf, 0).expect("nothing"), None);
+
+        let n = s.answer(CLIENT_ISN, &mut buf, 0).expect("synack");
+        let synack = parse_ipv4(&buf[..n]).expect("parse");
+        assert_eq!(synack.flags, segment::flags::SYN | segment::flags::ACK);
+        assert_eq!(synack.seq, SERVER_ISN.wrapping_sub(1));
+        assert_eq!(synack.ack, CLIENT_ISN);
+
+        let n = s.data(b"reply", &mut buf, 1).expect("data");
+        assert_eq!(parse_ipv4(&buf[..n]).expect("parse").seq, SERVER_ISN);
+    }
+
+    #[test]
+    fn a_fake_handshake_initiator_learns_the_answers_numbering() {
+        let mut c = announced(Role::Initiator);
+        let mut s = announced(Role::Responder);
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+
+        // A responder that has moved on since the numbers were derived.
+        let _ = emitted(|b| s.data(&[0u8; 700], b, 0));
+        let synack = emitted(|b| s.answer(syn.seq.wrapping_add(1), b, 1));
+        c.on_receive(&parse_ipv4(&synack).expect("parse"));
+
+        assert_eq!(c.next_ack(), Some(s.next_seq()));
+    }
+
+    /// Emits the opening segment an endpoint owes, which a test expects to exist.
+    fn opening(e: &mut Endpoint, now: u64) -> Vec<u8> {
+        emitted(|b| e.handshake(b, now).map(|n| n.expect("an opening is owed")))
+    }
+
+    #[test]
+    fn a_repeated_syn_is_the_same_syn() {
+        // The responder checks the number against the timestamp, so a repeat
+        // that took a fresh timestamp would fail the check it passed the first
+        // time.
+        let mut c = client();
+        let first = opening(&mut c, 100);
+        let again = opening(&mut c, 1_100);
+        let (first, again) = (
+            parse_ipv4(&first).expect("parse"),
+            parse_ipv4(&again).expect("parse"),
+        );
+        assert_eq!(first.seq, again.seq);
+        assert_eq!(first.ts_val, again.ts_val);
+        assert_eq!(first.ts_val, Some(timestamp(5_000, 100)));
+    }
+
+    #[test]
+    fn a_syn_ack_for_someone_elses_syn_opens_nothing() {
+        let mut c = client();
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+        let other = segment::Segment {
+            seq: syn.seq.wrapping_add(9),
+            ..syn
+        };
+        let forged = emitted(|b| answer_syn(&LINUX_6, SERVER, &other, 77, 1, true, b));
+        c.on_receive(&parse_ipv4(&forged).expect("parse"));
+        assert!(!c.is_ready(), "it does not acknowledge our SYN");
+        assert!(c.wants_opening());
+    }
+
+    #[test]
+    fn a_stateless_answer_opens_the_connection_it_answers() {
+        let mut c = client();
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+
+        let synack = emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 4_242, 9_999, true, b));
+        let synack = parse_ipv4(&synack).expect("parse");
+        assert_eq!(synack.flags, segment::flags::SYN | segment::flags::ACK);
+        assert_eq!(synack.ack, CLIENT_ISN.wrapping_add(1));
+        assert_eq!(synack.dst, CLIENT);
+        assert_eq!(synack.window, LINUX_6.syn_window);
+        assert_eq!(synack.ts_val, Some(9_999));
+
+        c.on_receive(&synack);
+        assert!(c.is_ready());
+        assert!(!c.wants_opening());
+        let ack = emitted(|b| c.ack(b, 1));
+        let ack = parse_ipv4(&ack).expect("parse");
+        assert_eq!(ack.flags, segment::flags::ACK);
+        assert_eq!(ack.seq, CLIENT_ISN.wrapping_add(1));
+        assert_eq!(ack.ack, 4_243);
+
+        // The responder kept nothing, and takes up the connection from the
+        // first segment the peer sends on it.
+        let mut s = server();
+        let hello = emitted(|b| c.data(b"hello", b, 2));
+        s.rejoin(&parse_ipv4(&hello).expect("parse"), 7_000);
+        assert!(s.is_ready());
+        assert_eq!(s.next_ack(), Some(CLIENT_ISN.wrapping_add(6)));
+        let reply = emitted(|b| s.data(b"hi", b, 3));
+        let reply = parse_ipv4(&reply).expect("parse");
+        assert_eq!(reply.seq, 4_243, "the byte after the SYN+ACK it never kept");
+        c.on_receive(&reply);
+        assert_eq!(c.next_ack(), Some(4_245));
+    }
+
+    #[test]
+    fn a_forged_syn_ack_is_refused_whatever_else_it_carries() {
+        // The one check an unauthenticated segment gets. A reset folded into a
+        // SYN+ACK that otherwise answers our SYN would close the connection on
+        // the word of whoever claimed the peer's address.
+        let mut c = client();
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+        let synack = emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 77, 1, true, b));
+        let good = parse_ipv4(&synack).expect("parse");
+        assert!(c.answers_syn(&good));
+        for extra in [segment::flags::RST, segment::flags::FIN] {
+            let forged = segment::Segment {
+                flags: good.flags | extra,
+                ..good
+            };
+            assert!(!c.answers_syn(&forged), "flags {:#x}", forged.flags);
+        }
+        let elsewhere = segment::Segment {
+            ack: good.ack.wrapping_add(1),
+            ..good
+        };
+        assert!(!c.answers_syn(&elsewhere));
+        let no_ack = segment::Segment {
+            flags: segment::flags::SYN,
+            ..good
+        };
+        assert!(!c.answers_syn(&no_ack));
+    }
+
+    #[test]
+    fn a_late_copy_of_the_syn_ack_does_not_rewind_the_acknowledgement() {
+        let mut c = client();
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+        let synack = emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 4_242, 1, true, b));
+        let synack = parse_ipv4(&synack).expect("parse");
+        c.on_receive(&synack);
+
+        let mut s = server();
+        let hello = emitted(|b| c.data(b"hello", b, 1));
+        s.rejoin(&parse_ipv4(&hello).expect("parse"), 7_000);
+        let reply = emitted(|b| s.data(&[0u8; 900], b, 2));
+        c.on_receive(&parse_ipv4(&reply).expect("parse"));
+        let ack = c.next_ack();
+
+        c.on_receive(&synack);
+        assert_eq!(c.next_ack(), ack);
+    }
+
+    #[test]
+    fn a_peer_that_restarted_in_place_is_told_apart_by_its_acknowledgement() {
+        let (mut c, mut s) = (client(), server());
+        connect(&mut c, &mut s);
+        let current = emitted(|b| c.data(b"same connection", b, 0));
+        assert!(!s.names_another_connection(&parse_ipv4(&current).expect("parse")));
+
+        let reborn = segment::Segment {
+            ack: s.next_seq().wrapping_add(1 << 30),
+            ..parse_ipv4(&current).expect("parse")
+        };
+        assert!(s.names_another_connection(&reborn));
+        let behind = segment::Segment {
+            ack: s.next_seq().wrapping_sub(1 << 30),
+            ..reborn
+        };
+        assert!(s.names_another_connection(&behind));
+
+        let opaque = Endpoint::new(opaque(Role::Responder));
+        assert!(
+            !opaque.names_another_connection(&reborn),
+            "opaque acknowledgements describe nothing"
+        );
+    }
+
+    #[test]
+    fn a_syn_is_numbered_from_the_timestamp_it_carries() {
+        let mut c = client();
+        c.number_syn(250, |ts| ts.wrapping_mul(3));
+        let syn = opening(&mut c, 900);
+        let syn = parse_ipv4(&syn).expect("parse");
+        let ts = timestamp(5_000, 250);
         assert_eq!(
-            peer_next_seq.wrapping_sub(our_ack),
-            300,
-            "and it should be exactly the lost segment"
+            syn.ts_val,
+            Some(ts),
+            "the timestamp of when it was numbered"
         );
+        assert_eq!(syn.seq, ts.wrapping_mul(3));
+
+        c.number_syn(5_000, |_| 1);
+        let again = opening(&mut c, 5_000);
+        assert_eq!(
+            parse_ipv4(&again).expect("parse").seq,
+            syn.seq,
+            "a repeat is the same SYN"
+        );
+    }
+
+    #[test]
+    fn rejoining_reads_the_clock_the_syn_ack_read() {
+        let mut c = client();
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+        let synack =
+            emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 1, timestamp(123_456, 10), true, b));
+        c.on_receive(&parse_ipv4(&synack).expect("parse"));
+        let hello = emitted(|b| c.data(b"hello", b, 20));
+
+        let mut s = server();
+        s.rejoin(&parse_ipv4(&hello).expect("parse"), 123_456);
+        let reply = emitted(|b| s.data(b"hi", b, 30));
+        assert_eq!(
+            parse_ipv4(&reply).expect("parse").ts_val,
+            Some(timestamp(123_456, 30))
+        );
+    }
+
+    #[test]
+    fn nothing_goes_out_before_the_syn_ack() {
+        let mut c = client();
+        let mut buf = vec![0u8; MAX_OVERHEAD + 64];
+        let _ = c.handshake(&mut buf, 0).expect("syn");
+        assert!(!c.is_ready());
+        assert!(matches!(
+            c.data(b"early", &mut buf, 1),
+            Err(Error::NotEstablished)
+        ));
     }
 }

@@ -185,6 +185,38 @@ const ROTATE_JITTER: Millis = 5 * 60 * 1_000;
 /// the handshake itself.
 const ROTATE_AFTER_UNANSWERED: u32 = 4;
 
+/// How long a SYN waits for its SYN+ACK before going again, the first time.
+///
+/// What a real stack waits, doubling on each repeat up to [`SYN_RETRY_MAX`]: a
+/// lost SYN then costs what it costs any TCP connection, and the repeats read
+/// like any other connection's.
+const SYN_RETRY: Millis = 1_000;
+
+/// The longest a repeated SYN waits.
+///
+/// Capped well short of a real stack's two minutes, because rotation is what
+/// decides when a tuple is not worth knocking on, and it counts the SYNs.
+const SYN_RETRY_MAX: Millis = 8_000;
+
+/// How long a datapath thread waits before reading again, after a read the
+/// host is expected to recover from.
+const READ_RETRY: Duration = Duration::from_secs(1);
+
+/// How long a real handshake's SYN is repeated before a fresh one replaces it.
+///
+/// Its proof is bound to the time it was first sent, and holds for a period
+/// either side, so a SYN repeated for longer than half a period could outlive
+/// it -- and an end that cannot rotate, because its port is fixed, would then
+/// knock with a SYN the responder can only refuse, until it was restarted.
+const SYN_FRESH: Millis = noise::SYN_PERIOD_SECS * 1_000 / 2;
+
+/// How many answered SYNs a real handshake's responder remembers.
+const SYN_LEDGER_LEN: usize = 256;
+
+/// How long a real handshake's responder remembers an answered SYN: as long as
+/// the SYN could prove itself.
+const SYN_LEDGER_KEEP: Millis = 3 * noise::SYN_PERIOD_SECS * 1_000;
+
 /// What this end will spend on moving its five-tuple around.
 ///
 /// The defaults above are what a censored path wanted when they were measured,
@@ -382,6 +414,12 @@ struct PeerState {
     /// ends answering every keepalive with a keepalive is a loop that never
     /// stops, and an empty packet is not something that needs acknowledging.
     last_data_receive: Option<Millis>,
+    /// SYNs sent for the carrier's connection since one was answered.
+    syn_tries: u32,
+    /// The earliest the next SYN may go.
+    syn_retry_at: Millis,
+    /// When the current connection's SYN first went out.
+    opened_at: Millis,
 }
 
 impl PeerState {
@@ -409,7 +447,52 @@ impl PeerState {
             rotate_at: Millis::MAX,
             reported_mtu: None,
             unanswered: 0,
+            syn_tries: 0,
+            syn_retry_at: 0,
+            opened_at: 0,
         }
+    }
+
+    /// Puts a freshly built carrier in place, owing whatever opens it.
+    ///
+    /// Its SYN goes when the last one's wait is up, which on a working tunnel
+    /// is at once. The wait carries over until a SYN is answered, so moving to
+    /// a new port is not a way of knocking faster: on a path that answers
+    /// nothing, the last SYN on the old port and the first on the new one
+    /// would otherwise go out together, and the wait restart at a second on
+    /// every port tried.
+    fn replace_carrier(&mut self, carrier: Wire) {
+        self.carrier = Some(carrier);
+    }
+
+    /// Whether a SYN still owed may be repeated now.
+    ///
+    /// Only while something wants the tunnel -- a session moved onto a new
+    /// port, or a handshake due -- so an idle end that has given up
+    /// handshaking gives up knocking with it, and starts again when the
+    /// handshake does.
+    fn knock_due(&self, now: Millis) -> bool {
+        now >= self.syn_retry_at && (self.session.is_some() || self.wants_handshake(now))
+    }
+
+    /// Whether a real handshake's SYN has been repeated long enough that a
+    /// fresh one, with a proof bound to now, should replace it.
+    fn syn_stale(&self, now: Millis) -> bool {
+        now.saturating_sub(self.opened_at) >= SYN_FRESH
+    }
+
+    /// Records a real handshake's SYN as sent.
+    ///
+    /// Unanswered until its SYN+ACK arrives, like a tunnel handshake, so a
+    /// tuple that swallows SYNs is left behind by the same rule as one that
+    /// swallows handshakes; and it opens a run of attempts, so giving up and
+    /// starting again are paced by the same clocks too.
+    fn sent_syn(&mut self, now: Millis) {
+        self.syn_tries = self.syn_tries.saturating_add(1);
+        self.syn_retry_at = now.saturating_add(syn_backoff(self.syn_tries));
+        self.unanswered = self.unanswered.saturating_add(1);
+        self.last_handshake = now;
+        self.attempt_started.get_or_insert(now);
     }
 
     /// The header mask for this peer, if any session exists.
@@ -798,6 +881,33 @@ impl Wire {
         }
     }
 
+    /// Whether a packet may go out on this carrier now: false only while a
+    /// connection is still opening.
+    fn is_ready(&self) -> bool {
+        match self {
+            Self::Tcp(c) => c.is_ready(),
+            Self::Raw(_) => true,
+        }
+    }
+
+    /// Whether the peer's acknowledgement in `seg` describes another
+    /// connection's numbering: one it opened from the same place after a
+    /// restart.
+    fn names_another_connection(&self, seg: &segment::Segment<'_>) -> bool {
+        match self {
+            Self::Tcp(c) => c.names_another_connection(seg),
+            Self::Raw(_) => false,
+        }
+    }
+
+    /// The fake-TCP endpoint, for what only that shape does.
+    fn tcp(&mut self) -> Option<&mut Carrier> {
+        match self {
+            Self::Tcp(c) => Some(c),
+            Self::Raw(_) => None,
+        }
+    }
+
     /// Follows the peer to a new address.
     fn set_remote(&mut self, remote: SocketAddrV4) {
         match self {
@@ -841,6 +951,114 @@ pub(crate) struct Tunnel {
     config_path: Option<std::path::PathBuf>,
     /// What to call this tunnel in the log, when the process has several.
     label: Option<String>,
+    /// SYNs answered under a real handshake, and where each came from.
+    answered: Mutex<SynLedger>,
+    /// Drawn at start-up and mixed into the responder's timestamp clocks, so a
+    /// restart does not put them back where they began.
+    clock_secret: u32,
+    /// Why the tunnel stopped, when a datapath thread ended it.
+    fault: Mutex<Option<String>>,
+}
+
+/// A datapath read that keeps failing, and since when.
+#[derive(Debug, Default)]
+struct Outage {
+    since: Option<Instant>,
+}
+
+/// What a datapath thread does after a read fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterFailure {
+    /// Wait, and read again.
+    Wait,
+    /// End the tunnel.
+    Stop,
+}
+
+/// Whether a failed datapath read is waited out or ends the tunnel.
+///
+/// A thread that stops reading leaves the process up and the tunnel deaf:
+/// nothing exits, so nothing restarts it, and the health line goes on
+/// describing a tunnel that hears nothing. Found in a long run as a receive
+/// thread that stopped for good on `Network is down`, when an interface went
+/// down for a moment. So what the host recovers from on its own -- the
+/// interface down while a link flaps or a network restarts, the device down,
+/// a buffer briefly short -- is waited out, and anything else ends the tunnel
+/// with an error, for the service manager to start it again from scratch.
+fn after_failure(e: &io::Error) -> AfterFailure {
+    let recoverable = matches!(
+        e.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::NetworkDown
+    ) || matches!(
+        e.raw_os_error(),
+        Some(
+            libc::ENETDOWN
+                | libc::ENETRESET
+                | libc::ENODEV
+                | libc::ENXIO
+                // A TUN device read while the device is down.
+                | libc::EIO
+                | libc::ENOBUFS
+                | libc::ENOMEM
+        )
+    );
+    if recoverable {
+        AfterFailure::Wait
+    } else {
+        AfterFailure::Stop
+    }
+}
+
+/// SYNs a real handshake's responder has answered, and where each came from.
+///
+/// A SYN's proof cannot cover the sender's address, because a NAT changes it
+/// in transit, so a SYN captured off the wire proves itself for whoever sends
+/// it again within its period -- and the answer it draws is exactly what a
+/// scanner is after. Remembering where each SYN came from first leaves such a
+/// copy unanswered, while the sender's own repeats, from the same place, are
+/// answered as often as they arrive.
+#[derive(Debug, Default)]
+struct SynLedger {
+    seen: std::collections::VecDeque<(u32, SocketAddrV4, Millis)>,
+}
+
+impl SynLedger {
+    /// Whether to answer a SYN numbered `seq` from `from`, remembering it if so.
+    fn admit(&mut self, seq: u32, from: SocketAddrV4, now: Millis) -> bool {
+        while self
+            .seen
+            .front()
+            .is_some_and(|(_, _, at)| now.saturating_sub(*at) > SYN_LEDGER_KEEP)
+        {
+            self.seen.pop_front();
+        }
+        if let Some((_, first, _)) = self.seen.iter().find(|(s, _, _)| *s == seq) {
+            return *first == from;
+        }
+        if self.seen.len() >= SYN_LEDGER_LEN {
+            self.seen.pop_front();
+        }
+        self.seen.push_back((seq, from, now));
+        true
+    }
+}
+
+/// How long to wait before repeating a SYN that has gone out `tries` times.
+fn syn_backoff(tries: u32) -> Millis {
+    SYN_RETRY
+        .saturating_mul(1 << tries.saturating_sub(1).min(3))
+        .min(SYN_RETRY_MAX)
+}
+
+/// The period of the clock a SYN's proof is bound to, now.
+///
+/// Wall-clock time, because it has to agree between two hosts. A clock that
+/// cannot be read reads as the epoch, and a SYN proved against it fails --
+/// which is the failure of a host whose clock is broken, said by its peer.
+fn syn_period() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() / noise::SYN_PERIOD_SECS)
 }
 
 /// Anything that can stop the tunnel starting.
@@ -863,9 +1081,9 @@ pub(crate) enum Error {
     #[error("carrier: {0}")]
     Wire(#[from] paqetz_tcpwire::Error),
 
-    /// A configuration was valid but names something not yet built.
+    /// A datapath thread could not go on.
     #[error("{0}")]
-    Unsupported(&'static str),
+    Datapath(String),
 }
 
 /// Result alias for this module.
@@ -884,20 +1102,6 @@ impl Tunnel {
     /// # Errors
     /// Returns the first failure, with context describing what was attempted.
     pub(crate) fn start(cfg: TunnelConfig, health_interval: u64) -> Result<Self> {
-        if matches!(
-            cfg.interface.shape,
-            crate::config::Shape::Tcp(paqetz_tcpwire::Carrier::Handshake)
-        ) {
-            // The carrier can emit SYN/SYN+ACK/ACK, but nothing here drives that
-            // exchange or retries a lost SYN yet. Refusing is better than
-            // starting a tunnel whose first data segment fails with
-            // "not established". See docs/decisions/D14-carrier-mode.md.
-            return Err(Error::Unsupported(
-                "carrier = \"handshake\" is not implemented yet; \
-                 use the default \"midstream\"",
-            ));
-        }
-
         // Said once, at start-up, rather than left for someone to infer from a
         // rotation line that never appears. `rotate` defaults to on, so most
         // configurations that reach here are asking for something this carrier
@@ -1056,6 +1260,9 @@ impl Tunnel {
             running: Arc::new(AtomicBool::new(true)),
             stats: Arc::new(Stats::default()),
             config_path: None,
+            answered: Mutex::new(SynLedger::default()),
+            clock_secret: os("drawing a timestamp secret", random_u32())?,
+            fault: Mutex::new(None),
         })
     }
 
@@ -1138,6 +1345,126 @@ impl Tunnel {
         self.cfg.peer.is_initiator()
     }
 
+    /// How the fake-TCP carrier opens its connections, if that is the shape in
+    /// use.
+    const fn opening(&self) -> Option<paqetz_tcpwire::Carrier> {
+        match self.cfg.interface.shape {
+            crate::config::Shape::Tcp(carrier) => Some(carrier),
+            crate::config::Shape::Raw(_) => None,
+        }
+    }
+
+    /// Builds the initiating side's carrier for a new connection, numbered
+    /// from `epoch`.
+    fn initiator_carrier(&self, local: (Ipv4Addr, u16), peer: SocketAddrV4, epoch: u32) -> Wire {
+        let numbers = noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
+        self.wire(Role::Initiator, local, (*peer.ip(), peer.port()), numbers)
+    }
+
+    /// Sends the SYN the carrier still owes, if it owes one and it is due.
+    ///
+    /// Sent with the state still held, which is what keeps everything else
+    /// behind it: a fake handshake's carrier counts as open the moment its SYN
+    /// is written, and another thread sealing a packet in the gap would put
+    /// data on the wire ahead of the SYN that is meant to open it.
+    ///
+    /// A real handshake's SYN repeated for [`SYN_FRESH`] is replaced by a
+    /// fresh one, with a proof bound to now, rather than repeated past the
+    /// point where it proves anything. Returns whether a SYN went out.
+    fn knock(&self, state: &mut PeerState, out: &mut [u8], now: Millis) -> Result<bool> {
+        if now < state.syn_retry_at {
+            return Ok(false);
+        }
+        let stale_proof = state.syn_stale(now);
+        let (waits, stale, local) = match state.carrier.as_mut().and_then(Wire::tcp) {
+            Some(tcp) if tcp.wants_opening() => {
+                let waits = tcp.carrier() == paqetz_tcpwire::Carrier::Handshake;
+                let stale = waits && tcp.phase() == paqetz_tcpwire::Phase::SynSent && stale_proof;
+                (waits, stale, tcp.local())
+            }
+            _ => return Ok(false),
+        };
+        if stale && let Some(peer) = state.endpoint {
+            let epoch = os("drawing an epoch", random_u32())?;
+            state.carrier = Some(self.initiator_carrier(local, peer, epoch));
+        }
+        let Some(tcp) = state.carrier.as_mut().and_then(Wire::tcp) else {
+            return Ok(false);
+        };
+        let first = tcp.phase() == paqetz_tcpwire::Phase::Idle || !waits;
+        if waits {
+            // The proof the responder will check, bound to the timestamp this
+            // SYN carries and to the time.
+            let responder = &self.cfg.peer.public_key;
+            tcp.number_syn(now, |ts| noise::syn_tag(responder, syn_period(), ts));
+        }
+        let Some(n) = tcp.handshake(out, now)? else {
+            return Ok(false);
+        };
+        let dst = tcp.remote().0;
+        if waits {
+            if first {
+                state.opened_at = now;
+            }
+            state.sent_syn(now);
+        }
+        let Some(syn) = out.get(..n) else {
+            return Ok(false);
+        };
+        os("transmitting a SYN", self.tx.send(syn, dst))?;
+        debug!("SYN sent to {dst}");
+        Ok(true)
+    }
+
+    /// The timestamp clock a real handshake's responder reads for the
+    /// connection from `from`.
+    fn responder_clock(&self, from: (Ipv4Addr, u16)) -> u32 {
+        noise::responder_ts_base(
+            &self.cfg.interface.private_key,
+            self.clock_secret,
+            (from.0.octets(), from.1),
+        )
+    }
+
+    /// Folds the peer's first authenticated segment on a connection into the
+    /// carrier, writing into `out` the SYN+ACK a fake handshake owes it.
+    ///
+    /// `fresh` says the segment opens a connection this end has not seen yet:
+    /// the carrier was just built, the peer arrived from somewhere new, or it
+    /// restarted where it was and acknowledges another connection's numbering.
+    /// Under a real handshake the SYN+ACK went out already, composed from the
+    /// SYN alone, so this end takes up its numbering from the peer's
+    /// acknowledgement instead. Only the responder does either; an initiator
+    /// opened the connection itself.
+    fn take_up(
+        &self,
+        carrier: &mut Wire,
+        seg: &segment::Segment<'_>,
+        fresh: bool,
+        out: &mut [u8],
+        now: Millis,
+    ) -> Result<Option<usize>> {
+        let answering = fresh && !self.is_initiator();
+        match carrier.tcp() {
+            Some(tcp) if answering && tcp.carrier() == paqetz_tcpwire::Carrier::Handshake => {
+                tcp.rejoin(seg, self.responder_clock(seg.src));
+                Ok(None)
+            }
+            Some(tcp) if answering && tcp.carrier() == paqetz_tcpwire::Carrier::FakeHandshake => {
+                tcp.set_remote(seg.src);
+                tcp.on_receive(seg);
+                // Acknowledging the byte its first segment starts at, which is
+                // where a real SYN+ACK would say the connection begins.
+                Ok(Some(tcp.answer(seg.seq, out, now)?))
+            }
+            _ => {
+                carrier.set_remote(SocketAddrV4::new(seg.src.0, seg.src.1));
+                carrier.on_receive(seg);
+                Ok(None)
+            }
+        }
+    }
+
     /// Runs until stopped. Consumes the tunnel.
     ///
     /// # Errors
@@ -1202,7 +1529,8 @@ impl Tunnel {
         this.stop();
 
         drop((t1, t2, t3, t4));
-        Ok(())
+        let fault = this.fault.lock().unwrap_or_else(|e| e.into_inner()).take();
+        fault.map_or(Ok(()), |why| Err(Error::Datapath(why)))
     }
 
     /// Names this tunnel in its own log lines.
@@ -1365,6 +1693,52 @@ impl Tunnel {
         self.running.store(false, Ordering::Relaxed);
     }
 
+    /// Handles a failed datapath read, saying whether to read again.
+    ///
+    /// Waited out when [`after_failure`] says the host will recover, with one
+    /// line when it starts and one when it ends rather than one per try.
+    /// Otherwise the whole process stops, with the reason, so that it exits
+    /// with an error and the service manager restarts it -- every tunnel in it,
+    /// since a process half of whose tunnels are deaf is not one anybody would
+    /// think to restart.
+    fn read_failed(&self, what: &str, e: &io::Error, outage: &mut Outage) -> bool {
+        if e.kind() == io::ErrorKind::Interrupted {
+            return true;
+        }
+        match after_failure(e) {
+            AfterFailure::Wait => {
+                if outage.since.is_none() {
+                    warn_!(
+                        "{}{what} failed: {e}; waiting for it to recover",
+                        self.tag()
+                    );
+                    outage.since = Some(Instant::now());
+                }
+                std::thread::sleep(READ_RETRY);
+                true
+            }
+            AfterFailure::Stop => {
+                error!("{}{what} failed: {e}", self.tag());
+                *self.fault.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("{what} failed: {e}"));
+                SHUTDOWN.store(true, Ordering::Relaxed);
+                self.stop();
+                false
+            }
+        }
+    }
+
+    /// Notes a datapath read that worked, ending any outage.
+    fn read_ok(&self, what: &str, outage: &mut Outage) {
+        if let Some(since) = outage.since.take() {
+            info!(
+                "{}{what} works again, after {}s",
+                self.tag(),
+                since.elapsed().as_secs()
+            );
+        }
+    }
+
     // -- outbound ------------------------------------------------------------
 
     /// Reads inner packets, encrypts them, and puts them on the wire.
@@ -1381,15 +1755,18 @@ impl Tunnel {
         let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
         let mut frame = vec![0u8; MAX_INNER + MAX_OVERHEAD + paqetz_core::framing::OVERHEAD];
 
+        let mut outage = Outage::default();
         while self.running.load(Ordering::Relaxed) {
             let n = match self.tun.recv(&mut inner) {
-                Ok(n) if n > 0 => n,
+                Ok(n) if n > 0 => {
+                    self.read_ok("reading the device", &mut outage);
+                    n
+                }
                 Ok(_) => continue,
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
+                    if self.read_failed("reading the device", &e, &mut outage) {
                         continue;
                     }
-                    error!("reading the device failed: {e}");
                     break;
                 }
             };
@@ -1423,10 +1800,11 @@ impl Tunnel {
         let mut sealed = vec![0u8; MAX_INNER + paqetz_core::framing::OVERHEAD];
         let mut lens = [0usize; sys::BATCH];
         let mut dsts = Vec::with_capacity(sys::BATCH);
+        let mut outage = Outage::default();
 
         while self.running.load(Ordering::Relaxed) {
             // Block for the first, then take anything else already queued.
-            let Some(first) = self.read_inner_blocking(&mut inner) else {
+            let Some(first) = self.read_inner_blocking(&mut inner, &mut outage) else {
                 break;
             };
             let mut count = 1;
@@ -1523,7 +1901,7 @@ impl Tunnel {
     /// Blocks in `poll` rather than in `read`, so the device can stay
     /// non-blocking for the drain that follows, and so the wait has a timeout
     /// through which a shutdown request is noticed.
-    fn read_inner_blocking(&self, inner: &mut [Vec<u8>]) -> Option<usize> {
+    fn read_inner_blocking(&self, inner: &mut [Vec<u8>], outage: &mut Outage) -> Option<usize> {
         loop {
             if !self.running.load(Ordering::Relaxed) {
                 return None;
@@ -1531,19 +1909,24 @@ impl Tunnel {
             match self.tun.wait_readable(250) {
                 Ok(false) => continue,
                 Ok(true) => {}
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    error!("waiting on the device failed: {e}");
+                    if self.read_failed("waiting on the device", &e, outage) {
+                        continue;
+                    }
                     return None;
                 }
             }
             let buf = inner.first_mut()?;
             match self.tun.recv_nonblocking(buf) {
-                Ok(Some(n)) if n > 0 => return Some(n),
+                Ok(Some(n)) if n > 0 => {
+                    self.read_ok("reading the device", outage);
+                    return Some(n);
+                }
                 Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    error!("reading the device failed: {e}");
+                    if self.read_failed("reading the device", &e, outage) {
+                        continue;
+                    }
                     return None;
                 }
             }
@@ -1596,11 +1979,21 @@ impl Tunnel {
         if state.session.as_ref().is_none_or(|s| s.is_expired(now)) {
             state.confirm();
         }
-        let Some(session) = state.session.as_mut() else {
+        if state.session.is_none() {
             // Traffic with nothing to carry it: the one thing that says this
             // tunnel is wanted, and so the one thing that restarts a run of
             // handshake attempts that has given up.
             state.wants_to_send();
+            return Ok(None);
+        }
+        // A connection still opening carries nothing yet. The packet is lost,
+        // as on a link not yet up -- and it is not sealed, so no counter is
+        // spent on it.
+        if state.carrier.as_ref().is_some_and(|c| !c.is_ready()) {
+            Stats::bump(&self.stats.tx_dropped);
+            return Ok(None);
+        }
+        let Some(session) = state.session.as_mut() else {
             return Ok(None);
         };
         // The counter this packet will carry, read before sealing spends it.
@@ -1664,14 +2057,17 @@ impl Tunnel {
         let mut inner = vec![0u8; MAX_INNER];
         let mut reply = vec![0u8; MAX_FRAME];
 
+        let mut outage = Outage::default();
         while self.running.load(Ordering::Relaxed) {
             let count = match self.rx.recv_batch(&mut frames, &mut lens) {
-                Ok(n) => n,
+                Ok(n) => {
+                    self.read_ok("reading from the wire", &mut outage);
+                    n
+                }
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
+                    if self.read_failed("reading from the wire", &e, &mut outage) {
                         continue;
                     }
-                    error!("reading from the wire failed: {e}");
                     break;
                 }
             };
@@ -1824,14 +2220,17 @@ impl Tunnel {
         let mut inner = vec![0u8; MAX_INNER];
         let mut reply = vec![0u8; MAX_FRAME];
 
+        let mut outage = Outage::default();
         while self.running.load(Ordering::Relaxed) {
             let n = match self.rx.recv(&mut frame) {
-                Ok(n) => n,
+                Ok(n) => {
+                    self.read_ok("reading from the wire", &mut outage);
+                    n
+                }
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
+                    if self.read_failed("reading from the wire", &e, &mut outage) {
                         continue;
                     }
-                    error!("reading from the wire failed: {e}");
                     break;
                 }
             };
@@ -1858,6 +2257,16 @@ impl Tunnel {
         let from = SocketAddrV4::new(seg.src.0, seg.src.1);
         let payload = seg.payload;
 
+        if seg.has(segment::flags::SYN) {
+            return self.handle_syn(seg, from, reply);
+        }
+        // How a connection finishes opening. It carries nothing to decrypt, and
+        // counting it as a rejection would report the peer's own handshake as
+        // someone sending garbage.
+        if payload.is_empty() && self.opening().is_some_and(paqetz_tcpwire::Carrier::opens) {
+            return Ok(());
+        }
+
         // A handshake and a transport packet can be the same length, so the
         // keyed mac1 decides which this is rather than the length (D7).
         //
@@ -1879,6 +2288,135 @@ impl Tunnel {
         }
 
         self.handle_transport(seg, from, inner)
+    }
+
+    /// Handles a SYN or a SYN+ACK: a connection opening.
+    ///
+    /// Nothing here is authenticated, which is why so little is done with it.
+    /// An initiator takes a SYN+ACK only if it acknowledges the SYN this end
+    /// sent; a real handshake's responder answers only a SYN that proves
+    /// itself; and everything else is refused and counted, as any unrecognised
+    /// packet at the port is -- except a fake handshake's SYN, which asks for
+    /// nothing and is answered once the peer has authenticated.
+    fn handle_syn(
+        &self,
+        seg: &segment::Segment<'_>,
+        from: SocketAddrV4,
+        reply: &mut [u8],
+    ) -> Result<()> {
+        if seg.has(segment::flags::ACK) {
+            return if self.is_initiator() {
+                self.handle_syn_ack(seg, from, reply)
+            } else {
+                Err(paqetz_core::Error::Rejected.into())
+            };
+        }
+        match self.opening() {
+            Some(paqetz_tcpwire::Carrier::Handshake) if !self.is_initiator() => {
+                self.answer_syn(seg, from, reply)
+            }
+            Some(paqetz_tcpwire::Carrier::FakeHandshake) => Ok(()),
+            _ => Err(paqetz_core::Error::Rejected.into()),
+        }
+    }
+
+    /// Takes the SYN+ACK answering this end's SYN, and completes the opening.
+    fn handle_syn_ack(
+        &self,
+        seg: &segment::Segment<'_>,
+        from: SocketAddrV4,
+        reply: &mut [u8],
+    ) -> Result<()> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tcp) = state.carrier.as_mut().and_then(Wire::tcp) else {
+            return Ok(());
+        };
+        // Nothing here is authenticated: an address is easy to claim. Only a
+        // SYN+ACK answering the SYN this end sent, on a carrier that sends one,
+        // is let near the connection's state.
+        if !tcp.carrier().opens()
+            || tcp.remote() != (*from.ip(), from.port())
+            || !tcp.answers_syn(seg)
+        {
+            return Err(paqetz_core::Error::Rejected.into());
+        }
+        let was_ready = tcp.is_ready();
+        // Checks that it acknowledges our SYN, and learns where the peer's
+        // numbering starts.
+        tcp.on_receive(seg);
+        if was_ready || !tcp.is_ready() {
+            // A fake handshake's, which only told us its numbering; or one that
+            // answered nothing we sent.
+            return Ok(());
+        }
+        let n = tcp.ack(reply, now)?;
+        state.syn_tries = 0;
+        state.syn_retry_at = 0;
+        // An answer on this tuple is what proves it still reaches the peer.
+        state.unanswered = 0;
+        // The tunnel handshake that was waiting on the connection goes now.
+        state.retry_at = now;
+        drop(state);
+
+        let Some(ack) = reply.get(..n) else {
+            return Ok(());
+        };
+        os("completing the connection", self.tx.send(ack, *from.ip()))?;
+        debug!("{}connection to {from} open", self.tag());
+        // Rather than on the next tick: a quarter of a second, on every new
+        // connection, for nothing.
+        self.maybe_handshake(reply)
+    }
+
+    /// Answers a SYN under a real handshake, if it proves its sender knows this
+    /// end's public key.
+    ///
+    /// Nothing is kept but the ledger of where each SYN came from: the
+    /// SYN+ACK's number is computed from the SYN, so a repeat draws the same
+    /// one, and the connection is taken up from the peer's first authenticated
+    /// packet on it.
+    fn answer_syn(
+        &self,
+        seg: &segment::Segment<'_>,
+        from: SocketAddrV4,
+        reply: &mut [u8],
+    ) -> Result<()> {
+        let now = self.now();
+        let Some(ts_val) = seg.ts_val else {
+            return Err(paqetz_core::Error::Rejected.into());
+        };
+        if !noise::syn_tag_matches(&self.local_public, syn_period(), ts_val, seg.seq) {
+            return Err(paqetz_core::Error::Rejected.into());
+        }
+        let admitted = self
+            .answered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(seg.seq, from, now);
+        if !admitted {
+            return Err(paqetz_core::Error::Rejected.into());
+        }
+
+        let private = &self.cfg.interface.private_key;
+        let isn = noise::syn_ack_isn(private, seg.seq, (seg.src.0.octets(), seg.src.1));
+        let ts = paqetz_tcpwire::endpoint::timestamp(self.responder_clock(seg.src), now);
+        let df = self.cfg.interface.fragment == crate::config::Fragment::Never;
+        let n = paqetz_tcpwire::endpoint::answer_syn(
+            &self.cfg.interface.profile,
+            seg.dst,
+            seg,
+            isn,
+            ts,
+            df,
+            reply,
+        )?;
+        let Some(synack) = reply.get(..n) else {
+            return Ok(());
+        };
+        os("answering a SYN", self.tx.send(synack, *from.ip()))?;
+        debug!("{}answered a SYN from {from}", self.tag());
+        Ok(())
     }
 
     /// Accepts an initiator's handshake and answers it.
@@ -1940,29 +2478,50 @@ impl Tunnel {
         }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let from = SocketAddrV4::new(seg.src.0, seg.src.1);
+        // A new connection: a first one, one from somewhere new, or one the
+        // peer opened from the same place after a restart, which only its
+        // acknowledgement can show.
+        let opens = self.opening().is_some_and(paqetz_tcpwire::Carrier::opens);
+        let fresh = state
+            .carrier
+            .as_ref()
+            .is_none_or(|c| c.remote() != from || opens && c.names_another_connection(seg));
 
         // As on the initiating side: a rekey must not restart the conversation
         // underneath it, so the carrier is built once and then kept.
         if state.carrier.is_none() {
+            // Under a real handshake the numbering comes from the connection
+            // itself, and the clock is the one the SYN+ACK already used.
+            let numbers = match self.opening() {
+                Some(paqetz_tcpwire::Carrier::Handshake) => (0, 0, self.responder_clock(seg.src)),
+                _ => (isn_r, isn_i, ts_base),
+            };
             // We learn our own outer address from where the peer sent to.
-            state.carrier = Some(self.wire(
+            state.replace_carrier(self.wire(
                 Role::Responder,
                 (seg.dst.0, seg.dst.1),
                 seg.src,
-                (isn_r, isn_i, ts_base),
+                numbers,
             ));
         }
 
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(());
         };
-        carrier.set_remote(SocketAddrV4::new(seg.src.0, seg.src.1));
-        // Fold in the segment that carried msg1, so our acknowledgement counts
-        // the bytes the peer actually sent.
-        carrier.on_receive(seg);
+        // Fold in the segment that carried msg1, so our acknowledgement says
+        // what the peer actually sent -- and announce the connection first, if
+        // a fake handshake owes it.
+        let mut synack = [0u8; MAX_OVERHEAD];
+        let announce = self.take_up(carrier, seg, fresh, &mut synack, now)?;
+        let dst = seg.src.0;
+        // Sent with the state still held, so nothing sealed by another thread
+        // reaches the wire ahead of the segment that opens the connection.
+        if let Some(syn_ack) = announce.and_then(|n| synack.get(..n)) {
+            os("announcing the connection", self.tx.send(syn_ack, dst))?;
+        }
 
         let written = carrier.data(msg2, reply, now)?;
-        let dst = seg.src.0;
 
         state.accept(session);
         state.pending = None;
@@ -2051,12 +2610,10 @@ impl Tunnel {
         // Authenticated, so the endpoint is trustworthy. Roaming (D5): the peer
         // may have moved, and following it here is what makes a NAT rebinding
         // invisible instead of fatal.
+        let fresh = state.carrier.as_ref().is_some_and(|c| c.remote() != from);
         if state.endpoint != Some(from) {
             let was = state.endpoint;
             state.endpoint = Some(from);
-            if let Some(carrier) = state.carrier.as_mut() {
-                carrier.set_remote(from);
-            }
             Stats::bump(&self.stats.roams);
             // The single most useful line when a link is flapping: it says the
             // peer moved and the tunnel followed, rather than leaving a gap in
@@ -2066,8 +2623,19 @@ impl Tunnel {
                 was.map_or_else(|| "unknown".to_owned(), |a| a.to_string())
             );
         }
-        if let Some(carrier) = state.carrier.as_mut() {
-            carrier.on_receive(seg);
+        // A peer arriving from somewhere new has opened a new connection, which
+        // a fake handshake announces and a real one takes up.
+        let mut synack = [0u8; MAX_OVERHEAD];
+        let announce = match state.carrier.as_mut() {
+            Some(carrier) => self.take_up(carrier, seg, fresh, &mut synack, now)?,
+            None => None,
+        };
+        // With the state held, so nothing sealed by another thread goes ahead.
+        if let Some(syn_ack) = announce.and_then(|n| synack.get(..n)) {
+            os(
+                "announcing the connection",
+                self.tx.send(syn_ack, *from.ip()),
+            )?;
         }
         // The other half. This is reached only for a packet that decrypted and
         // passed the replay window, so it is the peer speaking and no one else:
@@ -2324,11 +2892,14 @@ impl Tunnel {
             if initiator && let Err(e) = self.maybe_handshake(&mut frame) {
                 warn_!("handshake attempt failed: {e}");
             }
-            if let Err(e) = self.maybe_keepalive(&mut sealed, &mut keepalive_frame) {
-                debug!("keepalive failed: {e}");
-            }
             if initiator {
                 self.maybe_rotate();
+                if let Err(e) = self.maybe_open(&mut frame) {
+                    warn_!("could not open the connection: {e}");
+                }
+            }
+            if let Err(e) = self.maybe_keepalive(&mut sealed, &mut keepalive_frame) {
+                debug!("keepalive failed: {e}");
             }
             std::thread::sleep(TICK);
         }
@@ -2401,14 +2972,12 @@ impl Tunnel {
                 return;
             }
         };
-        let (isn, peer_isn, ts_base) =
-            noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
-        state.carrier = Some(self.wire(
-            Role::Initiator,
-            (ip, next),
-            (*peer.ip(), peer.port()),
-            (isn, peer_isn, ts_base),
-        ));
+        state.replace_carrier(self.initiator_carrier((ip, next), peer, epoch));
+        // A new port is a new connection, opened before anything follows it.
+        let mut syn = [0u8; MAX_OVERHEAD];
+        if let Err(e) = self.knock(&mut state, &mut syn, now) {
+            warn_!("could not open the new carrier: {e}");
+        }
         if stuck {
             // The point of moving was to try a tuple that might work. Leaving
             // the retry deadline where it was makes the new port wait out the
@@ -2428,6 +2997,16 @@ impl Tunnel {
             "{}carrier moved from port {current} to {next}: {why}",
             self.tag()
         );
+    }
+
+    /// Repeats a SYN nothing has answered, when [`PeerState::knock_due`].
+    fn maybe_open(&self, frame: &mut [u8]) -> Result<()> {
+        let now = self.now();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.knock_due(now) {
+            return Ok(());
+        }
+        self.knock(&mut state, frame, now).map(|_| ())
     }
 
     /// Sends an empty packet when the peer has spoken and we have not answered.
@@ -2521,6 +3100,23 @@ impl Tunnel {
             source,
         })?;
 
+        // The carrier is per *connection*, not per session. A rekey replaces
+        // the keys above it and must leave the conversation underneath
+        // untouched: rebuilding it would restart the sequence numbering on an
+        // unchanged five-tuple every couple of minutes, which is exactly the
+        // discontinuity byte-accurate sequencing exists to avoid.
+        if state.carrier.is_none() {
+            state.replace_carrier(self.initiator_carrier(self.local(), peer, epoch));
+        }
+        // The connection opens before anything goes over it: a fake handshake
+        // announces it and carries on, a real one waits for the answer -- and
+        // until then there is no point composing a message it cannot carry.
+        let mut syn = [0u8; MAX_OVERHEAD];
+        self.knock(&mut state, &mut syn, now)?;
+        if state.carrier.as_ref().is_some_and(|c| !c.is_ready()) {
+            return Ok(());
+        }
+
         let (initiator, (msg1, msg1_len)) = Initiator::start(
             &self.cfg.interface.private_key,
             &self.local_public,
@@ -2532,22 +3128,6 @@ impl Tunnel {
         let Some(msg1) = msg1.get(..msg1_len) else {
             return Ok(());
         };
-
-        // The carrier is per *connection*, not per session. A rekey replaces
-        // the keys above it and must leave the conversation underneath
-        // untouched: rebuilding it would restart the sequence numbering on an
-        // unchanged five-tuple every couple of minutes, which is exactly the
-        // discontinuity byte-accurate sequencing exists to avoid.
-        if state.carrier.is_none() {
-            let (isn_i, isn_r, ts_base) =
-                noise::carrier_numbers(epoch, &self.local_public, &self.cfg.peer.public_key);
-            state.carrier = Some(self.wire(
-                Role::Initiator,
-                self.local(),
-                (*peer.ip(), peer.port()),
-                (isn_i, isn_r, ts_base),
-            ));
-        }
 
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(());
@@ -3758,6 +4338,199 @@ mod tests {
             seen.insert(pad);
         }
         assert!(seen.len() > noise::MAX_PAD / 2, "only {} sizes", seen.len());
+    }
+
+    #[test]
+    fn a_syn_is_answered_again_from_where_it_first_came_and_nowhere_else() {
+        // A captured SYN still proves itself, because the proof cannot cover
+        // the sender's address; what it cannot do is come from somewhere new.
+        let mut ledger = SynLedger::default();
+        let sender = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 40_000);
+        let copier = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 40_000);
+        assert!(ledger.admit(42, sender, 0));
+        assert!(ledger.admit(42, sender, 1_000), "a repeat is answered");
+        assert!(!ledger.admit(42, copier, 2_000), "a copy is not");
+        assert!(ledger.admit(43, copier, 3_000), "its own SYN is");
+    }
+
+    #[test]
+    fn the_syn_ledger_forgets_what_could_no_longer_prove_itself() {
+        let mut ledger = SynLedger::default();
+        let sender = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 40_000);
+        let copier = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 40_000);
+        assert!(ledger.admit(42, sender, 0));
+        assert!(ledger.admit(42, copier, SYN_LEDGER_KEEP + 1));
+        for seq in 0..u32::try_from(SYN_LEDGER_LEN * 2).expect("fits") {
+            ledger.admit(1_000 + seq, sender, SYN_LEDGER_KEEP + 2);
+        }
+        assert!(ledger.seen.len() <= SYN_LEDGER_LEN, "bounded");
+    }
+
+    /// A week of SYNs nothing answers, driven through the same decisions the
+    /// timer loop makes, tick by tick, with rotation when `rotating`.
+    ///
+    /// Returns when each SYN went out.
+    fn a_week_of_unanswered_syns(mut state: PeerState, rotating: bool) -> Vec<Millis> {
+        const WEEK: Millis = 7 * 24 * 3_600 * 1_000;
+        let tick = Millis::try_from(TICK.as_millis()).expect("fits");
+        let mut sent = Vec::new();
+        let mut now = 0;
+        // What `knock` does with the connection's first SYN, and with one
+        // repeated too long: a fresh proof, bound to now.
+        // Whether the carrier is new: its first SYN gets a fresh proof.
+        let mut new_port = true;
+        let knock =
+            |state: &mut PeerState, new_port: &mut bool, now: Millis, sent: &mut Vec<Millis>| {
+                if *new_port || state.syn_stale(now) {
+                    state.opened_at = now;
+                    *new_port = false;
+                }
+                let age = now - state.opened_at;
+                assert!(age < SYN_FRESH, "a SYN sent with a proof {age} ms old");
+                state.sent_syn(now);
+                sent.push(now);
+            };
+        while now < WEEK {
+            // `maybe_handshake`: a session too old to use is let go, and a run
+            // that gave up is started again.
+            state.retire_expired(now);
+            let wanted = state.wants_handshake(now);
+            if wanted && state.revive(now) {
+                state.attempt_started = None;
+            }
+            if wanted && now >= state.syn_retry_at {
+                knock(&mut state, &mut new_port, now, &mut sent);
+            }
+            // `maybe_rotate`, when the tuple looks dead.
+            if rotating && state.stuck(now, ROTATE_AFTER_UNANSWERED) {
+                state.unanswered = 0;
+                new_port = true;
+            }
+            // `maybe_open`.
+            if state.knock_due(now) {
+                knock(&mut state, &mut new_port, now, &mut sent);
+            }
+            now += tick;
+        }
+        sent
+    }
+
+    /// Checks a week of SYNs is paced the way a long outage should be: never
+    /// faster than a real stack repeats one, and never giving up for good.
+    fn assert_paced(sent: &[Millis]) {
+        assert!(sent.len() > 1_000, "kept trying: {} SYNs", sent.len());
+        let gaps: Vec<Millis> = sent
+            .iter()
+            .zip(sent.iter().skip(1))
+            .map(|(a, b)| b - a)
+            .collect();
+        let shortest = gaps.iter().min().copied().unwrap_or(0);
+        let longest = gaps.iter().max().copied().unwrap_or(0);
+        assert!(shortest >= SYN_RETRY, "a SYN {shortest} ms after the last");
+        assert!(
+            longest <= RETRY_WHEN_GONE + SYN_RETRY_MAX,
+            "a silence of {longest} ms: a peer that came back would wait that long"
+        );
+        // Over the week, an idle end that has given up knocks a few times a
+        // minute, which is what its handshakes did before it had a SYN to send.
+        let per_minute = sent.len() as f64 / (7.0 * 24.0 * 60.0);
+        assert!(per_minute < 8.0, "{per_minute:.1} SYNs a minute");
+    }
+
+    #[test]
+    fn a_week_with_nothing_answering_knocks_at_a_bounded_pace() {
+        let state = PeerState::new(None, crate::repeat::Limits::off());
+        assert_paced(&a_week_of_unanswered_syns(state, false));
+    }
+
+    #[test]
+    fn rotating_through_dead_ports_does_not_knock_any_faster() {
+        let state = PeerState::new(None, crate::repeat::Limits::off());
+        let sent = a_week_of_unanswered_syns(state, true);
+        assert_paced(&sent);
+    }
+
+    #[test]
+    fn a_session_waiting_on_a_new_port_lets_go_and_slows_down() {
+        // The rotation case: a working session moved to a port whose SYN is
+        // never answered. It knocks while the session lasts, then the session
+        // ages out and the pace is the idle one.
+        let client = paqetz_core::KeyPair::generate().expect("generate");
+        let server = paqetz_core::KeyPair::generate().expect("generate");
+        let (session, _) = session_pair_at(&client, &server, 1, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
+        state.install(session);
+        let sent = a_week_of_unanswered_syns(state, true);
+        assert_paced(&sent);
+    }
+
+    #[test]
+    fn the_state_kept_for_syns_stays_the_same_size() {
+        // A million SYNs, every one proving itself, from addresses that never
+        // repeat: the ledger is the one thing a flood could grow.
+        let mut ledger = SynLedger::default();
+        for i in 0..1_000_000u32 {
+            let from = SocketAddrV4::new(Ipv4Addr::from(i), 40_000);
+            ledger.admit(i, from, Millis::from(i) / 10);
+            assert!(ledger.seen.len() <= SYN_LEDGER_LEN);
+        }
+        assert!(
+            ledger.seen.capacity() <= 2 * SYN_LEDGER_LEN,
+            "nor its allocation"
+        );
+    }
+
+    #[test]
+    fn a_read_the_host_recovers_from_is_waited_out_and_nothing_else_is() {
+        // Stopping on the first meant a moment with the interface down left a
+        // running process that never heard anything again.
+        for errno in [
+            libc::ENETDOWN,
+            libc::EIO,
+            libc::ENOBUFS,
+            libc::ENXIO,
+            libc::ENODEV,
+        ] {
+            assert_eq!(
+                after_failure(&io::Error::from_raw_os_error(errno)),
+                AfterFailure::Wait,
+                "errno {errno}"
+            );
+        }
+        // Anything else ends the process, so the service manager restarts it
+        // rather than leaving it up and deaf.
+        for errno in [libc::EBADF, libc::EINVAL, libc::EFAULT] {
+            assert_eq!(
+                after_failure(&io::Error::from_raw_os_error(errno)),
+                AfterFailure::Stop,
+                "errno {errno}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_port_waits_its_turn_to_knock() {
+        // Rotation must not be a way of knocking faster on a path that answers
+        // nothing.
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
+        state.sent_syn(1_000);
+        let due = state.syn_retry_at;
+        state.replace_carrier(Wire::Raw(paqetz_tcpwire::rawip::Carrier::new(
+            paqetz_tcpwire::rawip::Config {
+                local: Ipv4Addr::LOCALHOST,
+                remote: Ipv4Addr::LOCALHOST,
+                profile: paqetz_tcpwire::profile::LINUX_6,
+                shell: paqetz_tcpwire::rawip::Shell::Gre,
+                dont_fragment: true,
+            },
+        )));
+        assert_eq!(state.syn_retry_at, due);
+    }
+
+    #[test]
+    fn a_syn_waits_longer_each_time_up_to_a_limit() {
+        let waits: Vec<Millis> = (1..=6).map(syn_backoff).collect();
+        assert_eq!(waits, [1_000, 2_000, 4_000, 8_000, 8_000, 8_000]);
     }
 
     #[test]

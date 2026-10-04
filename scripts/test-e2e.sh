@@ -5,6 +5,8 @@
 #
 #   ./scripts/test-e2e.sh
 #   CARRIER=gre ./scripts/test-e2e.sh      # the same suite, other wire shape
+#   CARRIER=handshake ./scripts/test-e2e.sh    # a connection that opens first
+#   CARRIER=midstream-fh ./scripts/test-e2e.sh # one that announces it, and goes on
 #   CARRIER=rawip PROTO=143 ./scripts/test-e2e.sh
 #   DATAPATH=simple ./scripts/test-e2e.sh
 #
@@ -194,6 +196,17 @@ fi
 
 # --- start both ends --------------------------------------------------------
 log "starting the tunnel"
+
+# A carrier that opens its connection does it once, at the start, so that is
+# when the capture has to be running.
+OPENING_DUMP=""
+if [[ ${CARRIER} == handshake || ${CARRIER} == midstream-fh ]]; then
+    sudo ip netns exec "${SRV_NS}" timeout 8 \
+        tcpdump -i veth-srv -c 6 -w "${WORK}/opening.pcap" "tcp port ${PORT}" >/dev/null 2>&1 &
+    OPENING_DUMP=$!
+    sleep 1
+fi
+
 sudo ip netns exec "${SRV_NS}" "${BIN}" run -c "${WORK}/server.toml" \
     > "${WORK}/server.log" 2>&1 &
 sleep 1
@@ -212,6 +225,30 @@ if sudo ip netns exec "${CLI_NS}" ip link show pq-cli >/dev/null 2>&1; then
     ok "the client's TUN device exists"
 else
     bad "the client's TUN device was not created"
+fi
+
+if [[ -n ${OPENING_DUMP} ]]; then
+    log "how the connection opens"
+    wait "${OPENING_DUMP}" 2>/dev/null
+    # The flags of the first four segments, in order, as tcpdump writes them.
+    opening=$(sudo tcpdump -r "${WORK}/opening.pcap" -n 2>/dev/null |
+        grep -o "Flags \[[^]]*\]" | head -4 | sed 's/Flags //' | tr '\n' ' ')
+    case ${CARRIER} in
+    handshake)
+        # SYN, SYN+ACK, ACK, and only then the tunnel's first message.
+        expected="[S] [S.] [.] [P.] "
+        ;;
+    midstream-fh)
+        # SYN, then the tunnel's first message without waiting; the SYN+ACK
+        # follows once that message has authenticated, ahead of the reply.
+        expected="[S] [P.] [S.] [P.] "
+        ;;
+    esac
+    if [[ ${opening} == "${expected}" ]]; then
+        ok "the connection opens ${expected}"
+    else
+        bad "the connection opened ${opening:-with nothing captured}, not ${expected}"
+    fi
 fi
 
 # --- the tunnel carries traffic ---------------------------------------------
@@ -461,7 +498,7 @@ if [[ -s ${WORK}/wire.pcap ]]; then
     # ciphertext. tcpdump duly parses them as IPv4 and duly finds nonsense, on
     # the indented continuation lines. Only the unindented outer line is a
     # claim about anything paqetz built.
-    if [[ ${CARRIER} == midstream || ${CARRIER} == handshake ]]; then
+    if [[ ${CARRIER} != gre && ${CARRIER} != rawip ]]; then
         cksum_lines=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null)
     else
         cksum_lines=$(sudo tcpdump -r "${WORK}/wire.pcap" -vv 2>/dev/null | grep -v "^[[:space:]]")
@@ -495,12 +532,13 @@ if [[ -s ${WORK}/wire.pcap ]]; then
             bad "${gre_plain} of ${gre_all} GRE packets are plain GREv0"
         fi
     else
-        # No SYN should ever appear: the carrier is mid-stream by default (D14).
+        # No SYN once the connection is open: never at all mid-stream (D14),
+        # and only at the start for a carrier that opens its connection.
         syns=$(sudo tcpdump -r "${WORK}/wire.pcap" "tcp[tcpflags] & tcp-syn != 0" 2>/dev/null | wc -l)
         if [[ ${syns} -eq 0 ]]; then
-            ok "no SYN was emitted, as mid-stream mode requires"
+            ok "no SYN was emitted on an open connection"
         else
-            bad "${syns} SYN segments were emitted in mid-stream mode"
+            bad "${syns} SYN segments were emitted on an open connection"
         fi
     fi
 else
