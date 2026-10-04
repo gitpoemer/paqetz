@@ -820,10 +820,13 @@ struct RawInterface {
     fragment: Option<String>,
     #[serde(default)]
     rotate: Option<bool>,
-    rotate_after: Option<u64>,
-    rotate_jitter: Option<u64>,
+    rotate_after: Option<Seconds>,
+    rotate_jitter: Option<Seconds>,
     rotate_ports: Option<usize>,
     rotate_after_unanswered: Option<u32>,
+    rotate_after_packets: Option<u64>,
+    rotate_after_bytes: Option<u64>,
+    rotate_after_silence: Option<u64>,
     #[serde(default)]
     log: Option<String>,
     #[serde(default)]
@@ -979,12 +982,45 @@ fn carrier_protocol(proto: u8) -> Result<()> {
     }
 }
 
+/// A number of seconds, written whole or with a fraction.
+///
+/// Whole seconds were enough while a five-tuple lived for minutes. A path
+/// that cuts every flow after four seconds needs the difference between
+/// three and three and a half.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum Seconds {
+    Whole(u64),
+    Fraction(f64),
+}
+
+impl Seconds {
+    /// In milliseconds, or `None` for a value that is negative, not a number,
+    /// or past what this could ever be asked to wait.
+    fn millis(self) -> Option<Millis> {
+        match self {
+            Self::Whole(s) => s.checked_mul(1_000),
+            Self::Fraction(f) if f.is_finite() && (0.0..=MAX_ROTATE_AFTER as f64).contains(&f) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "checked above to be a finite, non-negative number of seconds no \
+                              larger than a day, which fits in milliseconds"
+                )]
+                let ms = (f * 1_000.0).round() as Millis;
+                Some(ms)
+            }
+            Self::Fraction(_) => None,
+        }
+    }
+}
+
 /// The shortest a five-tuple may live, in seconds.
 ///
-/// Below this the carrier is opening a new mid-stream flow every minute, which
-/// is not what a real host does either -- and every one of them has to be
-/// accepted afresh by whatever tracks connections on the path.
-const MIN_ROTATE_AFTER: u64 = 60;
+/// One. A path that cuts every flow a few seconds in is answered by moving
+/// before it does, which is a new connection every few seconds -- not what an
+/// ordinary host does, but a flow that has been cut carries nothing at all.
+const MIN_ROTATE_AFTER: u64 = 1;
 
 /// The longest, in seconds. A day is already far past the point where moving
 /// is what the setting is for.
@@ -993,14 +1029,21 @@ const MAX_ROTATE_AFTER: u64 = 24 * 60 * 60;
 /// The fewest ports worth moving between: one is nowhere to go.
 const MIN_ROTATE_PORTS: usize = 2;
 
-/// The most.
+/// The most: as many as the capture filter can name.
 ///
-/// The hard ceiling is the capture filter, whose jump offsets are single bytes
-/// and stop being correct somewhere past two hundred. This is well under it,
-/// and is the width the filter is tested to. At the default interval sixty-four
-/// ports take most of a day to come around, so a larger pool holds ports that
-/// will not be reached before the process is restarted anyway.
-const MAX_ROTATE_PORTS: usize = 64;
+/// Moving every few seconds comes back to a port within minutes in a small
+/// pool, and a path that remembers the flows it cut would find it again.
+const MAX_ROTATE_PORTS: usize = paqetz_dp::bpf::MAX_PORTS;
+
+/// The shortest wait for a reply before a quiet connection is left, in
+/// milliseconds: under a round trip on most paths, which would move away from
+/// connections that work.
+const MIN_ROTATE_SILENCE: u64 = 200;
+
+/// The longest, in milliseconds. Past this the ordinary liveness timer, which
+/// moves on after fifteen seconds and a few unanswered handshakes, does the
+/// job.
+const MAX_ROTATE_SILENCE: u64 = 60_000;
 
 /// The most unanswered handshakes worth waiting through.
 ///
@@ -1778,20 +1821,26 @@ impl Config {
                     // One source for the defaults, as above, so "unset" and
                     // what the tunnel would have used cannot drift apart.
                     let defaults = crate::tunnel::Rotation::default();
-                    let seconds = |field, given: Option<u64>, fallback: Millis| match given {
-                        Some(s) if !(MIN_ROTATE_AFTER..=MAX_ROTATE_AFTER).contains(&s) => {
-                            Err(invalid(
-                                field,
-                                format!(
-                                    "expected {MIN_ROTATE_AFTER} to {MAX_ROTATE_AFTER} seconds"
-                                ),
-                            ))
-                        }
-                        Some(s) => Ok(Millis::from(s).saturating_mul(1_000)),
-                        None => Ok(fallback),
+                    let after = match iface.rotate_after {
+                        None => defaults.after,
+                        Some(given) => match given.millis() {
+                            Some(ms)
+                                if (MIN_ROTATE_AFTER * 1_000..=MAX_ROTATE_AFTER * 1_000)
+                                    .contains(&ms) =>
+                            {
+                                ms
+                            }
+                            _ => {
+                                return Err(invalid(
+                                    "interface.rotate_after",
+                                    format!(
+                                        "expected {MIN_ROTATE_AFTER} to {MAX_ROTATE_AFTER} \
+                                         seconds; a fraction such as 2.5 is fine"
+                                    ),
+                                ));
+                            }
+                        },
                     };
-                    let after =
-                        seconds("interface.rotate_after", iface.rotate_after, defaults.after)?;
                     // Jitter is subtracted from `after` to get the low end of
                     // the band, so one at least as large as the interval puts
                     // that end at or below zero -- rotating on every tick, which
@@ -1804,10 +1853,15 @@ impl Config {
                     // `rotate_after` to anything under the default jitter would
                     // be refused for a field the operator never wrote.
                     let jitter = match iface.rotate_jitter {
-                        Some(0) => 0,
                         None => after / 3,
-                        given => {
-                            let j = seconds("interface.rotate_jitter", given, defaults.jitter)?;
+                        Some(given) => {
+                            let Some(j) = given.millis() else {
+                                return Err(invalid(
+                                    "interface.rotate_jitter",
+                                    "expected a number of seconds, zero or more; a fraction \
+                                     such as 0.3 is fine",
+                                ));
+                            };
                             if j >= after {
                                 return Err(invalid(
                                     "interface.rotate_jitter",
@@ -1824,8 +1878,8 @@ impl Config {
                                 "interface.rotate_ports",
                                 format!(
                                     "expected {MIN_ROTATE_PORTS} to {MAX_ROTATE_PORTS}: one port \
-                                     is nowhere to move to, and past {MAX_ROTATE_PORTS} the pool \
-                                     holds ports that will not come around before a restart"
+                                     is nowhere to move to, and past {MAX_ROTATE_PORTS} the \
+                                     capture filter cannot name them all"
                                 ),
                             ));
                         }
@@ -1849,12 +1903,42 @@ impl Config {
                         }
                         other => other.unwrap_or(defaults.unanswered),
                     };
+                    // A connection may also be spent before its time is up, by
+                    // what it has carried, or left early for going quiet.
+                    // Absent, each is no limit at all.
+                    let limit = |field, given: Option<u64>| match given {
+                        Some(0) => Err(invalid(
+                            field,
+                            "zero would move on every tick; leave it out for no limit",
+                        )),
+                        other => Ok(other),
+                    };
+                    let packets =
+                        limit("interface.rotate_after_packets", iface.rotate_after_packets)?;
+                    let bytes = limit("interface.rotate_after_bytes", iface.rotate_after_bytes)?;
+                    let silence = match iface.rotate_after_silence {
+                        Some(ms) if !(MIN_ROTATE_SILENCE..=MAX_ROTATE_SILENCE).contains(&ms) => {
+                            return Err(invalid(
+                                "interface.rotate_after_silence",
+                                format!(
+                                    "expected {MIN_ROTATE_SILENCE} to {MAX_ROTATE_SILENCE} \
+                                     milliseconds: shorter would leave connections that are only \
+                                     waiting on a round trip, and longer is what the liveness \
+                                     timer already does"
+                                ),
+                            ));
+                        }
+                        other => other,
+                    };
                     crate::tunnel::Rotation {
                         enabled: iface.rotate.unwrap_or(defaults.enabled),
                         after,
                         jitter,
                         ports,
                         unanswered,
+                        packets,
+                        bytes,
+                        silence,
                     }
                 },
                 gateway: iface.gateway.unwrap_or(false),
@@ -2459,35 +2543,81 @@ tunnel_address = "10.8.0.1"
     #[test]
     fn each_rotation_setting_refuses_what_it_cannot_honour() {
         for line in [
-            "rotate_after = 59",
+            "rotate_after = 0",
+            "rotate_after = 0.5",
             "rotate_after = 86401",
+            "rotate_after = -3",
+            "rotate_after = nan",
             "rotate_jitter = 86401",
+            "rotate_jitter = -0.1",
             "rotate_ports = 1",
-            "rotate_ports = 65",
+            "rotate_ports = 241",
             "rotate_after_unanswered = 0",
             "rotate_after_unanswered = 17",
+            "rotate_after_packets = 0",
+            "rotate_after_bytes = 0",
+            "rotate_after_silence = 199",
+            "rotate_after_silence = 60001",
             // Jitter is subtracted from the interval, so one that reaches it
             // puts the low end of the band at zero: a five-tuple replaced the
             // moment it is made.
             "rotate_after = 600\nrotate_jitter = 600",
             "rotate_after = 600\nrotate_jitter = 900",
+            "rotate_after = 2.5\nrotate_jitter = 2.5",
         ] {
             assert!(with_interface(line).is_err(), "{line} was accepted");
         }
         for line in [
-            "rotate_after = 60",
+            "rotate_after = 1",
             "rotate_after = 86400",
             "rotate_ports = 2",
-            "rotate_ports = 64",
+            "rotate_ports = 240",
             "rotate_after_unanswered = 1",
             "rotate_after_unanswered = 16",
             "rotate_after = 600\nrotate_jitter = 599",
             // Zero is a deliberate choice -- a fixed period, for someone who
-            // wants one -- and is below the floor the others share.
+            // wants one.
             "rotate_jitter = 0",
+            "rotate_after_packets = 1",
+            "rotate_after_bytes = 1",
+            "rotate_after_silence = 200",
+            "rotate_after_silence = 60000",
         ] {
             assert!(with_interface(line).is_ok(), "{line} was refused");
         }
+    }
+
+    #[test]
+    fn a_rotation_can_be_timed_to_a_fraction_of_a_second() {
+        // A path that cuts every flow at four seconds wants three and a half,
+        // and a spread of a few hundred milliseconds rather than a whole one.
+        let c = with_interface("rotate_after = 3.5\nrotate_jitter = 0.3").expect("parses");
+        assert_eq!(c.interface.rotation.after, 3_500);
+        assert_eq!(c.interface.rotation.jitter, 300);
+        let c = with_interface("rotate_after = 3").expect("parses");
+        assert_eq!(
+            c.interface.rotation.after, 3_000,
+            "whole seconds still read as before"
+        );
+        assert_eq!(c.interface.rotation.jitter, 1_000, "and default to a third");
+    }
+
+    #[test]
+    fn a_connection_can_be_spent_by_what_it_carries_or_left_for_going_quiet() {
+        let c = with_interface(
+            "rotate_after_packets = 3000\nrotate_after_bytes = 2_000_000\nrotate_after_silence = 1500",
+        )
+        .expect("parses");
+        let r = c.interface.rotation;
+        assert_eq!(r.packets, Some(3_000));
+        assert_eq!(r.bytes, Some(2_000_000));
+        assert_eq!(r.silence, Some(1_500));
+        let unset = with_interface("").expect("parses").interface.rotation;
+        assert_eq!(
+            (unset.packets, unset.bytes, unset.silence),
+            (None, None, None),
+            "no limit unless asked for"
+        );
     }
 
     #[test]

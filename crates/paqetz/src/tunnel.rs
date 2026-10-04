@@ -198,6 +198,18 @@ const SYN_RETRY: Millis = 1_000;
 /// decides when a tuple is not worth knocking on, and it counts the SYNs.
 const SYN_RETRY_MAX: Millis = 8_000;
 
+/// The most a real handshake's next connection is opened ahead of a move, so
+/// the move finds it open.
+///
+/// A connection opened too early spends its own lifetime waiting, on a path
+/// that may be timing it from its SYN, so the lead is four round trips of the
+/// last SYN answered -- within this, and [`STANDBY_LEAD_MIN`] -- and this until
+/// one has been.
+const STANDBY_LEAD: Millis = 500;
+
+/// The least lead: a SYN repeated once on a fast path still makes it.
+const STANDBY_LEAD_MIN: Millis = 100;
+
 /// How long a datapath thread waits before reading again, after a read the
 /// host is expected to recover from.
 const READ_RETRY: Duration = Duration::from_secs(1);
@@ -236,6 +248,13 @@ pub(crate) struct Rotation {
     pub(crate) ports: usize,
     /// Unanswered handshakes that mean the tuple itself is the problem.
     pub(crate) unanswered: u32,
+    /// Packets, both ways, one five-tuple may carry.
+    pub(crate) packets: Option<u64>,
+    /// Bytes of payload, both ways, one five-tuple may carry.
+    pub(crate) bytes: Option<u64>,
+    /// How long one may go without an answer, while this end sends, before it
+    /// is left.
+    pub(crate) silence: Option<Millis>,
 }
 
 impl Default for Rotation {
@@ -246,6 +265,9 @@ impl Default for Rotation {
             jitter: ROTATE_JITTER,
             ports: PORT_POOL,
             unanswered: ROTATE_AFTER_UNANSWERED,
+            packets: None,
+            bytes: None,
+            silence: None,
         }
     }
 }
@@ -262,6 +284,32 @@ impl Rotation {
         self.after
             .saturating_add(spread)
             .saturating_sub(self.jitter)
+    }
+}
+
+/// Why the carrier moves to the next port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Move {
+    /// Nothing comes back on this tuple at all.
+    Stuck,
+    /// Its time is up.
+    Scheduled,
+    /// It has carried what it may: [`Rotation::packets`] or
+    /// [`Rotation::bytes`].
+    Spent,
+    /// It went quiet while this end was sending: [`Rotation::silence`].
+    Silent,
+}
+
+impl Move {
+    /// Why, for the log.
+    const fn why(self) -> &'static str {
+        match self {
+            Self::Stuck => "nothing came back",
+            Self::Scheduled => "time on this one is up",
+            Self::Spent => "it has carried its share",
+            Self::Silent => "it went quiet",
+        }
     }
 }
 
@@ -420,6 +468,21 @@ struct PeerState {
     syn_retry_at: Millis,
     /// When the current connection's SYN first went out.
     opened_at: Millis,
+    /// Packets carried on the current five-tuple, both ways.
+    carried_packets: u64,
+    /// Payload bytes carried on the current five-tuple, both ways.
+    carried_bytes: u64,
+    /// When this end sent data that nothing has answered yet, on the current
+    /// five-tuple: the first such send since the peer was last heard.
+    quiet_since: Option<Millis>,
+    /// When the peer was last heard on the current five-tuple.
+    heard_at: Option<Millis>,
+    /// How long the last SYN answered took to be answered.
+    syn_rtt: Option<Millis>,
+    /// The next connection, opened ahead of a move under a real handshake.
+    standby: Option<Wire>,
+    /// When the standby connection's SYN went out.
+    standby_opened_at: Millis,
 }
 
 impl PeerState {
@@ -450,6 +513,13 @@ impl PeerState {
             syn_tries: 0,
             syn_retry_at: 0,
             opened_at: 0,
+            carried_packets: 0,
+            carried_bytes: 0,
+            quiet_since: None,
+            heard_at: None,
+            syn_rtt: None,
+            standby: None,
+            standby_opened_at: 0,
         }
     }
 
@@ -463,6 +533,78 @@ impl PeerState {
     /// every port tried.
     fn replace_carrier(&mut self, carrier: Wire) {
         self.carrier = Some(carrier);
+        self.carried_packets = 0;
+        self.carried_bytes = 0;
+        self.quiet_since = None;
+        self.heard_at = None;
+    }
+
+    /// Counts a packet carried on the current five-tuple.
+    fn carried(&mut self, payload: usize) {
+        self.carried_packets = self.carried_packets.saturating_add(1);
+        self.carried_bytes = self
+            .carried_bytes
+            .saturating_add(u64::try_from(payload).unwrap_or(u64::MAX));
+    }
+
+    /// Why the carrier should move now, if it should.
+    ///
+    /// Arms the schedule the first time there is a session to carry -- not in
+    /// `established`, which runs on every rekey and would push the deadline out
+    /// every two minutes so it never arrived.
+    fn move_due(&mut self, now: Millis, rotation: &Rotation) -> Option<Move> {
+        if self.stuck(now, rotation.unanswered) {
+            return Some(Move::Stuck);
+        }
+        self.session.as_ref()?;
+        if self.rotate_at == Millis::MAX {
+            self.rotate_at = now.saturating_add(rotation.interval());
+        }
+        if now >= self.rotate_at {
+            return Some(Move::Scheduled);
+        }
+        if rotation.packets.is_some_and(|n| self.carried_packets >= n)
+            || rotation.bytes.is_some_and(|n| self.carried_bytes >= n)
+        {
+            return Some(Move::Spent);
+        }
+        // Quiet either way round: spoken to and not answering, or answering
+        // and then not. The second is the one a download shows -- the peer
+        // sending, this end barely speaking -- since when the peer's packets
+        // stop, this end has nothing left to acknowledge and stops too. An
+        // idle tunnel goes quiet the same way, and moves once for it: the new
+        // connection has not been heard on, so it does not move again.
+        let gone = |since: Option<Millis>, quiet: Millis| {
+            since.is_some_and(|t| now.saturating_sub(t) >= quiet)
+        };
+        if rotation
+            .silence
+            .is_some_and(|quiet| gone(self.quiet_since, quiet) || gone(self.heard_at, quiet))
+        {
+            return Some(Move::Silent);
+        }
+        None
+    }
+
+    /// How far ahead of a move the next connection is opened.
+    fn standby_lead(&self) -> Millis {
+        self.syn_rtt.map_or(STANDBY_LEAD, |rtt| {
+            rtt.saturating_mul(4).clamp(STANDBY_LEAD_MIN, STANDBY_LEAD)
+        })
+    }
+
+    /// Whether a move is close enough that the next connection should be
+    /// opened now: within [`Self::standby_lead`] of the schedule, or three
+    /// quarters of the way to what the connection may carry.
+    ///
+    /// A move for going quiet cannot be seen coming, and is not prepared for.
+    fn move_near(&self, now: Millis, rotation: &Rotation) -> bool {
+        let near = |carried: u64, limit: Option<u64>| {
+            limit.is_some_and(|n| carried.saturating_mul(4) >= n.saturating_mul(3))
+        };
+        now.saturating_add(self.standby_lead()) >= self.rotate_at
+            || near(self.carried_packets, rotation.packets)
+            || near(self.carried_bytes, rotation.bytes)
     }
 
     /// Whether a SYN still owed may be repeated now.
@@ -2026,7 +2168,9 @@ impl Tunnel {
         // keepalive, wait fifteen seconds, and rehandshake, for ever.
         if !packet.is_empty() {
             state.last_send = Some(now);
+            state.quiet_since.get_or_insert(now);
         }
+        state.carried(n);
         // Held only if the peer might ask for it. A packet that is itself a
         // repeat or a request is not worth holding: repeating a repeat is a
         // loop, and a lost request is re-derived from the next gap anyway.
@@ -2329,7 +2473,16 @@ impl Tunnel {
     ) -> Result<()> {
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(tcp) = state.carrier.as_mut().and_then(Wire::tcp) else {
+        // The connection it answers is told by the port it arrived on: the
+        // carrier's, or the standby's, opened ahead of a move.
+        let ours = |w: &mut Wire| w.tcp().is_some_and(|t| t.local().1 == seg.dst.1);
+        let standby = state.standby.as_mut().is_some_and(ours);
+        let slot = if standby {
+            state.standby.as_mut()
+        } else {
+            state.carrier.as_mut()
+        };
+        let Some(tcp) = slot.and_then(Wire::tcp) else {
             return Ok(());
         };
         // Nothing here is authenticated: an address is easy to claim. Only a
@@ -2342,21 +2495,40 @@ impl Tunnel {
             return Err(paqetz_core::Error::Rejected.into());
         }
         let was_ready = tcp.is_ready();
-        // Checks that it acknowledges our SYN, and learns where the peer's
-        // numbering starts.
+        // Learns where the peer's numbering starts.
         tcp.on_receive(seg);
         if was_ready || !tcp.is_ready() {
-            // A fake handshake's, which only told us its numbering; or one that
-            // answered nothing we sent.
+            // A fake handshake's, which only told us its numbering; or a late
+            // copy of one already taken.
             return Ok(());
         }
         let n = tcp.ack(reply, now)?;
+        let asked = if standby {
+            state.standby_opened_at
+        } else {
+            state.opened_at
+        };
+        state.syn_rtt = Some(now.saturating_sub(asked));
+        if standby {
+            // Open and waiting for the move; nothing else changes until then.
+            drop(state);
+            let Some(ack) = reply.get(..n) else {
+                return Ok(());
+            };
+            os(
+                "completing the next connection",
+                self.tx.send(ack, *from.ip()),
+            )?;
+            debug!("{}next connection to {from} open", self.tag());
+            return Ok(());
+        }
         state.syn_tries = 0;
         state.syn_retry_at = 0;
         // An answer on this tuple is what proves it still reaches the peer.
         state.unanswered = 0;
         // The tunnel handshake that was waiting on the connection goes now.
         state.retry_at = now;
+        let carrying = state.session.is_some();
         drop(state);
 
         let Some(ack) = reply.get(..n) else {
@@ -2364,6 +2536,13 @@ impl Tunnel {
         };
         os("completing the connection", self.tx.send(ack, *from.ip()))?;
         debug!("{}connection to {from} open", self.tag());
+        if carrying {
+            // A session moved onto this connection: the peer follows the first
+            // packet it authenticates from here, and a download would leave it
+            // sending to the old tuple until this end next spoke.
+            let mut sealed = vec![0u8; paqetz_core::framing::OVERHEAD];
+            return self.send_inner(&[], &mut sealed, reply);
+        }
         // Rather than on the next tick: a quarter of a second, on every new
         // connection, for nothing.
         self.maybe_handshake(reply)
@@ -2617,11 +2796,15 @@ impl Tunnel {
             Stats::bump(&self.stats.roams);
             // The single most useful line when a link is flapping: it says the
             // peer moved and the tunnel followed, rather than leaving a gap in
-            // traffic with no explanation.
-            info!(
-                "peer moved from {} to {from}",
-                was.map_or_else(|| "unknown".to_owned(), |a| a.to_string())
-            );
+            // traffic with no explanation. Only a new address, though: a new
+            // port is the peer's rotation, which may happen every few seconds
+            // and is counted in `roams`.
+            let was_text = was.map_or_else(|| "unknown".to_owned(), |a| a.to_string());
+            if was.is_some_and(|w| w.ip() == from.ip()) {
+                debug!("peer moved from {was_text} to {from}");
+            } else {
+                info!("peer moved from {was_text} to {from}");
+            }
         }
         // A peer arriving from somewhere new has opened a new connection, which
         // a fake handshake announces and a real one takes up.
@@ -2641,6 +2824,9 @@ impl Tunnel {
         // passed the replay window, so it is the peer speaking and no one else:
         // the one piece of evidence that it still holds this session.
         state.last_receive = Some(now);
+        state.quiet_since = None;
+        state.heard_at = Some(now);
+        state.carried(seg.payload.len());
         // An empty packet is a keepalive and needs no reply; answering one would
         // have the two ends trading them for ever.
         if n > 0 {
@@ -2893,7 +3079,7 @@ impl Tunnel {
                 warn_!("handshake attempt failed: {e}");
             }
             if initiator {
-                self.maybe_rotate();
+                self.maybe_rotate(&mut sealed, &mut keepalive_frame);
                 if let Err(e) = self.maybe_open(&mut frame) {
                     warn_!("could not open the connection: {e}");
                 }
@@ -2920,42 +3106,34 @@ impl Tunnel {
     /// Two things ask for a move: the interval, which only a live session
     /// counts down, and [`PeerState::stuck`], which says the tuple is being
     /// dropped and no session will exist until it changes.
-    fn maybe_rotate(&self) {
+    fn maybe_rotate(&self, sealed: &mut [u8], frame: &mut [u8]) {
         let rotation = self.cfg.interface.rotation;
-        if !rotation.enabled || !self.cfg.interface.shape.has_ports() {
+        if !rotation.enabled || !self.cfg.interface.shape.has_ports() || self.ports.len() < 2 {
             return;
         }
         let now = self.now();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let stuck = state.stuck(now, rotation.unanswered);
-        if !stuck {
-            if state.session.is_none() {
-                return;
-            }
-            // Armed once, when there is first a session to carry -- not in
-            // `established`, which runs on every rekey and would push the
-            // deadline out every two minutes so it never arrived.
-            if state.rotate_at == Millis::MAX {
-                state.rotate_at = now.saturating_add(rotation.interval());
-                return;
-            }
-            if now < state.rotate_at {
-                return;
-            }
+
+        // Under a real handshake the next connection is opened ahead of the
+        // move, so the move finds it open rather than waiting a round trip
+        // with nothing getting through.
+        if self.opening() == Some(paqetz_tcpwire::Carrier::Handshake)
+            && state.session.is_some()
+            && state.standby.is_none()
+            && state.carrier.as_ref().is_some_and(Wire::is_ready)
+            && state.move_near(now, &rotation)
+            && let Err(e) = self.prepare_standby(&mut state, now)
+        {
+            debug!("could not open the next connection: {e}");
         }
+
+        let Some(why) = state.move_due(now, &rotation) else {
+            return;
+        };
         state.rotate_at = now.saturating_add(rotation.interval());
         // Zeroed whether or not a move follows. Left standing, `stuck` holds on
         // a single-port pool and this runs on every tick for ever.
         state.unanswered = 0;
-
-        if self.ports.len() < 2 {
-            return;
-        }
-        let (_, current) = self.local();
-        let next = next_port(&self.ports, current);
-        if next == current {
-            return;
-        }
 
         // Rebuilt here rather than left absent for something else to notice.
         // Dropping it and waiting meant every packet in between was encrypted,
@@ -2964,21 +3142,36 @@ impl Tunnel {
         let Some(peer) = state.endpoint else {
             return;
         };
-        let (ip, _) = self.local();
-        let epoch = match random_u32() {
-            Ok(e) => e,
-            Err(e) => {
-                warn_!("could not start a new carrier: {e}");
-                return;
+        let (ip, current) = self.local();
+        let (carrier, next) = match state.standby.take() {
+            Some(mut standby) => {
+                let next = standby.tcp().map_or(current, |t| t.local().1);
+                state.opened_at = state.standby_opened_at;
+                (standby, next)
+            }
+            None => {
+                let next = next_port(&self.ports, current);
+                if next == current {
+                    return;
+                }
+                let epoch = match random_u32() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn_!("could not start a new carrier: {e}");
+                        return;
+                    }
+                };
+                (self.initiator_carrier((ip, next), peer, epoch), next)
             }
         };
-        state.replace_carrier(self.initiator_carrier((ip, next), peer, epoch));
-        // A new port is a new connection, opened before anything follows it.
+        state.replace_carrier(carrier);
+        // A new port is a new connection, opened before anything follows it --
+        // unless it was opened already, as the standby.
         let mut syn = [0u8; MAX_OVERHEAD];
         if let Err(e) = self.knock(&mut state, &mut syn, now) {
             warn_!("could not open the new carrier: {e}");
         }
-        if stuck {
+        if why == Move::Stuck {
             // The point of moving was to try a tuple that might work. Leaving
             // the retry deadline where it was makes the new port wait out the
             // old one's timer before anything is sent from it.
@@ -2987,16 +3180,65 @@ impl Tunnel {
         if let Ok(mut local) = self.local.lock() {
             local.1 = next;
         }
+        let follow = state.session.is_some() && state.carrier.as_ref().is_some_and(Wire::is_ready);
         drop(state);
-        let why = if stuck {
-            "nothing came back"
+        Stats::bump(&self.stats.moves);
+
+        // A planned move every few seconds would fill the log; only the one
+        // forced by a dead tuple is worth a line.
+        let why = why.why();
+        if why == Move::Stuck.why() {
+            info!(
+                "{}carrier moved from port {current} to {next}: {why}",
+                self.tag()
+            );
         } else {
-            "time on this one is up"
+            debug!(
+                "{}carrier moved from port {current} to {next}: {why}",
+                self.tag()
+            );
+        }
+        // The peer follows the first packet it can authenticate from the new
+        // port. Left to the traffic, a download -- the peer sending, this end
+        // barely answering -- keeps arriving on the old tuple, which is the one
+        // about to be cut. An empty packet now moves it at once.
+        if follow && let Err(e) = self.send_inner(&[], sealed, frame) {
+            debug!("could not announce the move: {e}");
+        }
+    }
+
+    /// Opens the next connection, on the next port, ahead of a move.
+    ///
+    /// Its SYN goes once: a standby nothing answers by the time of the move
+    /// becomes the carrier anyway, and is repeated from there like any other.
+    fn prepare_standby(&self, state: &mut PeerState, now: Millis) -> Result<()> {
+        let (ip, current) = self.local();
+        let next = next_port(&self.ports, current);
+        let Some(peer) = state.endpoint else {
+            return Ok(());
         };
-        info!(
-            "{}carrier moved from port {current} to {next}: {why}",
-            self.tag()
-        );
+        if next == current {
+            return Ok(());
+        }
+        let epoch = os("drawing an epoch", random_u32())?;
+        let mut standby = self.initiator_carrier((ip, next), peer, epoch);
+        let Some(tcp) = standby.tcp() else {
+            return Ok(());
+        };
+        let responder = &self.cfg.peer.public_key;
+        tcp.number_syn(now, |ts| noise::syn_tag(responder, syn_period(), ts));
+        let mut syn = [0u8; MAX_OVERHEAD];
+        let Some(n) = tcp.handshake(&mut syn, now)? else {
+            return Ok(());
+        };
+        let Some(out) = syn.get(..n) else {
+            return Ok(());
+        };
+        os("opening the next connection", self.tx.send(out, *peer.ip()))?;
+        state.standby = Some(standby);
+        state.standby_opened_at = now;
+        debug!("{}next connection opening, on port {next}", self.tag());
+        Ok(())
     }
 
     /// Repeats a SYN nothing has answered, when [`PeerState::knock_due`].
@@ -4506,6 +4748,193 @@ mod tests {
                 "errno {errno}"
             );
         }
+    }
+
+    /// A state with a session, as rotation sees one on a working tunnel.
+    fn carrying() -> PeerState {
+        let client = paqetz_core::KeyPair::generate().expect("generate");
+        let server = paqetz_core::KeyPair::generate().expect("generate");
+        let (session, _) = session_pair_at(&client, &server, 1, 0);
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
+        state.install(session);
+        state.last_receive = Some(0);
+        state
+    }
+
+    fn every(after: Millis) -> Rotation {
+        Rotation {
+            after,
+            jitter: 0,
+            ..Rotation::default()
+        }
+    }
+
+    #[test]
+    fn a_connection_moves_when_its_time_is_up() {
+        let mut state = carrying();
+        let rotation = every(3_000);
+        assert_eq!(state.move_due(0, &rotation), None, "armed, not due");
+        assert_eq!(state.move_due(2_999, &rotation), None);
+        assert_eq!(state.move_due(3_000, &rotation), Some(Move::Scheduled));
+    }
+
+    #[test]
+    fn a_connection_is_spent_by_what_it_carries() {
+        for rotation in [
+            Rotation {
+                packets: Some(10),
+                ..every(60_000)
+            },
+            Rotation {
+                bytes: Some(10_000),
+                ..every(60_000)
+            },
+        ] {
+            let mut state = carrying();
+            for _ in 0..9 {
+                state.carried(1_000);
+            }
+            assert_eq!(state.move_due(1, &rotation), None, "{rotation:?}");
+            state.carried(1_000);
+            assert_eq!(
+                state.move_due(2, &rotation),
+                Some(Move::Spent),
+                "{rotation:?}"
+            );
+            // A new connection starts with nothing carried.
+            state.replace_carrier(raw_wire());
+            assert_eq!(state.move_due(3, &rotation), None, "{rotation:?}");
+        }
+    }
+
+    #[test]
+    fn a_connection_that_goes_quiet_while_spoken_to_is_left() {
+        let rotation = Rotation {
+            silence: Some(1_500),
+            ..every(60_000)
+        };
+        let mut state = carrying();
+        // Idle: nothing sent, so nothing is owed.
+        assert_eq!(state.move_due(10_000, &rotation), None);
+        // Spoken to and unanswered. The wait runs from the first send nothing
+        // answered, not from whenever the peer last spoke: after an idle spell
+        // that would be long past before any reply could arrive.
+        state.quiet_since = Some(10_000);
+        assert_eq!(state.move_due(11_499, &rotation), None);
+        assert_eq!(state.move_due(11_500, &rotation), Some(Move::Silent));
+        // An answer settles it.
+        state.quiet_since = None;
+        assert_eq!(state.move_due(12_000, &rotation), None);
+    }
+
+    #[test]
+    fn a_download_that_stops_arriving_is_left_too() {
+        // The peer does the sending; this end only acknowledges what arrives,
+        // so when it stops arriving this end stops too, and "spoken to and not
+        // answering" never comes true. Hearing and then not hearing must do.
+        let rotation = Rotation {
+            silence: Some(1_500),
+            ..every(60_000)
+        };
+        let mut state = carrying();
+        state.heard_at = Some(5_000);
+        assert_eq!(state.move_due(6_499, &rotation), None);
+        assert_eq!(state.move_due(6_500, &rotation), Some(Move::Silent));
+        // An idle spell moves once: the new connection has not been heard on,
+        // so it waits for traffic like any other.
+        state.replace_carrier(raw_wire());
+        assert_eq!(state.move_due(60_000 - 1, &rotation), None);
+    }
+
+    #[test]
+    fn the_next_connection_is_opened_by_the_round_trip_it_takes() {
+        let mut state = carrying();
+        assert_eq!(state.standby_lead(), STANDBY_LEAD, "until one is measured");
+        state.syn_rtt = Some(95);
+        assert_eq!(state.standby_lead(), 380);
+        state.syn_rtt = Some(1);
+        assert_eq!(state.standby_lead(), STANDBY_LEAD_MIN);
+        state.syn_rtt = Some(2_000);
+        assert_eq!(
+            state.standby_lead(),
+            STANDBY_LEAD,
+            "a slow answer does not open it seconds early"
+        );
+    }
+
+    #[test]
+    fn a_dead_tuple_outranks_the_schedule() {
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
+        state.unanswered = ROTATE_AFTER_UNANSWERED;
+        assert_eq!(
+            state.move_due(PRESUMED_DEAD, &every(60_000)),
+            Some(Move::Stuck),
+            "and needs no session to be due"
+        );
+    }
+
+    #[test]
+    fn the_next_connection_is_opened_just_ahead_of_the_move() {
+        let rotation = Rotation {
+            bytes: Some(1_000),
+            ..every(3_000)
+        };
+        let mut state = carrying();
+        let _ = state.move_due(0, &rotation);
+        assert!(!state.move_near(3_000 - STANDBY_LEAD - 1, &rotation));
+        assert!(state.move_near(3_000 - STANDBY_LEAD, &rotation));
+
+        let mut state = carrying();
+        let _ = state.move_due(0, &rotation);
+        state.carried(749);
+        assert!(!state.move_near(1, &rotation));
+        state.carried(1);
+        assert!(
+            state.move_near(1, &rotation),
+            "three quarters of the way to a limit"
+        );
+    }
+
+    #[test]
+    fn a_path_that_cuts_every_flow_is_outrun() {
+        // A flow is cut four seconds after it starts. Moving every three and a
+        // half seconds, with some jitter, must leave every connection before
+        // its cut, tick by tick through an hour.
+        const CUT: Millis = 4_000;
+        let tick = Millis::try_from(TICK.as_millis()).expect("fits");
+        let rotation = Rotation {
+            after: 3_500,
+            jitter: 250,
+            ..Rotation::default()
+        };
+        let mut state = carrying();
+        let mut born = 0;
+        let mut moves = 0;
+        let mut now = 0;
+        while now < 3_600_000 {
+            if state.move_due(now, &rotation).is_some() {
+                assert!(now - born < CUT, "a connection lived {} ms", now - born);
+                state.rotate_at = now.saturating_add(rotation.interval());
+                state.replace_carrier(raw_wire());
+                born = now;
+                moves += 1;
+            }
+            now += tick;
+        }
+        assert!(moves > 900, "moved {moves} times in an hour");
+    }
+
+    /// Any carrier, for a test that only needs one in place.
+    fn raw_wire() -> Wire {
+        Wire::Raw(paqetz_tcpwire::rawip::Carrier::new(
+            paqetz_tcpwire::rawip::Config {
+                local: Ipv4Addr::LOCALHOST,
+                remote: Ipv4Addr::LOCALHOST,
+                profile: paqetz_tcpwire::profile::LINUX_6,
+                shell: paqetz_tcpwire::rawip::Shell::Gre,
+                dont_fragment: true,
+            },
+        ))
     }
 
     #[test]

@@ -64,6 +64,14 @@ const MTU_TAIL_LEN: usize = 8;
 /// and then the path-MTU tail.
 const FIXED_LEN: usize = 10 + MTU_TAIL_LEN;
 
+/// The most ports a filter may name.
+///
+/// Classic BPF jump offsets are a single byte, and the jump from the top of the
+/// program to `fail` crosses every port comparison: at a little under 250 ports
+/// it no longer fits, and the offset that does not fit is not an error but a
+/// jump to the wrong place. This leaves room, and is the width the tests run.
+pub const MAX_PORTS: usize = 240;
+
 /// Instructions in a program matching one IP protocol rather than a port set.
 ///
 /// Six of preamble, accept and drop, then the same tail. No ports to compare
@@ -580,6 +588,40 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_pool_filters_exactly_as_the_smallest() {
+        // Every jump that crosses the port list grows with it, and one that no
+        // longer fits in a byte is not refused, it lands somewhere else. So the
+        // paths that cross the whole list -- not IPv4, a later fragment, a
+        // path-MTU report -- are run at every width up to the most allowed.
+        for n in [1, 64, 128, MAX_PORTS] {
+            let ports: Vec<u16> = (0..n)
+                .map(|i| 61_000 + u16::try_from(i).expect("small") * 3)
+                .collect();
+            let prog = program(Match::Ports(&ports));
+            for p in &ports {
+                assert_eq!(run(&prog, &good(*p)), ACCEPT, "n={n}: port {p}");
+            }
+            assert_eq!(run(&prog, &good(60_999)), 0, "n={n}: another port");
+            assert_eq!(
+                run(&prog, &frame(0x86DD, 6, 0, ports[0], 5)),
+                0,
+                "n={n}: not IPv4"
+            );
+            assert_eq!(
+                run(&prog, &frame(0x0800, 6, 0x0001, ports[0], 5)),
+                0,
+                "n={n}: a later fragment"
+            );
+            assert_ne!(
+                run(&prog, &icmp(3, 4, 0, 5)),
+                0,
+                "n={n}: a path-MTU report still reaches userspace"
+            );
+            assert_eq!(run(&prog, &icmp(8, 0, 0, 5)), 0, "n={n}: other ICMP");
+        }
+    }
+
+    #[test]
     fn one_port_still_produces_what_it_always_did() {
         let prog = program(Match::Ports(&[9999]));
         assert_eq!(prog.len(), program_len(Match::Ports(&[0u16; 1])));
@@ -612,7 +654,7 @@ mod tests {
         // bytes and `try_from` falls back to `u8::MAX` rather than failing --
         // so growing the pool too far would not break loudly, it would build a
         // filter whose jumps land past the end.
-        for n in 1..=64usize {
+        for n in 1..=MAX_PORTS {
             let ports: Vec<u16> = (0..n)
                 .map(|i| 61_000 + u16::try_from(i).expect("small"))
                 .collect();

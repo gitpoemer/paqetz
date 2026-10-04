@@ -657,6 +657,45 @@ new five-tuple. Moving on a timer is the same cure without the outage.
 
 Turn either off if your path does not want it.
 
+### A path that cuts every connection
+
+Some filters let a connection start and cut it a few seconds later, whatever
+it carries. The tunnel then works for a moment after every restart and is dead
+the rest of the time. The answer is to move before the cut, on the end that
+connects out:
+
+```toml
+# under [tunnel.interface], on the client
+rotate_after = 3            # seconds; fractions are fine (2.5)
+rotate_jitter = 0.3         # spread either side, so moves are not on a clock
+rotate_after_silence = 500  # ms: leave a connection that has gone quiet
+rotate_ports = 200          # ports to move between, up to 240
+```
+
+Moving costs no handshake: the session carries straight over to the new port,
+the end that connects out sends one packet from there at once, and the other end
+follows it.
+
+Measured through a router that cut every TCP connection four seconds in, a
+download through the tunnel managed 0.3 to 1.3 Mbit/s with the defaults, dead 29
+seconds in 30, and over 2 Gbit/s moving every 3 seconds, on every carrier, with
+nothing cut.
+
+| setting | what ends a connection |
+|---|---|
+| `rotate_after`, `rotate_jitter` | time, from 1 second up |
+| `rotate_after_packets` | packets carried, both ways |
+| `rotate_after_bytes` | payload bytes carried, both ways |
+| `rotate_after_silence` | nothing heard for this long, in milliseconds, while there was traffic to answer: a cut that comes sooner than expected |
+
+Whichever comes first moves the connection. Set the time comfortably under the
+cut: a connection is timed from its first packet, and the cut is rarely exact.
+With `carrier = "handshake"` the next connection is opened just before a move, a
+few round trips ahead, so the move does not wait for its SYN+ACK; that lead
+counts against its lifetime too. Moves are counted as `moves` in the client's
+status line, and logged only at `debug`, since at this rate a line each would
+fill the log.
+
 ### When WARP is the way out
 
 `egress = "warp"` sends everything the tunnel forwards out through Cloudflare

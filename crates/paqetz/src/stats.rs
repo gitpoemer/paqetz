@@ -79,6 +79,11 @@ pub(crate) struct Stats {
     pub(crate) handshakes_done: AtomicU64,
     /// Times the peer's endpoint changed under an authenticated packet.
     pub(crate) roams: AtomicU64,
+    /// Times this end moved its carrier to another port.
+    ///
+    /// Each one is otherwise only a debug line, because moving every few
+    /// seconds would fill a log at info; this is how often it happens.
+    pub(crate) moves: AtomicU64,
     /// Times the peer said it was shutting down.
     ///
     /// Worth a counter rather than only a log line: on a pair that restarts
@@ -184,6 +189,7 @@ impl Stats {
             ("repeated", get(&self.repeated)),
             ("repaired", get(&self.repaired)),
             ("roams", get(&self.roams)),
+            ("moves", get(&self.moves)),
             ("farewells", get(&self.farewells)),
         ] {
             if value > 0 {
