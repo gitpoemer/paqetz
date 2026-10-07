@@ -524,6 +524,19 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 |e| format!("via {e}")
             ),
         );
+        // Everything the file asked for that it cannot quite have, said once
+        // here and reported again by `doctor`. A setting silently overridden is
+        // worse than one that was never offered: it is discovered from a packet
+        // capture rather than from the thing that overrode it.
+        for note in &cfg.interface.notes {
+            log::warn_!(
+                "{}: {}: {}. {}",
+                cfg.name,
+                note.what,
+                note.detail,
+                note.remedy
+            );
+        }
         let mut tunnel = Tunnel::start(cfg.clone(), process.health_interval)?;
         if labelled {
             tunnel.set_label(cfg.name.clone());

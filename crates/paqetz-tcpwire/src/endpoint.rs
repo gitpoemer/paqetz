@@ -167,6 +167,12 @@ pub struct Config {
     pub ts_base: u32,
     /// How to number the segments.
     pub sequencing: Sequencing,
+    /// Whether to wrap each payload in a TLS application-data record header.
+    ///
+    /// For a connection opened with a decoy handshake: having claimed to be a
+    /// TLS session, what follows has to be shaped like one. Five bytes per
+    /// packet, and the far end strips them.
+    pub records: bool,
     /// Whether to set Don't Fragment on every packet.
     pub dont_fragment: bool,
 }
@@ -199,6 +205,7 @@ pub struct Endpoint {
     phase: Phase,
 
     sequencing: Sequencing,
+    records: bool,
 
     local_isn: u32,
     /// Payload bytes sent, plus one for each SYN or FIN we have sent.
@@ -260,6 +267,7 @@ impl Endpoint {
                 Phase::Established
             },
             sequencing: cfg.sequencing,
+            records: cfg.records,
             dont_fragment: cfg.dont_fragment,
             local_isn: cfg.isn,
             sent: 0,
@@ -546,6 +554,38 @@ impl Endpoint {
         if !self.is_ready() {
             return Err(Error::NotEstablished);
         }
+        // The record header is on the wire, so it occupies sequence space like
+        // anything else: counted here rather than in `emit`, which is told what
+        // to write and not what it means.
+        let header = if self.records {
+            crate::cover::record_header(payload.len())
+        } else {
+            None
+        };
+        let (n, written) = match header {
+            Some(header) => (
+                self.emit_parts(Kind::Data, &[&header, payload], out, now)?,
+                payload.len() + header.len(),
+            ),
+            None => (self.emit_raw(Kind::Data, payload, out, now)?, payload.len()),
+        };
+        let len = u32::try_from(written).map_err(|_| Error::TooLong { len: written })?;
+        self.sent = self.sent.wrapping_add(len);
+        Ok(n)
+    }
+
+    /// Writes a payload that is already shaped the way the wire should see it.
+    ///
+    /// For the decoy handshake, which is TLS records of its own: wrapping those
+    /// in an application-data record would be claiming a session had begun
+    /// before its hello.
+    ///
+    /// # Errors
+    /// As [`Self::data`].
+    pub fn bare(&mut self, payload: &[u8], out: &mut [u8], now: u64) -> Result<usize> {
+        if !self.is_ready() {
+            return Err(Error::NotEstablished);
+        }
         let n = self.emit_raw(Kind::Data, payload, out, now)?;
         let len =
             u32::try_from(payload.len()).map_err(|_| Error::TooLong { len: payload.len() })?;
@@ -584,8 +624,19 @@ impl Endpoint {
     /// retransmitted SYN repeats its predecessor's number rather than taking a
     /// new one.
     fn emit_raw(&mut self, kind: Kind, payload: &[u8], out: &mut [u8], now: u64) -> Result<usize> {
+        self.emit_parts(kind, &[payload], out, now)
+    }
+
+    /// As [`Self::emit_raw`], with the payload in pieces.
+    fn emit_parts(
+        &mut self,
+        kind: Kind,
+        parts: &[&[u8]],
+        out: &mut [u8],
+        now: u64,
+    ) -> Result<usize> {
         let fields = self.fields(kind, now);
-        let n = segment::emit(kind, &self.profile, &fields, payload, out)?;
+        let n = segment::emit_parts(kind, &self.profile, &fields, parts, out)?;
         self.counter = self.counter.wrapping_add(1);
         Ok(n)
     }
@@ -860,6 +911,7 @@ mod tests {
             // The tests below check the byte-accurate numbering specifically,
             // so they ask for it. `Opaque` is the default and has its own.
             sequencing: Sequencing::Stream,
+            records: false,
             dont_fragment: true,
         }
     }
@@ -867,6 +919,7 @@ mod tests {
     fn opaque(role: Role) -> Config {
         Config {
             sequencing: Sequencing::Opaque,
+            records: false,
             dont_fragment: true,
             ..cfg(role, Carrier::Midstream, LINUX_6)
         }

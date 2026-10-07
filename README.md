@@ -382,6 +382,69 @@ Both number the segments by the bytes they carry (`sequencing = "stream"`)
 unless told otherwise: after an opening, numbers that describe no stream would
 contradict it. Every new outer port is a new connection, opened the same way.
 
+### When the path wants a name
+
+Some filters decide what a connection is from the server name in its first
+packet, and act on nothing after that. This carrier's packets are uniform
+random bytes, which such a filter cannot classify at all, and on a path that
+carries only what it recognises, "cannot classify" is itself a verdict. So each
+connection can be opened with a decoy TLS handshake:
+
+```toml
+# under [tunnel.interface], on both hosts
+spoof_sni = "www.cloudflare.com"
+```
+
+The end that connects out sends a ClientHello naming that, the end that waits
+answers with a ServerHello echoing the session identifier it was asked with,
+and everything after it is what the tunnel was going to send anyway. Both ends
+need the line: one to ask, one to answer.
+
+The hello is Chrome's, field for field, including the GREASE values and the
+shuffled extension order Chrome has used since version 110, and it is padded to
+517 bytes so its length says nothing about the name it carries. Every
+connection draws fresh randoms, so two of them are never byte-identical. With
+rotation that is a new hello every few seconds, which is also what a browser
+opening connections looks like.
+
+Each packet after the handshake wears a TLS application-data record header, so
+the whole flow reads as records rather than as a handshake followed by
+something unexplained. That is `spoof_records`, on by default wherever
+`spoof_sni` is, and five bytes per packet off the inner MTU:
+
+```toml
+spoof_records = false      # if you want the hellos and nothing else
+```
+
+**It needs `sequencing = "stream"`,** because the decoy is the first bytes of a
+stream and under opaque numbering the segments describe no stream for anything
+to read it out of. Nothing has to be written down: setting `spoof_sni` switches
+the numbering. A file that explicitly asks for `opaque` still gets `stream`, and
+is told so rather than quietly overridden.
+
+**It belongs on `carrier = "handshake"`,** where the wire reads exactly as an
+ordinary TLS connection does: SYN, SYN+ACK, ACK, ClientHello, ServerHello,
+application data. On a carrier that never opens its connections the hello
+arrives mid-stream, which no client does, so paqetz says so and carries on: a
+filter reading the name need not be the one tracking the connection.
+
+Both of those, and anything else a configuration asks for that it cannot quite
+have, appear as a warning in the service log at start-up and again in
+`paqetz doctor`, each with what to write instead.
+
+It is a guess about what the path reads. If the path cuts on age or volume
+instead, the rotation knobs below are what help, and this costs 517 bytes per
+connection for nothing.
+
+Unlike the known form of this trick, nothing is injected. That version belongs
+to programs speaking real TLS through the kernel's stack, which have to smuggle
+the decoy past it with a netfilter queue, firewall rules and a deliberately
+wrong sequence number, and then hope the filter reassembles more loosely than
+the server does. paqetz writes its own segments and owns its sequence space, and
+the far end is paqetz, so the decoy is simply the first bytes of the stream at
+the numbers they belong at. A filter that validates sequence numbers reads it
+just as one that does not.
+
 ### When the path will not carry TCP at all
 
 Three carriers drop TCP entirely. Which one a path carries is a property of the

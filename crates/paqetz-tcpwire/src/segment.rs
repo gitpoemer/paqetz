@@ -208,9 +208,27 @@ pub fn emit(
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize> {
+    emit_parts(kind, profile, fields, &[payload], out)
+}
+
+/// As [`emit`], with the payload given in pieces written back to back.
+///
+/// For a carrier that puts a header of its own in front of what it carries,
+/// which would otherwise mean copying the payload once more to join the two.
+///
+/// # Errors
+/// As [`emit`].
+pub fn emit_parts(
+    kind: Kind,
+    profile: &OsProfile,
+    fields: &Fields,
+    parts: &[&[u8]],
+    out: &mut [u8],
+) -> Result<usize> {
+    let payload_len: usize = parts.iter().map(|p| p.len()).sum();
     let opts = option_len(kind, profile);
     let tcp_total = TCP_LEN + opts;
-    let total = IPV4_LEN + tcp_total + payload.len();
+    let total = IPV4_LEN + tcp_total + payload_len;
     if out.len() < total {
         return Err(Error::Short {
             need: total,
@@ -256,7 +274,9 @@ pub fn emit(
 
         write_options(&mut c, kind, profile, fields)?;
         debug_assert_eq!(c.pos, tcp_total);
-        c.put(payload)?;
+        for part in parts {
+            c.put(part)?;
+        }
     }
 
     // ---- checksums ----

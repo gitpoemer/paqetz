@@ -136,7 +136,22 @@ pub(crate) fn run(path: &Path) -> bool {
             findings.push(check_port_free(t.interface.listen_port));
             findings.push(check_standard_port(t.interface.listen_port));
         }
-        findings.push(check_mtu(t.interface.mtu, t.interface.shape));
+        findings.push(check_mtu(
+            t.interface.mtu,
+            t.interface.shape,
+            t.interface.spoof_records,
+        ));
+        // What the file asked for that it cannot quite have. Reported here as
+        // well as logged at start-up, because this is the command an operator
+        // runs *before* starting anything, and a setting quietly overridden is
+        // otherwise discovered from a packet capture.
+        for note in &t.interface.notes {
+            findings.push(Finding::warn(
+                note.what.clone(),
+                note.detail.clone(),
+                note.remedy.clone(),
+            ));
+        }
         for lane in &t.lanes {
             if let Some(interface) = lane.egress.as_deref() {
                 findings.push(check_lane(lane.class, interface, lane.table));
@@ -563,11 +578,11 @@ fn check_warp(cfg: &TunnelConfig) -> Vec<Finding> {
 /// fake-TCP figure, this called a correctly-sized GRE tunnel too large by the
 /// difference between the two headers and told the operator to shrink an MTU
 /// that already fit -- a check reporting a fault it had invented.
-fn check_mtu(inner: u32, shape: crate::config::Shape) -> Finding {
+fn check_mtu(inner: u32, shape: crate::config::Shape, records: bool) -> Finding {
     // One source, shared with the default this compares against, so the two
     // cannot drift into disagreeing about the same packet.
     let overhead =
-        u32::try_from(shape.overhead() + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
+        u32::try_from(shape.overhead(records) + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
     match outbound_mtu() {
         Some(path_mtu) if inner + overhead > path_mtu => Finding::warn(
             "MTU",
@@ -1019,8 +1034,9 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
             Shape::Raw(Shell::Bare(143)),
             Shape::Raw(Shell::Icmp),
         ] {
-            let total =
-                shape.default_mtu() as usize + shape.overhead() + paqetz_core::framing::OVERHEAD;
+            let total = shape.default_mtu(false) as usize
+                + shape.overhead(false)
+                + paqetz_core::framing::OVERHEAD;
             assert!(
                 total <= 1500,
                 "{shape:?}: its own default is {total} bytes on a 1500-byte path"
@@ -1034,8 +1050,8 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
             Shape::Raw(Shell::Bare(143)),
             Shape::Raw(Shell::Icmp),
         ] {
-            let total = shape.fragment_free_mtu() as usize
-                + shape.overhead()
+            let total = shape.fragment_free_mtu(false) as usize
+                + shape.overhead(false)
                 + paqetz_core::framing::OVERHEAD;
             assert!(total <= 1280, "{shape:?}: capped default is {total} bytes");
         }
@@ -1054,6 +1070,7 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
             check_mtu(
                 1400,
                 crate::config::Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
+                false,
             ),
         ];
         for f in findings {

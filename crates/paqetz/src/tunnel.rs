@@ -214,6 +214,12 @@ const STANDBY_LEAD_MIN: Millis = 100;
 /// host is expected to recover from.
 const READ_RETRY: Duration = Duration::from_secs(1);
 
+/// A buffer with room for the longest decoy handshake and its outer headers.
+///
+/// The hello is 517 bytes for every name short enough to pad to it, and grows
+/// with a longer one; this covers the longest a name may be.
+const COVER_FRAME: usize = 1024;
+
 /// How long a real handshake's SYN is repeated before a fresh one replaces it.
 ///
 /// Its proof is bound to the time it was first sent, and holds for a period
@@ -479,6 +485,19 @@ struct PeerState {
     heard_at: Option<Millis>,
     /// How long the last SYN answered took to be answered.
     syn_rtt: Option<Millis>,
+    /// Whether this connection still owes its decoy handshake.
+    ///
+    /// Set whenever a connection begins, which with rotation is every few
+    /// seconds: the decoy is the first bytes of each one, because a filter that
+    /// reads a name reads it there or not at all.
+    cover_due: bool,
+    /// The session identifier the peer's decoy hello carried, for the answer
+    /// to echo.
+    ///
+    /// A server that answers with an identifier nobody sent is a server
+    /// answering nobody's hello, which is the first thing to check about a
+    /// handshake and the only part of it this can get right for free.
+    cover_session: Option<[u8; 32]>,
     /// The next connection, opened ahead of a move under a real handshake.
     standby: Option<Wire>,
     /// When the standby connection's SYN went out.
@@ -493,6 +512,8 @@ impl PeerState {
             previous: None,
             pending: None,
             carrier: None,
+            cover_due: false,
+            cover_session: None,
             outbox: crate::repeat::Outbox::new(repeat),
             inbox: crate::repeat::Inbox::new(repeat),
             endpoint,
@@ -537,6 +558,7 @@ impl PeerState {
         self.carried_bytes = 0;
         self.quiet_since = None;
         self.heard_at = None;
+        self.cover_due = true;
     }
 
     /// Counts a packet carried on the current five-tuple.
@@ -1012,6 +1034,22 @@ impl Wire {
         }
     }
 
+    /// Writes a payload that is already shaped the way the wire should see it,
+    /// for the decoy handshake.
+    fn bare(
+        &mut self,
+        payload: &[u8],
+        out: &mut [u8],
+        now: Millis,
+    ) -> core::result::Result<usize, paqetz_tcpwire::Error> {
+        match self {
+            Self::Tcp(c) => c.bare(payload, out, now),
+            // No clock: nothing in a GRE header is a function of time. The
+            // fake-TCP carrier needs one for its timestamp option.
+            Self::Raw(c) => c.data(payload, out),
+        }
+    }
+
     /// The peer's address as this carrier currently addresses it.
     fn remote(&self) -> SocketAddrV4 {
         match self {
@@ -1365,6 +1403,7 @@ impl Tunnel {
         let mtu = fitted_mtu(
             cfg.interface.mtu,
             cfg.interface.shape,
+            cfg.interface.spoof_records,
             crate::doctor::outbound_mtu(),
         );
         if mtu != cfg.interface.mtu {
@@ -1536,6 +1575,7 @@ impl Tunnel {
                     peer_isn: numbers.1,
                     ts_base: numbers.2,
                     sequencing: self.cfg.interface.sequencing,
+                    records: self.cfg.interface.spoof_records,
                     dont_fragment: df,
                 })))
             }
@@ -1564,6 +1604,66 @@ impl Tunnel {
                     },
                 },
             )),
+        }
+    }
+
+    /// Sends the decoy handshake this connection owes, if it owes one.
+    ///
+    /// Called with the state held and before anything else goes out, because
+    /// what it is for is being the first bytes a filter sees on the connection.
+    /// It goes through the carrier like any other data, so it occupies the
+    /// sequence numbers it claims and whatever reassembles the stream finds a
+    /// hello at the front of it rather than a gap.
+    ///
+    /// Failure is not an error: the decoy is cover, and a connection without it
+    /// carries traffic exactly as well.
+    fn send_cover(&self, state: &mut PeerState, now: Millis) {
+        let Some(name) = self.cfg.interface.spoof_sni.as_deref() else {
+            return;
+        };
+        if !state.cover_due {
+            return;
+        }
+        if state.carrier.as_ref().is_none_or(|c| !c.is_ready()) {
+            return;
+        }
+        let secrets = match cover_secrets() {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("could not draw a decoy handshake: {e}");
+                return;
+            }
+        };
+        // The end that connects out asks; the end that waits answers, echoing
+        // the identifier it was asked with. A responder that has not seen a
+        // hello has nothing to answer and says nothing.
+        let record = if self.is_initiator() {
+            paqetz_tcpwire::cover::client_hello(name, &secrets)
+        } else {
+            state
+                .cover_session
+                .map(|id| paqetz_tcpwire::cover::server_hello(&id, &secrets))
+        };
+        let Some(record) = record else {
+            return;
+        };
+        // Cleared whatever follows: a decoy that could not be sent is not worth
+        // retrying on every packet, and one sent late is worse than none.
+        state.cover_due = false;
+        let mut frame = [0u8; COVER_FRAME];
+        let Some(carrier) = state.carrier.as_mut() else {
+            return;
+        };
+        match carrier.bare(&record, &mut frame, now) {
+            Ok(written) => {
+                let dst = *carrier.remote().ip();
+                if let Some(out) = frame.get(..written)
+                    && let Err(e) = self.tx.send(out, dst)
+                {
+                    debug!("could not send the decoy handshake: {e}");
+                }
+            }
+            Err(e) => debug!("could not build the decoy handshake: {e}"),
         }
     }
 
@@ -2220,6 +2320,7 @@ impl Tunnel {
             Stats::bump(&self.stats.tx_dropped);
             return Ok(None);
         }
+        self.send_cover(&mut state, now);
         let Some(session) = state.session.as_mut() else {
             return Ok(None);
         };
@@ -2332,7 +2433,20 @@ impl Tunnel {
     /// only for the shape that has them.
     fn parse<'a>(&self, bytes: &'a [u8]) -> Option<segment::Segment<'a>> {
         match self.cfg.interface.shape {
-            crate::config::Shape::Tcp(_) => segment::parse_ethernet(bytes),
+            crate::config::Shape::Tcp(_) => {
+                let mut seg = segment::parse_ethernet(bytes)?;
+                // The record header the peer put in front of its payload, if
+                // it is wearing one. Length-checked, so a peer that is not --
+                // one end upgraded before the other -- still reads correctly,
+                // and the decoy handshake itself is left alone because it is a
+                // handshake record rather than an application-data one.
+                if self.cfg.interface.spoof_records
+                    && let Some(inner) = paqetz_tcpwire::cover::unwrap_record(seg.payload)
+                {
+                    seg.payload = inner;
+                }
+                Some(seg)
+            }
             crate::config::Shape::Raw(shell) => {
                 let got = paqetz_tcpwire::rawip::parse_ethernet(bytes, shell)?;
                 // Our own transmissions, on a kernel without
@@ -2514,6 +2628,23 @@ impl Tunnel {
         // counting it as a rejection would report the peer's own handshake as
         // someone sending garbage.
         if payload.is_empty() && self.opening().is_some_and(paqetz_tcpwire::Carrier::opens) {
+            return Ok(());
+        }
+
+        // The peer's decoy handshake, which is cover rather than anything to
+        // decrypt. Recognised before the AEAD so it is not counted as somebody
+        // sending garbage at the port -- which, with rotation, it would be once
+        // every few seconds, in the counter that exists to report exactly that.
+        //
+        // Read from an unauthenticated packet, so the only thing taken from it
+        // is the 32 bytes the answering decoy echoes. Nothing above can be
+        // reached by it: whoever can put a packet on this tuple can already see
+        // the flow, and all they can choose is a number in cover traffic.
+        if self.cfg.interface.spoof_sni.is_some() && paqetz_tcpwire::cover::is_cover(payload) {
+            if let Some(id) = paqetz_tcpwire::cover::session_id(payload) {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.cover_session = Some(id);
+            }
             return Ok(());
         }
 
@@ -2906,6 +3037,13 @@ impl Tunnel {
         // may have moved, and following it here is what makes a NAT rebinding
         // invisible instead of fatal.
         let fresh = state.carrier.as_ref().is_some_and(|c| c.remote() != from);
+        // A new tuple is a new connection to anything watching, whether this
+        // end moved or the peer did, so it owes a decoy of its own: the end
+        // that waits answers the hello it has just been sent, and the end that
+        // connects out asks again from wherever the peer now is.
+        if fresh {
+            state.cover_due = true;
+        }
         if state.endpoint != Some(from) {
             let was = state.endpoint;
             state.endpoint = Some(from);
@@ -3476,6 +3614,8 @@ impl Tunnel {
             return Ok(());
         }
 
+        self.send_cover(&mut state, now);
+
         let (initiator, (msg1, msg1_len)) = Initiator::start(
             &self.cfg.interface.private_key,
             &self.local_public,
@@ -3522,12 +3662,17 @@ impl Tunnel {
 ///
 /// The whole decision, in one place a test can reach, and away from the
 /// syscalls around it.
-fn fitted_mtu(configured: u32, shape: crate::config::Shape, link: Option<u32>) -> u32 {
+fn fitted_mtu(
+    configured: u32,
+    shape: crate::config::Shape,
+    records: bool,
+    link: Option<u32>,
+) -> u32 {
     let Some(link) = link else {
         return configured;
     };
     let overhead =
-        u32::try_from(shape.overhead() + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
+        u32::try_from(shape.overhead(records) + paqetz_core::framing::OVERHEAD).unwrap_or(u32::MAX);
     let room = link.saturating_sub(overhead);
     // A link too small to carry anything leaves the configuration alone: there
     // is no useful MTU to fall back to, and the failure should be the send
@@ -3700,10 +3845,34 @@ pub(crate) fn install_signal_handlers() {
 
 /// Reads four random bytes from the kernel.
 fn random_u32() -> io::Result<u32> {
-    use std::io::Read as _;
     let mut buf = [0u8; 4];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    random_bytes(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
+}
+
+/// Fills a buffer from the kernel's generator.
+fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
+    use std::io::Read as _;
+    std::fs::File::open("/dev/urandom")?.read_exact(buf)
+}
+
+/// The numbers one decoy handshake needs, drawn fresh.
+///
+/// Fresh per connection, which is the point: two hellos sharing a random, a
+/// session identifier or a key share would say they came from one program
+/// rather than from a browser opening connections.
+fn cover_secrets() -> io::Result<paqetz_tcpwire::cover::Secrets> {
+    let mut bytes = [0u8; 97];
+    random_bytes(&mut bytes)?;
+    let mut secrets = paqetz_tcpwire::cover::Secrets::default();
+    let (random, rest) = bytes.split_at(32);
+    let (session, rest) = rest.split_at(32);
+    let (share, grease) = rest.split_at(32);
+    secrets.random.copy_from_slice(random);
+    secrets.session_id.copy_from_slice(session);
+    secrets.key_share.copy_from_slice(share);
+    secrets.grease = grease.first().copied().unwrap_or(0);
+    Ok(secrets)
 }
 
 #[cfg(test)]
@@ -3773,40 +3942,46 @@ mod tests {
         use paqetz_tcpwire::rawip::Shell;
 
         let gre = Shape::Raw(Shell::Gre);
-        let over = u32::try_from(gre.overhead() + paqetz_core::framing::OVERHEAD)
+        let over = u32::try_from(gre.overhead(false) + paqetz_core::framing::OVERHEAD)
             .expect("an outer header is tens of bytes");
 
         // Its own default fits an ordinary link and is left alone.
         assert_eq!(
-            fitted_mtu(gre.default_mtu(), gre, Some(1500)),
-            gre.default_mtu()
+            fitted_mtu(gre.default_mtu(false), gre, false, Some(1500)),
+            gre.default_mtu(false)
         );
         // A smaller link lowers it to exactly what fits, and no further.
-        assert_eq!(fitted_mtu(gre.default_mtu(), gre, Some(1400)), 1400 - over);
         assert_eq!(
-            fitted_mtu(gre.default_mtu(), gre, Some(1400)) + over,
+            fitted_mtu(gre.default_mtu(false), gre, false, Some(1400)),
+            1400 - over
+        );
+        assert_eq!(
+            fitted_mtu(gre.default_mtu(false), gre, false, Some(1400)) + over,
             1400,
             "the whole outer packet, at the link"
         );
         // Already small enough is untouched: someone who measured their path
         // keeps what they measured.
-        assert_eq!(fitted_mtu(900, gre, Some(1500)), 900);
+        assert_eq!(fitted_mtu(900, gre, false, Some(1500)), 900);
 
         // Unreadable link, unchanged configuration. Guessing smaller from
         // nothing would shrink every tunnel on a host this cannot parse.
-        assert_eq!(fitted_mtu(gre.default_mtu(), gre, None), gre.default_mtu());
+        assert_eq!(
+            fitted_mtu(gre.default_mtu(false), gre, false, None),
+            gre.default_mtu(false)
+        );
 
         // A link too small to carry any payload leaves it alone as well: there
         // is no useful size to fall back to, and the send saying so is a better
         // failure than a device configured to nonsense.
-        assert_eq!(fitted_mtu(1400, gre, Some(over)), 1400);
-        assert_eq!(fitted_mtu(1400, gre, Some(8)), 1400);
+        assert_eq!(fitted_mtu(1400, gre, false, Some(over)), 1400);
+        assert_eq!(fitted_mtu(1400, gre, false, Some(8)), 1400);
 
         // Each shape is measured by its own header, which is the bug in one
         // line: fake-TCP pays more, so it is lowered further on the same link.
         let tcp = Shape::Tcp(paqetz_tcpwire::Carrier::Midstream);
         assert!(
-            fitted_mtu(9000, tcp, Some(1500)) < fitted_mtu(9000, gre, Some(1500)),
+            fitted_mtu(9000, tcp, false, Some(1500)) < fitted_mtu(9000, gre, false, Some(1500)),
             "a bigger outer header must leave less room, not the same"
         );
     }
@@ -3942,6 +4117,48 @@ mod tests {
             "a port outside the pool means it was configured, so stay put"
         );
         assert_eq!(next_port(&[], 8443), 8443, "and an empty pool goes nowhere");
+    }
+
+    #[test]
+    fn every_connection_owes_a_decoy_handshake_and_owes_it_once() {
+        // The decoy is worth having only as the *first* bytes of a connection,
+        // so what matters is that beginning one arms it and sending it clears
+        // it. With rotation that is every few seconds, and a decoy repeated per
+        // packet would be 517 bytes of overhead on each.
+        let mut state = PeerState::new(None, crate::repeat::Limits::off());
+        assert!(
+            !state.cover_due,
+            "nothing owed before there is a connection"
+        );
+
+        state.replace_carrier(raw_wire());
+        assert!(state.cover_due, "a new connection owes one");
+        state.cover_due = false;
+        state.replace_carrier(raw_wire());
+        assert!(state.cover_due, "and so does the next, after a move");
+    }
+
+    #[test]
+    fn a_decoy_is_read_back_as_cover_rather_than_as_garbage() {
+        // What the far end does with it, which is the half that decides whether
+        // the counter an operator reads means anything: with rotation this
+        // arrives every few seconds, and counted as a rejection it would report
+        // the peer as sending garbage for ever.
+        let secrets = paqetz_tcpwire::cover::Secrets::default();
+        let hello =
+            paqetz_tcpwire::cover::client_hello("www.example.com", &secrets).expect("builds");
+        assert!(paqetz_tcpwire::cover::is_cover(&hello));
+        assert_eq!(
+            paqetz_tcpwire::cover::session_id(&hello),
+            Some(secrets.session_id),
+            "the answer echoes what it was asked"
+        );
+
+        // A sealed packet must never be taken for one. The framing is a masked
+        // index, a counter and ciphertext; none of it describes TLS records.
+        let mut sealed = [0u8; 128];
+        random_bytes(&mut sealed).expect("urandom");
+        assert!(!paqetz_tcpwire::cover::is_cover(&sealed));
     }
 
     #[test]

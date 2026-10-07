@@ -8,6 +8,7 @@
 #   CARRIER=handshake ./scripts/test-e2e.sh    # a connection that opens first
 #   CARRIER=midstream-fh ./scripts/test-e2e.sh # one that announces it, and goes on
 #   CARRIER=icmp ./scripts/test-e2e.sh     # pings, with the identifier moving
+#   SPOOF_SNI=www.cloudflare.com ./scripts/test-e2e.sh  # with a decoy handshake
 #   CARRIER=rawip PROTO=143 ./scripts/test-e2e.sh
 #   DATAPATH=simple ./scripts/test-e2e.sh
 #
@@ -76,6 +77,12 @@ CLI_PUB=$(echo "${cli_keys}"  | awk -F'"' '/public/  {print $2}')
 CARRIER=${CARRIER:-midstream}
 PROTO=${PROTO:-143}
 
+# Written only when asked for, and then on both ends: one asks, one answers.
+SPOOF=""
+if [[ -n ${SPOOF_SNI:-} ]]; then
+    SPOOF="spoof_sni = \"${SPOOF_SNI}\""
+fi
+
 # Written only where it means something; every other carrier refuses it.
 CARRIER_PROTO=""
 if [[ ${CARRIER} == rawip ]]; then
@@ -90,6 +97,7 @@ listen_port = ${PORT}
 device = "pq-srv"
 carrier = "${CARRIER}"
 ${CARRIER_PROTO}
+${SPOOF}
 datapath = "${DATAPATH:-batched}"
 health_interval = 2
 
@@ -113,6 +121,7 @@ listen_port = $((PORT + 1))
 device = "pq-cli"
 carrier = "${CARRIER}"
 ${CARRIER_PROTO}
+${SPOOF}
 datapath = "${DATAPATH}"
 health_interval = 2
 persistent_keepalive = 5
@@ -571,6 +580,38 @@ if [[ -s ${WORK}/wire.pcap ]]; then
             ok "all ${gre_all} packets are GREv0 with no optional fields"
         else
             bad "${gre_plain} of ${gre_all} GRE packets are plain GREv0"
+        fi
+    elif [[ -n ${SPOOF_SNI:-} ]]; then
+        # The decoy has to be the *first* payload of each connection, and it has
+        # to parse: a filter that cannot read it learns no name from it, and the
+        # connection is then as unclassifiable as it was without it.
+        hellos=$(sudo tcpdump -r "${WORK}/wire.pcap" -A 2>/dev/null |
+            grep -c "${SPOOF_SNI}" || true)
+        if [[ ${hellos} -gt 0 ]]; then
+            ok "${hellos} packets carry the decoy name ${SPOOF_SNI}"
+        else
+            bad "the decoy name never appeared on the wire"
+        fi
+
+        # Every payload a record, not just the hellos: a stream that claimed a
+        # handshake and then sent something that is not a record is one
+        # anything reading past the hello walks straight into.
+        bare=$(sudo tcpdump -r "${WORK}/wire.pcap" -x 2>/dev/null |
+            grep -cE "0x0030:.*(1603|1703)" || true)
+        if [[ ${bare} -gt 0 ]]; then
+            ok "the payloads are TLS records"
+        else
+            bad "no TLS record header was found where the payload starts"
+        fi
+
+        # And it is 517 bytes whatever it names, which is what keeps the
+        # length from saying how long the name was.
+        padded=$(sudo tcpdump -r "${WORK}/wire.pcap" -n 2>/dev/null |
+            grep -c "length 517" || true)
+        if [[ ${padded} -gt 0 ]]; then
+            ok "${padded} decoy hellos are padded to the usual 517 bytes"
+        else
+            bad "no 517-byte hello was captured"
         fi
     elif [[ ${CARRIER} == icmp ]]; then
         # Asserted positively: every packet an echo, nothing else on protocol

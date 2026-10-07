@@ -37,6 +37,7 @@
 //! - **A `FIN` on close**, rather than the flow simply stopping.
 
 pub mod checksum;
+pub mod cover;
 pub mod endpoint;
 pub mod profile;
 pub mod rawip;

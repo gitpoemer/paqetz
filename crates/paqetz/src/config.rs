@@ -120,6 +120,22 @@ pub(crate) struct Interface {
     /// therefore checkable by anything modelling the flow — including after a
     /// loss this carrier cannot repair, which it then never recovers from.
     pub(crate) sequencing: paqetz_tcpwire::Sequencing,
+    /// A server name to open each connection with, for a path that decides
+    /// what a flow is by the name in its first packet.
+    ///
+    /// Absent by default: it is a guess about what the path reads, and a
+    /// connection that opens with a name nothing was looking for has paid 517
+    /// bytes for nothing.
+    pub(crate) spoof_sni: Option<String>,
+    /// Whether each packet wears a TLS application-data record header.
+    ///
+    /// On by default wherever `spoof_sni` is, because a connection that opened
+    /// with a handshake and then sent something that is not a record is one
+    /// anything reading past the hello walks straight into. Five bytes per
+    /// packet, off the inner MTU.
+    pub(crate) spoof_records: bool,
+    /// Everything about this tunnel worth saying but not worth refusing.
+    pub(crate) notes: Vec<Note>,
     /// Whether to forward and translate the peer's traffic to the internet.
     ///
     /// The server side of a tunnel that is meant to be a way out. Without it
@@ -305,6 +321,23 @@ pub(crate) enum Shape {
     Raw(paqetz_tcpwire::rawip::Shell),
 }
 
+/// Something worth saying about a configuration that is still usable.
+///
+/// Collected while the file is read, rather than logged there, because two
+/// places want them: `run` says them once at start-up, and `doctor` reports
+/// each as a warning with its remedy. A check that only logged would be
+/// invisible in the report, and one that only reported would be invisible to
+/// anyone who never runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Note {
+    /// What it is about, as a short label.
+    pub(crate) what: String,
+    /// What was observed, and why it matters.
+    pub(crate) detail: String,
+    /// What to do about it.
+    pub(crate) remedy: String,
+}
+
 /// What a shape's firewall rules name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Guarding {
@@ -318,10 +351,19 @@ pub(crate) enum Guarding {
 
 impl Shape {
     /// Bytes of outer header before the tunnel's own framing.
-    pub(crate) const fn overhead(self) -> usize {
-        match self {
+    ///
+    /// `records` adds the TLS application-data header each packet wears when
+    /// the connection was opened with a decoy handshake. It is outer header
+    /// like any other: five bytes the inner MTU does not get.
+    pub(crate) const fn overhead(self, records: bool) -> usize {
+        let shell = match self {
             Self::Tcp(_) => paqetz_tcpwire::segment::MAX_OVERHEAD,
             Self::Raw(shell) => shell.overhead(),
+        };
+        if records {
+            shell + paqetz_tcpwire::cover::RECORD_HEADER
+        } else {
+            shell
         }
     }
 
@@ -378,8 +420,8 @@ impl Shape {
     ///
     /// The ceiling with Don't Fragment cleared, because nothing here reassembles
     /// what a hop would split.
-    pub(crate) const fn fragment_free_mtu(self) -> u32 {
-        let room = FRAGMENT_FREE_OUTER - self.overhead() - paqetz_core::framing::OVERHEAD;
+    pub(crate) const fn fragment_free_mtu(self, records: bool) -> u32 {
+        let room = FRAGMENT_FREE_OUTER - self.overhead(records) - paqetz_core::framing::OVERHEAD;
         // Exact: `room` is around a thousand.
         #[expect(
             clippy::cast_possible_truncation,
@@ -401,15 +443,23 @@ impl Shape {
         clippy::cast_possible_truncation,
         reason = "both operands are outer header lengths, tens of bytes"
     )]
-    pub(crate) const fn default_mtu(self) -> u32 {
+    pub(crate) const fn default_mtu(self, records: bool) -> u32 {
+        // The record header comes off whichever default this shape has: a
+        // packet wearing one is five bytes longer on the wire, and the inner
+        // size is what has to give.
+        let records = if records {
+            paqetz_tcpwire::cover::RECORD_HEADER as u32
+        } else {
+            0
+        };
         match self {
-            Self::Tcp(_) => paqetz_dp::tun::DEFAULT_MTU,
+            Self::Tcp(_) => paqetz_dp::tun::DEFAULT_MTU - records,
             Self::Raw(_) => {
-                let saved = paqetz_tcpwire::segment::MAX_OVERHEAD - self.overhead();
+                let saved = paqetz_tcpwire::segment::MAX_OVERHEAD - self.overhead(false);
                 // Both are outer header lengths, tens of bytes; the conversion
                 // cannot fail, and a fallback of zero would only mean the
                 // fake-TCP default rather than a wrong one.
-                paqetz_dp::tun::DEFAULT_MTU + saved as u32
+                paqetz_dp::tun::DEFAULT_MTU + saved as u32 - records
             }
         }
     }
@@ -868,6 +918,10 @@ struct RawInterface {
     #[serde(default)]
     sequencing: Option<String>,
     #[serde(default)]
+    spoof_sni: Option<String>,
+    #[serde(default)]
+    spoof_records: Option<bool>,
+    #[serde(default)]
     manage_firewall: Option<bool>,
     #[serde(default)]
     datapath: Option<String>,
@@ -1018,6 +1072,56 @@ const MAX_REORDER: u64 = 16;
 ///
 /// Everything else is allowed. Most of it will be dropped by most networks,
 /// and which numbers are not is exactly what cannot be known from here.
+/// The decoy server name, checked for what it has to be to work.
+///
+/// A name, not a URL and not an address: it goes on the wire inside a TLS
+/// server_name extension, where only a hostname belongs. A literal address
+/// there is what a client sends when it has no name at all, which is rare
+/// enough to be its own marking.
+fn spoof_sni(name: Option<&str>, shape: Shape) -> Result<Option<String>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    if !shape.has_ports() {
+        return Err(invalid(
+            "interface.spoof_sni",
+            "only means something for a carrier with a stream to put it in: the decoy is a TLS \
+             handshake at the head of a TCP connection, and gre, rawip and icmp have no such \
+             thing",
+        ));
+    }
+    if name.is_empty() || name.len() > paqetz_tcpwire::cover::MAX_NAME {
+        return Err(invalid(
+            "interface.spoof_sni",
+            format!(
+                "a server name is 1 to {} bytes, got {}",
+                paqetz_tcpwire::cover::MAX_NAME,
+                name.len()
+            ),
+        ));
+    }
+    let shaped = name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    }) && name.parse::<Ipv4Addr>().is_err();
+    if !shaped {
+        return Err(invalid(
+            "interface.spoof_sni",
+            format!(
+                "{name:?} is not a hostname. Write the name a browser would be visiting, such as \
+                 \"www.cloudflare.com\": letters, digits and hyphens in dotted labels, no scheme, \
+                 no port, no address"
+            ),
+        ));
+    }
+    Ok(Some(name.to_owned()))
+}
+
 fn carrier_protocol(proto: u8) -> Result<()> {
     let taken = |what: &str| {
         Err(invalid(
@@ -1540,14 +1644,81 @@ impl Config {
                 ));
             }
         };
+        let opens = matches!(shape, Shape::Tcp(c) if c.opens());
+        let spoof_sni = spoof_sni(iface.spoof_sni.as_deref(), shape)?;
+        let mut notes = Vec::new();
+        let written = iface.sequencing.as_deref();
+        let mut sequencing = match written.unwrap_or(if opens { "stream" } else { "opaque" }) {
+            "opaque" => paqetz_tcpwire::Sequencing::Opaque,
+            "stream" => paqetz_tcpwire::Sequencing::Stream,
+            other => {
+                return Err(invalid(
+                    "interface.sequencing",
+                    format!("expected \"opaque\" or \"stream\", got {other:?}"),
+                ));
+            }
+        };
+        // A decoy handshake is bytes at the head of a stream, so the stream has
+        // to be one: under opaque numbering the segments describe no order, and
+        // nothing reassembling them would find the hello the decoy exists to
+        // show. Switched rather than refused -- the tunnel carries traffic
+        // either way and only the disguise is at stake -- but said out loud
+        // when it overrides something written down, because a setting quietly
+        // ignored is worse than one that was never offered.
+        if spoof_sni.is_some() && sequencing != paqetz_tcpwire::Sequencing::Stream {
+            sequencing = paqetz_tcpwire::Sequencing::Stream;
+            if written.is_some() {
+                notes.push(Note {
+                    what: "sequencing".to_owned(),
+                    detail: "spoof_sni needs stream numbering and this file says opaque, so \
+                             stream is being used instead: the decoy handshake is the first \
+                             bytes of the stream, and under opaque numbering the segments \
+                             describe no stream for anything to read it out of"
+                        .to_owned(),
+                    remedy: "write sequencing = \"stream\" to say so, or drop spoof_sni".to_owned(),
+                });
+            }
+        }
+        // The decoy is most at home on the carrier that opens its connections:
+        // a hello is the first thing after a TCP handshake, and on a connection
+        // nothing saw open it is a hello arriving mid-stream, which is a shape
+        // no client produces. Worth having anyway, since a filter reading the
+        // name need not be the one tracking the connection, so this is a note
+        // rather than a refusal.
+        if spoof_sni.is_some() && !matches!(shape, Shape::Tcp(paqetz_tcpwire::Carrier::Handshake)) {
+            notes.push(Note {
+                what: "carrier".to_owned(),
+                detail: "spoof_sni sends a TLS handshake on a connection this carrier never \
+                         opens, so the hello arrives mid-stream, which no client does"
+                    .to_owned(),
+                remedy: "carrier = \"handshake\" on both ends opens the connection first, and \
+                         the wire then reads as an ordinary TLS connection: SYN, SYN+ACK, ACK, \
+                         ClientHello"
+                    .to_owned(),
+            });
+        }
+        // On wherever the decoy is, because the decoy is what makes the records
+        // mean anything. Without one they are application data belonging to a
+        // session nothing ever saw begin, which stands out more than the random
+        // bytes they replaced -- so that combination is refused rather than
+        // noted.
+        let spoof_records = iface.spoof_records.unwrap_or(spoof_sni.is_some());
+        if spoof_records && spoof_sni.is_none() {
+            return Err(invalid(
+                "interface.spoof_records",
+                "needs spoof_sni: these are the records of the session the decoy handshake \
+                 opens, and on their own they are application data for a session nothing saw \
+                 begin -- which stands out more than the bytes they replace",
+            ));
+        }
 
         // After the carrier, because the room left for an inner packet is
         // whatever its outer header does not take -- and after `fragment`,
         // because clearing Don't Fragment is only safe below a size no hop
         // needs to split.
-        let cap = shape.fragment_free_mtu();
+        let cap = shape.fragment_free_mtu(spoof_records);
         let mtu = iface.mtu.unwrap_or_else(|| match fragment {
-            Fragment::Never => shape.default_mtu(),
+            Fragment::Never => shape.default_mtu(spoof_records),
             Fragment::Path => cap,
         });
         if !(576..=9000).contains(&mtu) {
@@ -1585,23 +1756,6 @@ impl Config {
         // first byte, and numbers that describe no stream would contradict
         // the opening they follow. So a carrier that opens defaults to honest
         // numbering; one that does not keeps the numbers nothing can track.
-        let opens = matches!(shape, Shape::Tcp(c) if c.opens());
-        let sequencing =
-            match iface
-                .sequencing
-                .as_deref()
-                .unwrap_or(if opens { "stream" } else { "opaque" })
-            {
-                "opaque" => paqetz_tcpwire::Sequencing::Opaque,
-                "stream" => paqetz_tcpwire::Sequencing::Stream,
-                other => {
-                    return Err(invalid(
-                        "interface.sequencing",
-                        format!("expected \"opaque\" or \"stream\", got {other:?}"),
-                    ));
-                }
-            };
-
         let datapath = match iface.datapath.as_deref().unwrap_or("simple") {
             "batched" => Datapath::Batched,
             "simple" => Datapath::Simple,
@@ -1810,6 +1964,9 @@ impl Config {
                 profile,
                 shape,
                 sequencing,
+                spoof_sni,
+                spoof_records,
+                notes,
                 datapath,
                 transmit,
                 // Both on unless declined. Each was measured on a live path
@@ -2345,6 +2502,136 @@ mod tests {
     }
 
     #[test]
+    fn a_decoy_name_forces_the_numbering_it_needs_and_refuses_what_it_cannot_be() {
+        // The decoy is the first bytes of a stream, so there has to be a
+        // stream: under opaque numbering the segments describe no order and
+        // nothing reassembling them would find the hello at all.
+        let c = with_interface("spoof_sni = \"www.example.com\"").expect("parses");
+        assert_eq!(c.interface.spoof_sni.as_deref(), Some("www.example.com"));
+        assert_eq!(
+            c.interface.sequencing,
+            paqetz_tcpwire::Sequencing::Stream,
+            "forced, not defaulted"
+        );
+
+        // The records that continue the session the hello opens, on by default
+        // wherever the hello is, and five bytes off the inner MTU.
+        assert!(c.interface.spoof_records, "on with the decoy");
+        assert_eq!(
+            c.interface.mtu,
+            paqetz_dp::tun::DEFAULT_MTU
+                - u32::try_from(paqetz_tcpwire::cover::RECORD_HEADER).expect("five"),
+            "the header comes off the inner size, not out of thin air"
+        );
+        assert!(
+            with_interface("spoof_sni = \"www.example.com\"\nspoof_records = false")
+                .expect("parses")
+                .interface
+                .spoof_records
+                .eq(&false),
+            "and can be turned off on its own"
+        );
+        // Alone they are application data for a session nothing saw begin,
+        // which stands out more than the bytes they replace.
+        let err = with_interface("spoof_records = true").expect_err("should refuse");
+        assert!(err.to_string().contains("spoof_sni"), "{err}");
+
+        // A file asking for opaque gets stream anyway, and is told so: the
+        // tunnel carries traffic either way, so refusing it would stop a tunnel
+        // over a disguise. Silence would be worse than either.
+        let overridden = with_interface("spoof_sni = \"www.example.com\"\nsequencing = \"opaque\"")
+            .expect("switched, not refused");
+        assert_eq!(
+            overridden.interface.sequencing,
+            paqetz_tcpwire::Sequencing::Stream
+        );
+        let note = overridden
+            .interface
+            .notes
+            .iter()
+            .find(|n| n.what == "sequencing")
+            .expect("said out loud");
+        assert!(note.detail.contains("opaque"), "{note:?}");
+        assert!(note.remedy.contains("stream"), "{note:?}");
+
+        // Asking for it unprompted says nothing, because nothing was overridden.
+        assert!(
+            with_interface("spoof_sni = \"www.example.com\"\nsequencing = \"stream\"")
+                .expect("parses")
+                .interface
+                .notes
+                .iter()
+                .all(|n| n.what != "sequencing"),
+            "a file that already agrees is not lectured"
+        );
+
+        // And the carrier it belongs on. A hello on a connection nothing saw
+        // open is a hello mid-stream, which no client sends.
+        let note = c
+            .interface
+            .notes
+            .iter()
+            .find(|n| n.what == "carrier")
+            .expect("midstream earns a word about the carrier");
+        assert!(note.remedy.contains("handshake"), "{note:?}");
+        assert!(
+            with_interface("carrier = \"handshake\"\nspoof_sni = \"www.example.com\"")
+                .expect("parses")
+                .interface
+                .notes
+                .is_empty(),
+            "and the carrier it belongs on earns nothing"
+        );
+
+        // Nothing else changes: the carrier and the numbering of a tunnel
+        // without one are what they were.
+        let plain = Config::parse(CLIENT)
+            .expect("parse")
+            .into_only()
+            .expect("one tunnel");
+        assert_eq!(plain.interface.spoof_sni, None);
+        assert_eq!(
+            plain.interface.sequencing,
+            paqetz_tcpwire::Sequencing::Opaque
+        );
+
+        // A carrier with no stream has nowhere to put it.
+        for carrier in ["gre", "icmp"] {
+            let err = with_interface(&format!(
+                "carrier = {carrier:?}\nspoof_sni = \"www.example.com\""
+            ))
+            .expect_err("should refuse");
+            assert!(err.to_string().contains("spoof_sni"), "{carrier}: {err}");
+        }
+
+        // What it refuses, and why: this goes in a TLS server_name extension,
+        // where only a hostname belongs.
+        for bad in [
+            "",
+            "https://www.example.com",
+            "www.example.com:443",
+            "203.0.113.5",
+            "www..example.com",
+            "-example.com",
+            "example-.com",
+            "exa mple.com",
+        ] {
+            let err =
+                with_interface(&format!("spoof_sni = {bad:?}")).expect_err("should refuse {bad:?}");
+            assert!(
+                err.to_string().contains("spoof_sni"),
+                "{bad:?} was refused for the wrong reason: {err}"
+            );
+        }
+        for good in ["a", "example.com", "cdn-1.example.co.uk", "WWW.Example.COM"] {
+            assert!(
+                with_interface(&format!("spoof_sni = {good:?}")).is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn a_ping_carries_a_block_of_identifiers_both_ends_work_out_for_themselves() {
         let c = with_interface("carrier = \"icmp\"").expect("parse");
         assert_eq!(
@@ -2361,10 +2648,10 @@ mod tests {
 
         // Twenty-eight bytes of outer header, and the same slack against a
         // 1500-byte path the other shapes leave.
-        assert_eq!(c.interface.shape.overhead(), 28);
+        assert_eq!(c.interface.shape.overhead(c.interface.spoof_records), 28);
         assert_eq!(
             c.interface.mtu as usize
-                + c.interface.shape.overhead()
+                + c.interface.shape.overhead(c.interface.spoof_records)
                 + paqetz_core::framing::OVERHEAD,
             1488,
         );
@@ -2414,7 +2701,7 @@ mod tests {
         assert_eq!(c.interface.mtu, 1436);
         assert_eq!(
             c.interface.mtu as usize
-                + c.interface.shape.overhead()
+                + c.interface.shape.overhead(c.interface.spoof_records)
                 + paqetz_core::framing::OVERHEAD,
             1488,
         );
@@ -2671,10 +2958,15 @@ tunnel_address = "10.8.0.1"
         // tunnel that loses packets whenever the path narrows.
         let c = with_interface("fragment = \"path\"").expect("parse");
         assert_eq!(c.interface.fragment, Fragment::Path);
-        assert_eq!(c.interface.mtu, c.interface.shape.fragment_free_mtu());
+        assert_eq!(
+            c.interface.mtu,
+            c.interface
+                .shape
+                .fragment_free_mtu(c.interface.spoof_records)
+        );
         assert_eq!(
             c.interface.mtu as usize
-                + c.interface.shape.overhead()
+                + c.interface.shape.overhead(c.interface.spoof_records)
                 + paqetz_core::framing::OVERHEAD,
             FRAGMENT_FREE_OUTER,
             "the whole outer packet, at the cap"
