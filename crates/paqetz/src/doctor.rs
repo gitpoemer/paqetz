@@ -1017,6 +1017,7 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
             Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
             Shape::Raw(Shell::Gre),
             Shape::Raw(Shell::Bare(143)),
+            Shape::Raw(Shell::Icmp),
         ] {
             let total =
                 shape.default_mtu() as usize + shape.overhead() + paqetz_core::framing::OVERHEAD;
@@ -1031,6 +1032,7 @@ enp3s0\t00000000\t01A8C0\t0003\t0\t0\t100\t00000000
             Shape::Tcp(paqetz_tcpwire::Carrier::Midstream),
             Shape::Raw(Shell::Gre),
             Shape::Raw(Shell::Bare(143)),
+            Shape::Raw(Shell::Icmp),
         ] {
             let total = shape.fragment_free_mtu() as usize
                 + shape.overhead()

@@ -1019,7 +1019,11 @@ impl Wire {
                 let (ip, port) = c.remote();
                 SocketAddrV4::new(ip, port)
             }
-            Self::Raw(c) => SocketAddrV4::new(c.remote(), 0),
+            // The echo identifier stands where the port would: it is what a
+            // middlebox between the two ends keys its state on, so it is what
+            // "the peer as currently addressed" has to include. Zero for the
+            // shells with no such field.
+            Self::Raw(c) => SocketAddrV4::new(c.remote(), c.id()),
         }
     }
 
@@ -1055,7 +1059,10 @@ impl Wire {
         match self {
             Self::Tcp(c) => c.set_remote((*remote.ip(), remote.port())),
             // The port is not dropped here so much as never existing: GRE has
-            // no ports, and `remote` reports zero for the same reason.
+            // no ports, and `remote` reports zero for the same reason. A ping's
+            // echo identifier does go in that place, but it is followed in
+            // `on_receive` along with the sequence number beside it, since the
+            // two are answered together.
             Self::Raw(c) => c.set_remote(*remote.ip()),
         }
     }
@@ -1063,12 +1070,65 @@ impl Wire {
     /// Folds an inbound packet into whatever state the carrier keeps.
     ///
     /// Nothing at all for GRE, which is the point of it: no sequence space, no
-    /// acknowledgement, no timestamp to echo, no connection phase.
+    /// acknowledgement, no timestamp to echo, no connection phase. A ping keeps
+    /// the one thing it has to answer with: the identifier and sequence the
+    /// peer asked under, which the replying end quotes back and the asking end
+    /// ignores.
     fn on_receive(&mut self, seg: &segment::Segment<'_>) {
-        if let Self::Tcp(c) = self {
-            c.on_receive(seg);
+        match self {
+            Self::Tcp(c) => {
+                c.on_receive(seg);
+            }
+            Self::Raw(c) => c.answer_as(seg.src.1, u16::try_from(seg.seq & 0xFFFF).unwrap_or(0)),
         }
     }
+}
+
+/// Every outer number this end may receive on, in rotation order.
+///
+/// Choosing our own outer port above the kernel's ephemeral range keeps it from
+/// colliding with a port the kernel hands to some other socket. paqet picked
+/// from 32768-65535, which overlaps that range exactly.
+///
+/// A pool rather than one port. The side that waits has to be findable, so it
+/// keeps the port it was configured with; the side that initiates takes several
+/// and moves between them, which is what stops a single five-tuple living for
+/// hours.
+fn outer_pool(cfg: &TunnelConfig) -> Result<Vec<u16>> {
+    if let Some((base, width)) = cfg.icmp_ids() {
+        // Echo identifiers rather than ports: drawn from the block both ends
+        // derive from the key, so neither has to be told which numbers to
+        // expect. Only the asking end moves through them -- the replying end
+        // answers under whichever one arrives -- so the waiting end holds the
+        // single number it starts from.
+        if !cfg.peer.is_initiator() {
+            return Ok(vec![base]);
+        }
+        let pool = cfg.interface.rotation.ports.min(usize::from(width));
+        return Ok((0..pool)
+            .map(|i| base.wrapping_add(u16::try_from(i).unwrap_or(0)))
+            .collect());
+    }
+    if !cfg.interface.shape.has_ports() {
+        // Nothing to fill: this carrier addresses a peer with two addresses and
+        // a protocol number. A pool would be twenty numbers nothing reads, and
+        // `listen_port` on such a tunnel is a line with no effect rather than a
+        // port anything binds.
+        return Ok(Vec::new());
+    }
+    if cfg.interface.listen_port != 0 {
+        return Ok(vec![cfg.interface.listen_port]);
+    }
+    let pool = cfg.interface.rotation.ports;
+    let mut v = Vec::with_capacity(pool);
+    while v.len() < pool {
+        let r = os("choosing an outer port", random_u32())?;
+        let port = 61_000 + u16::try_from(r % 4_000).unwrap_or(0);
+        if !v.contains(&port) {
+            v.push(port);
+        }
+    }
+    Ok(v)
 }
 
 /// A running tunnel.
@@ -1083,7 +1143,18 @@ pub(crate) struct Tunnel {
     /// Our own outer address and the port currently in use.
     local: Mutex<(Ipv4Addr, u16)>,
     /// Every port the capture filter accepts, in rotation order.
+    ///
+    /// Echo identifiers, for the carrier that is a ping: the same sixteen-bit
+    /// number in the same place, moved by the same clocks.
     ports: Vec<u16>,
+    /// The identifiers this peering's pings may carry: the first, and how many.
+    ///
+    /// Wider than `ports`, which holds only the ones this end moves through.
+    /// The block is what the firewall rules at both ends name, and reading it
+    /// here lets everything else on protocol 1 -- the host's own pings, and
+    /// whatever answers them -- be dropped before it reaches the AEAD and is
+    /// counted as a rejection.
+    icmp_ids: Option<(u16, u16)>,
     /// Our static public key, needed to verify `mac1` on inbound handshakes.
     local_public: PublicKey,
     started: Instant,
@@ -1248,44 +1319,19 @@ impl Tunnel {
         // rotation line that never appears. `rotate` defaults to on, so most
         // configurations that reach here are asking for something this carrier
         // cannot do, and silently not doing it is the worse answer.
-        if cfg.interface.rotation.enabled && !cfg.interface.shape.has_ports() {
+        if cfg.interface.rotation.enabled && !cfg.interface.shape.rotates() {
             warn_!(
-                "this carrier has no ports, so `rotate` does nothing: its outer \
-                 packets are addresses and a protocol number, and none of those \
-                 can be varied"
+                "this carrier has nothing to move, so `rotate` does nothing: its \
+                 outer packets are addresses and a protocol number, and none of \
+                 those can be varied"
             );
         }
 
         let local_public =
             paqetz_core::keys::public_from_private(cfg.interface.private_key.as_bytes());
 
-        // Choosing our own outer port above the kernel's ephemeral range keeps
-        // it from colliding with a port the kernel hands to some other socket.
-        // paqet picked from 32768-65535, which overlaps that range exactly.
-        // A pool rather than one port. The side that waits has to be findable,
-        // so it keeps the port it was configured with; the side that initiates
-        // takes several and moves between them, which is what stops a single
-        // five-tuple living for hours.
-        let ports: Vec<u16> = if !cfg.interface.shape.has_ports() {
-            // Nothing to fill: this carrier addresses a peer with two addresses
-            // and a protocol number. A pool would be twenty numbers nothing
-            // reads, and `listen_port` on such a tunnel is a line with no
-            // effect rather than a port anything binds.
-            Vec::new()
-        } else if cfg.interface.listen_port == 0 {
-            let pool = cfg.interface.rotation.ports;
-            let mut v = Vec::with_capacity(pool);
-            while v.len() < pool {
-                let r = os("choosing an outer port", random_u32())?;
-                let port = 61_000 + u16::try_from(r % 4_000).unwrap_or(0);
-                if !v.contains(&port) {
-                    v.push(port);
-                }
-            }
-            v
-        } else {
-            vec![cfg.interface.listen_port]
-        };
+        let icmp_ids = cfg.icmp_ids();
+        let ports = outer_pool(&cfg)?;
         let local_port = *ports.first().unwrap_or(&0);
 
         // Our own outer address is whichever one the kernel would route from.
@@ -1397,6 +1443,7 @@ impl Tunnel {
             tx: Arc::new(tx),
             local: Mutex::new((local_ip, local_port)),
             ports,
+            icmp_ids,
             local_public,
             started: Instant::now(),
             running: Arc::new(AtomicBool::new(true)),
@@ -1406,6 +1453,28 @@ impl Tunnel {
             clock_secret: os("drawing a timestamp secret", random_u32())?,
             fault: Mutex::new(None),
         })
+    }
+
+    /// The first and last echo identifier this tunnel's pings may carry.
+    ///
+    /// What the firewall rules name. Wider than the pool this end moves
+    /// through, because the block is agreed from the key and each end chooses
+    /// its own pool size inside it.
+    pub(crate) fn icmp_block(&self) -> Option<(u16, u16)> {
+        self.icmp_ids
+            .map(|(base, width)| (base, base.wrapping_add(width.saturating_sub(1))))
+    }
+
+    /// What the number this carrier moves between is called, for the log.
+    ///
+    /// A ping's is an identifier, not a port: calling it a port sends whoever
+    /// reads the line looking for something that is not on the wire.
+    const fn moving(&self) -> &'static str {
+        if self.cfg.interface.shape.has_ports() {
+            "port"
+        } else {
+            "echo identifier"
+        }
     }
 
     /// The outer port this end actually receives on.
@@ -1477,6 +1546,22 @@ impl Tunnel {
                     profile: self.cfg.interface.profile,
                     shell,
                     dont_fragment: df,
+                    // The end that waits answers under the identifier it was
+                    // asked with, which is the one the packet in hand arrived
+                    // on; the end that initiates asks under the one it is
+                    // currently moving through. Zero for the shells with
+                    // nowhere to put it, which also makes `remote` report no
+                    // identifier for them.
+                    echo: paqetz_tcpwire::rawip::Echo {
+                        reply: role == Role::Responder,
+                        id: match role {
+                            Role::Initiator => local.1,
+                            Role::Responder => remote.1,
+                        },
+                        // Filled in from the first ping this end answers; the
+                        // asking end numbers its own and never reads it.
+                        seq: 0,
+                    },
                 },
             )),
         }
@@ -2239,10 +2324,12 @@ impl Tunnel {
     /// Reads one captured frame as this carrier's, whichever shape it has.
     ///
     /// GRE has no ports, no sequence numbers and no flags, so the segment this
-    /// yields carries zero in those fields. Nothing reads them: dispatch to
-    /// msg1, msg2 or transport is by keyed `mac1` and by role, neither of which
-    /// is a property of the carrier, and `Wire::on_receive` folds them in only
-    /// for the shape that has them.
+    /// yields carries zero in those fields -- except a ping's echo identifier,
+    /// which stands where the ports would because it is the one number in the
+    /// outer header that belongs to the flow. Nothing else reads them: dispatch
+    /// to msg1, msg2 or transport is by keyed `mac1` and by role, neither of
+    /// which is a property of the carrier, and `Wire::on_receive` folds them in
+    /// only for the shape that has them.
     fn parse<'a>(&self, bytes: &'a [u8]) -> Option<segment::Segment<'a>> {
         match self.cfg.interface.shape {
             crate::config::Shape::Tcp(_) => segment::parse_ethernet(bytes),
@@ -2259,10 +2346,20 @@ impl Tunnel {
                 if got.src == ours && !ours.is_unspecified() {
                     return None;
                 }
+                // A ping under an identifier outside this peering's block is
+                // somebody else's: the host's own monitoring, or whatever is
+                // answering it. The filter cannot tell -- it matches a protocol
+                // number -- and read as a payload each one would be decrypted,
+                // fail, and be counted against the peer.
+                if let Some((base, width)) = self.icmp_ids
+                    && got.id.wrapping_sub(base) >= width
+                {
+                    return None;
+                }
                 Some(segment::Segment {
-                    src: (got.src, 0),
-                    dst: (got.dst, 0),
-                    seq: 0,
+                    src: (got.src, got.id),
+                    dst: (got.dst, got.id),
+                    seq: u32::from(got.seq),
                     ack: 0,
                     flags: 0,
                     window: 0,
@@ -2283,7 +2380,16 @@ impl Tunnel {
     /// that is dropping packets, and that diagnosis has already cost days.
     fn handle_unparsed(&self, bytes: &[u8]) {
         let Some(report) = paqetz_tcpwire::toobig::parse_ethernet(bytes) else {
-            Stats::bump(&self.stats.unparsed);
+            // Not counted at all for a ping carrier, where the number would
+            // mean nothing. Its filter matches a protocol number, so every
+            // piece of ICMP on the machine arrives here: the host's own
+            // monitoring and the answers to it, a traceroute's time-exceeded
+            // reports, a redirect. Counting those would put a figure in front
+            // of the operator that reads as the path mangling the tunnel's
+            // packets, which is the one thing this counter is for.
+            if self.icmp_ids.is_none() {
+                Stats::bump(&self.stats.unparsed);
+            }
             return;
         };
         self.note_too_big(&report);
@@ -2653,7 +2759,17 @@ impl Tunnel {
         // rejection: the counter that exists to say "someone is sending
         // garbage at this port" instead reporting its own traffic.
         if let Ok(mut local) = self.local.lock() {
-            *local = learn_local(*local, (seg.dst.0, seg.dst.1));
+            // The number alongside the address is a port for one shape and an
+            // echo identifier for another, and only the port is this end's own
+            // to learn. A ping's identifier belongs to the connection: the
+            // carrier follows the peer's, and taking it here would leave this
+            // reporting an identifier nothing is using.
+            let port = if self.cfg.interface.shape.has_ports() {
+                seg.dst.1
+            } else {
+                local.1
+            };
+            *local = learn_local(*local, (seg.dst.0, port));
         }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -3108,7 +3224,7 @@ impl Tunnel {
     /// dropped and no session will exist until it changes.
     fn maybe_rotate(&self, sealed: &mut [u8], frame: &mut [u8]) {
         let rotation = self.cfg.interface.rotation;
-        if !rotation.enabled || !self.cfg.interface.shape.has_ports() || self.ports.len() < 2 {
+        if !rotation.enabled || !self.cfg.interface.shape.rotates() || self.ports.len() < 2 {
             return;
         }
         let now = self.now();
@@ -3187,14 +3303,15 @@ impl Tunnel {
         // A planned move every few seconds would fill the log; only the one
         // forced by a dead tuple is worth a line.
         let why = why.why();
+        let what = self.moving();
         if why == Move::Stuck.why() {
             info!(
-                "{}carrier moved from port {current} to {next}: {why}",
+                "{}carrier moved from {what} {current} to {next}: {why}",
                 self.tag()
             );
         } else {
             debug!(
-                "{}carrier moved from port {current} to {next}: {why}",
+                "{}carrier moved from {what} {current} to {next}: {why}",
                 self.tag()
             );
         }
@@ -3825,6 +3942,118 @@ mod tests {
             "a port outside the pool means it was configured, so stay put"
         );
         assert_eq!(next_port(&[], 8443), 8443, "and an empty pool goes nowhere");
+    }
+
+    #[test]
+    fn a_pings_identifiers_are_a_pool_to_move_through_on_the_end_that_asks() {
+        // And a single number on the end that answers, which never chooses:
+        // it replies under whichever identifier arrived, so a pool there would
+        // be nineteen numbers nothing ever sends.
+        let only = |toml: &str| {
+            Config::parse(toml)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel")
+        };
+        let asking = only(
+            "[interface]\n\
+             private_key = \"QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y=\"\n\
+             address = \"10.7.0.2/24\"\n\
+             carrier = \"icmp\"\n\
+             rotate_ports = 8\n\n\
+             [peer]\n\
+             public_key = \"SGVsbG9UaGlyZFNlcnZlcktleUZvclRlc3RzT25seTA=\"\n\
+             endpoint = \"203.0.113.5:9999\"\n\
+             tunnel_address = \"10.7.0.1\"\n",
+        );
+        let (base, _) = asking.icmp_ids().expect("a block");
+        let pool = outer_pool(&asking).expect("a pool");
+        assert_eq!(pool, (0..8).map(|i| base + i).collect::<Vec<u16>>());
+
+        let answering = only(
+            "[interface]\n\
+             private_key = \"QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y=\"\n\
+             address = \"10.7.0.1/24\"\n\
+             listen_port = 9999\n\
+             carrier = \"icmp\"\n\n\
+             [peer]\n\
+             public_key = \"Rm91cnRoU2VydmVyS2V5VXNlZE9ubHlJblRoZXNlVGU=\"\n\
+             tunnel_address = \"10.7.0.2\"\n",
+        );
+        let (theirs, _) = answering.icmp_ids().expect("a block");
+        assert_eq!(
+            outer_pool(&answering).expect("a pool"),
+            vec![theirs],
+            "the end that waits holds one identifier and answers on any"
+        );
+        assert_ne!(
+            theirs, base,
+            "and the block is the responder's own key, not the initiator's"
+        );
+        // `listen_port` is a port, and a ping has none: it must not become one
+        // of these numbers.
+        assert_ne!(theirs, 9999);
+    }
+
+    #[test]
+    fn the_end_that_asks_keeps_its_identifier_and_the_other_follows_it() {
+        // One identifier belongs to the flow, and the asking end owns it: a
+        // NAT between them holds state for that number, so the reply has to
+        // carry it back. An asking end that followed the replies still in
+        // flight would be dragged back onto the identifier it had just left,
+        // which is the whole point of moving.
+        let echo = |reply, id| {
+            Wire::Raw(paqetz_tcpwire::rawip::Carrier::new(
+                paqetz_tcpwire::rawip::Config {
+                    local: Ipv4Addr::LOCALHOST,
+                    remote: Ipv4Addr::new(203, 0, 113, 5),
+                    profile: paqetz_tcpwire::profile::LINUX_6,
+                    shell: paqetz_tcpwire::rawip::Shell::Icmp,
+                    dont_fragment: true,
+                    echo: paqetz_tcpwire::rawip::Echo { reply, id, seq: 0 },
+                },
+            ))
+        };
+
+        // A ping as the parser yields one: the identifier where the ports
+        // would be, the sequence number in `seq`.
+        let ping = |from: Ipv4Addr, id: u16, seq: u32| segment::Segment {
+            src: (from, id),
+            dst: (Ipv4Addr::LOCALHOST, id),
+            seq,
+            ack: 0,
+            flags: 0,
+            window: 0,
+            ts_val: None,
+            payload: &[],
+        };
+
+        let mut asking = echo(false, 40_007);
+        assert_eq!(
+            asking.remote(),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 40_007),
+            "the identifier stands where a port would, so a change of either \
+             reads as the peer having moved"
+        );
+        asking.set_remote(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 40_006));
+        asking.on_receive(&ping(Ipv4Addr::new(198, 51, 100, 9), 40_006, 5));
+        assert_eq!(
+            asking.remote(),
+            SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 40_007),
+            "it follows the address and keeps its own identifier"
+        );
+
+        let mut answering = echo(true, 40_007);
+        answering.on_receive(&ping(Ipv4Addr::new(203, 0, 113, 5), 40_008, 5));
+        assert_eq!(
+            answering.remote(),
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 40_008),
+            "and this end answers under whichever the peer has moved to"
+        );
+
+        // The shapes with nowhere to put one report no identifier at all, so
+        // nothing above reads a number into their packets.
+        assert_eq!(raw_wire().remote().port(), 0);
     }
 
     #[test]
@@ -4933,6 +5162,11 @@ mod tests {
                 profile: paqetz_tcpwire::profile::LINUX_6,
                 shell: paqetz_tcpwire::rawip::Shell::Gre,
                 dont_fragment: true,
+                echo: paqetz_tcpwire::rawip::Echo {
+                    reply: false,
+                    id: 0,
+                    seq: 1,
+                },
             },
         ))
     }
@@ -4951,6 +5185,11 @@ mod tests {
                 profile: paqetz_tcpwire::profile::LINUX_6,
                 shell: paqetz_tcpwire::rawip::Shell::Gre,
                 dont_fragment: true,
+                echo: paqetz_tcpwire::rawip::Echo {
+                    reply: false,
+                    id: 0,
+                    seq: 1,
+                },
             },
         )));
         assert_eq!(state.syn_retry_at, due);

@@ -382,6 +382,55 @@ Both number the segments by the bytes they carry (`sequencing = "stream"`)
 unless told otherwise: after an opening, numbers that describe no stream would
 contradict it. Every new outer port is a new connection, opened the same way.
 
+### When the path will not carry TCP at all
+
+Three carriers drop TCP entirely. Which one a path carries is a property of the
+path, so there is nothing to recommend in general: try them. Each must be set
+the same at both ends.
+
+```toml
+# under [tunnel.interface], on both hosts
+carrier = "icmp"           # pings: 28 bytes of outer header
+# carrier = "gre"          # RFC 2784 on protocol 47: 24 bytes
+# carrier = "rawip"        # nothing at all, under a protocol number you pick
+# carrier_protocol = 143   # required with rawip, and the whole signature
+```
+
+`gre` and `rawip` have no ports, so nothing moves and nothing survives NAT. A
+network that filters by protocol number drops both outright.
+
+`carrier = "icmp"` sends real pings: the end that connects out asks, the end
+that waits answers, both under one echo identifier, and the answer quotes the
+sequence number it was asked with. That identifier is NAT state, so this works
+from behind one, and it is also something to move, so the `rotate` knobs below
+apply to it exactly as they do to a port. Neither end is configured with it:
+both derive a block of 256 identifiers from the two public keys, which each end
+already holds for the other. Two tunnels therefore land on different blocks, and
+if they collide anyway, which happens about once in 109 peerings, paqetz says so
+when it reads the file and a fresh `paqetz keygen` for either end fixes it.
+
+Two things are worth knowing before choosing it.
+
+**The host must be stopped from answering.** Left alone, your kernel replies to
+an incoming echo request by itself, with the tunnel's own payload echoed
+straight back to the peer at the full sending rate. paqetz installs a rule that
+drops exactly the identifiers in its block before the stack sees them. The cost
+is that the host stops answering ordinary pings that happen to use one of those
+256 identifiers, which is a little under one percent of the range Linux numbers
+its own pings from. With `manage_firewall = false` the rule is yours to install,
+and `paqetz firewall plan` prints it. On a host with no `nftables` the fallback
+rules read the identifier with iptables `-m u32`, so that match has to be
+available; without it the tunnel refuses to start rather than run with the
+kernel answering its pings.
+
+**The traffic ratio cannot be made honest.** A real ping is one reply per
+request. A download is thousands of replies against almost no requests, and no
+setting changes that. This is a carrier for a path that has stopped carrying
+the others, not a better one.
+
+With the identifier moving every second it carried 2.9 Gbit/s in both
+directions, the same ground the fake-TCP carrier covers.
+
 ### Putting Xray in front of it
 
 On the client host, one command installs Xray, configures it, and starts it:
@@ -690,6 +739,8 @@ nothing cut.
 
 Whichever comes first moves the connection. Set the time comfortably under the
 cut: a connection is timed from its first packet, and the cut is rarely exact.
+With `carrier = "icmp"` all of this applies to the echo identifier instead of a
+port, and `rotate_ports` counts identifiers out of the block both ends derive.
 With `carrier = "handshake"` the next connection is opened just before a move, a
 few round trips ahead, so the move does not wait for its SYN+ACK; that lead
 counts against its lifetime too. Moves are counted as `moves` in the client's

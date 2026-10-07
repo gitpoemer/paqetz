@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use paqetz_core::KeyPair;
 use paqetz_fw::Firewall;
 
-use crate::config::Config;
+use crate::config::{Config, Guarding, Shape};
 use crate::tunnel::Tunnel;
 
 #[derive(Parser)]
@@ -538,6 +538,15 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 tunnel.local_port(),
                 level.name()
             );
+        } else if let Some((first, last)) = tunnel.icmp_block() {
+            // The block, not the identifier in use: that one moves every few
+            // seconds, and the block is what a capture filter or a firewall
+            // rule would be written against.
+            log::info!(
+                "{}: pings with echo identifiers {first}-{last}, log level {}",
+                cfg.name,
+                level.name()
+            );
         } else {
             log::info!(
                 "{}: outer protocol {}, log level {}",
@@ -558,8 +567,19 @@ fn start(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // cannot be mixed: the rules for one say nothing about the other, so a
     // process carrying both shapes at once is refused when the configuration is
     // read rather than half-protected here.
-    let guard = match tunnels.first().map(Tunnel::shape) {
-        Some(shape) if !shape.has_ports() => paqetz_fw::rules::Guard::Protocol(shape.protocol()),
+    let guard = match tunnels.first().map(Tunnel::shape).map(Shape::guarding) {
+        Some(Guarding::Protocol) => paqetz_fw::rules::Guard::Protocol(
+            tunnels
+                .first()
+                .map_or(paqetz_tcpwire::segment::PROTO_TCP, |t| t.shape().protocol()),
+        ),
+        // One block per tunnel, each derived from its own key: a process
+        // carrying several pings on one protocol number has nothing else to
+        // tell them apart by, and a block left out is a block the kernel
+        // answers itself.
+        Some(Guarding::IcmpIds) => paqetz_fw::rules::Guard::IcmpIds(
+            tunnels.iter().filter_map(Tunnel::icmp_block).collect(),
+        ),
         _ => paqetz_fw::rules::Guard::Ports(
             tunnels.iter().flat_map(Tunnel::ports).copied().collect(),
         ),
@@ -1520,7 +1540,19 @@ fn effective_guard(cfg: &Config) -> Result<paqetz_fw::rules::Guard, &'static str
         && !shape.has_ports()
     {
         // Nameable whatever `listen_port` says: these rules are about a
-        // protocol number, and that is fixed before anything is bound.
+        // protocol number, or about identifiers that come from the keys. Both
+        // are fixed before anything is bound, which is the point of this
+        // command -- it has to be right on the host where nothing else
+        // installs them.
+        if shape.guarding() == Guarding::IcmpIds {
+            return Ok(paqetz_fw::rules::Guard::IcmpIds(
+                cfg.tunnels
+                    .iter()
+                    .filter_map(|t| t.icmp_ids())
+                    .map(|(base, width)| (base, base.wrapping_add(width.saturating_sub(1))))
+                    .collect(),
+            ));
+        }
         return Ok(paqetz_fw::rules::Guard::Protocol(shape.protocol()));
     }
     effective_port(cfg)

@@ -299,8 +299,21 @@ pub(crate) enum Shape {
     /// Half the outer header, no ports, and no per-packet state. No ports also
     /// means no NAT traversal and nothing to rotate, and a network that filters
     /// by protocol drops it outright -- so this is worth trying where the other
-    /// has stopped working, and pointless where it has not.
+    /// has stopped working, and pointless where it has not. A ping is the
+    /// exception on both counts: protocol 1 is carried almost everywhere, and
+    /// its echo identifier is both NAT state and a thing to move.
     Raw(paqetz_tcpwire::rawip::Shell),
+}
+
+/// What a shape's firewall rules name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Guarding {
+    /// The fake-TCP carrier's outer ports.
+    Ports,
+    /// A block of ICMP echo identifiers.
+    IcmpIds,
+    /// An IP protocol number, for a shape with nothing finer to name.
+    Protocol,
 }
 
 impl Shape {
@@ -320,9 +333,37 @@ impl Shape {
         }
     }
 
-    /// Whether moving between outer ports means anything here.
+    /// Whether the outer header carries TCP ports.
     pub(crate) const fn has_ports(self) -> bool {
         matches!(self, Self::Tcp(_))
+    }
+
+    /// Whether the outer header has a sixteen-bit number this end can move
+    /// between: a TCP port, or a ping's echo identifier.
+    ///
+    /// What the rotation machinery needs, which is not quite the same question
+    /// as [`Self::has_ports`]: an identifier is not a port -- nothing binds it
+    /// and it is not in `listen_port` -- but it is the one field in the outer
+    /// header a middlebox tracking the flow would be tracking, so moving it
+    /// moves the flow for the same reason and by the same clocks.
+    pub(crate) const fn rotates(self) -> bool {
+        match self {
+            Self::Tcp(_) => true,
+            Self::Raw(shell) => matches!(shell, paqetz_tcpwire::rawip::Shell::Icmp),
+        }
+    }
+
+    /// What the firewall rules for this shape have to name.
+    ///
+    /// Two shapes whose rules name different kinds of thing cannot run in one
+    /// process, because the rules are written once; this is what that is
+    /// compared by.
+    pub(crate) const fn guarding(self) -> Guarding {
+        match self {
+            Self::Tcp(_) => Guarding::Ports,
+            Self::Raw(paqetz_tcpwire::rawip::Shell::Icmp) => Guarding::IcmpIds,
+            Self::Raw(_) => Guarding::Protocol,
+        }
     }
 
     /// The IP protocol number these packets carry.
@@ -567,6 +608,32 @@ impl Config {
 }
 
 impl TunnelConfig {
+    /// The block of ICMP echo identifiers this peering uses, if its carrier is
+    /// a ping: the first, and how many.
+    ///
+    /// Derived from both static public keys, which both ends hold before either
+    /// has sent anything: each has its own and the other's. So the two agree on
+    /// the block without a line of configuration to keep in step, which matters
+    /// because an end whose rules named the wrong numbers would have its kernel
+    /// answer the tunnel's own pings.
+    #[must_use]
+    pub(crate) fn icmp_ids(&self) -> Option<(u16, u16)> {
+        if self.interface.shape.guarding() != Guarding::IcmpIds {
+            return None;
+        }
+        let own = paqetz_core::keys::public_from_private(self.interface.private_key.as_bytes());
+        // In role order, or the two ends would hash the same pair differently.
+        let (responder, initiator) = if self.peer.is_initiator() {
+            (self.peer.public_key, own)
+        } else {
+            (own, self.peer.public_key)
+        };
+        Some((
+            paqetz_core::noise::icmp_id_base(&responder, &initiator),
+            paqetz_core::noise::ICMP_IDS,
+        ))
+    }
+
     /// The tunnel's inner subnet, from this end's address and prefix.
     ///
     /// The gateway translates traffic from this range, so it has to be the
@@ -969,8 +1036,10 @@ fn carrier_protocol(proto: u8) -> Result<()> {
         )),
         1 => Err(invalid(
             "interface.carrier_protocol",
-            "1 is ICMP, and the capture filter accepts path-MTU reports on it -- this tunnel's \
-             own packets would be read as those",
+            "1 is ICMP; write carrier = \"icmp\" instead, which emits the echo header that goes \
+             with it. Bare packets on protocol 1 are not ICMP at all: this host's stack and \
+             everything on the path parse what follows the IPv4 header, and the tunnel's own \
+             packets would be read as the path-MTU reports the capture filter accepts",
         )),
         6 => taken("TCP"),
         17 => taken("UDP"),
@@ -1312,7 +1381,7 @@ impl Config {
                 // about the other, so a process carrying both would run one
                 // tunnel with the kernel free to answer its packets -- which is
                 // the leak the rules exist to close.
-                if a.interface.shape.has_ports() != b.interface.shape.has_ports() {
+                if a.interface.shape.guarding() != b.interface.shape.guarding() {
                     return Err(invalid(
                         "interface.carrier",
                         format!(
@@ -1322,15 +1391,42 @@ impl Config {
                         ),
                     ));
                 }
-                // Without ports there is nothing in the outer header but two
-                // addresses and a protocol number, so two tunnels to one peer
-                // address cannot be told apart at all -- not even by the
-                // firewall rules, which would be identical.
-                if !a.interface.shape.has_ports()
+                // Without ports or an identifier there is nothing in the outer
+                // header but two addresses and a protocol number, so two
+                // tunnels to one peer address cannot be told apart at all --
+                // not even by the firewall rules, which would be identical.
+                // A ping is not in this: its identifiers come from the keys, so
+                // two peerings land on different blocks -- unless they collide,
+                // which is the check below.
+                if !a.interface.shape.rotates()
                     && let (Some(x), Some(y)) = (a.peer.endpoint, b.peer.endpoint)
                     && x.ip() == y.ip()
                 {
                     return Err(clash("peer address", x.ip().to_string()));
+                }
+                // There are 109 blocks of echo identifiers and two peerings can
+                // land on one, roughly once in that many. Sharing it, each
+                // tunnel would read the other's pings and reject them, and the
+                // firewall rules would name the same numbers twice -- which
+                // `nft` refuses, taking the whole process down with it. Said
+                // here rather than worked around, because the remedy is one
+                // command: generate a new keypair for either end of either
+                // tunnel.
+                if let (Some(x), Some(y)) = (a.icmp_ids(), b.icmp_ids())
+                    && x == y
+                {
+                    let last = x.0.wrapping_add(x.1.saturating_sub(1));
+                    return Err(invalid(
+                        "tunnel",
+                        format!(
+                            "{:?} and {:?} both derive echo identifiers {}-{} from their keys, \
+                             and two tunnels cannot share a block: each would read the other's \
+                             pings, and the firewall rules would name those numbers twice. \
+                             Generate a new keypair for either end of either tunnel \
+                             (`paqetz keygen`) and the blocks will differ.",
+                            a.name, b.name, x.0, last
+                        ),
+                    ));
                 }
                 // Zero is "pick one at start-up", and two tunnels both doing
                 // that will pick differently. Only a port written down twice
@@ -1401,6 +1497,7 @@ impl Config {
                 Shape::Tcp(paqetz_tcpwire::Carrier::Handshake)
             }
             "gre" => Shape::Raw(paqetz_tcpwire::rawip::Shell::Gre),
+            "icmp" => Shape::Raw(paqetz_tcpwire::rawip::Shell::Icmp),
             "rawip" => {
                 let Some(proto) = iface.carrier_protocol else {
                     return Err(invalid(
@@ -1417,8 +1514,8 @@ impl Config {
                 return Err(invalid(
                     "interface.carrier",
                     format!(
-                        "expected \"midstream\", \"midstream-fh\", \"handshake\", \"gre\" \
-                         or \"rawip\", got {other:?}"
+                        "expected \"midstream\", \"midstream-fh\", \"handshake\", \"gre\", \
+                         \"icmp\" or \"rawip\", got {other:?}"
                     ),
                 ));
             }
@@ -1542,6 +1639,10 @@ impl Config {
         // authenticated packet would differ from the configured endpoint,
         // count as a roam, and rewrite it to this anyway -- reporting a peer
         // that had moved on a tunnel that had done nothing of the kind.
+        //
+        // A ping does put its echo identifier there, but which one is not
+        // known until a packet arrives: the number comes from the key, not from
+        // this line, and it moves while the tunnel runs.
         let endpoint = endpoint.map(|e| {
             if shape.has_ports() {
                 e
@@ -1658,7 +1759,11 @@ impl Config {
         };
 
         let listen_port = iface.listen_port.unwrap_or(0);
-        if endpoint.is_none() && listen_port == 0 {
+        // Only where there is a port to be found at. A carrier without ports is
+        // reached at an address and a protocol number, both of which are fixed
+        // already, so demanding a port here would be demanding a line that
+        // changes nothing on the wire.
+        if endpoint.is_none() && listen_port == 0 && shape.has_ports() {
             return Err(invalid(
                 "interface.listen_port",
                 "the side without a peer endpoint must listen on a fixed port, \
@@ -2240,6 +2345,61 @@ mod tests {
     }
 
     #[test]
+    fn a_ping_carries_a_block_of_identifiers_both_ends_work_out_for_themselves() {
+        let c = with_interface("carrier = \"icmp\"").expect("parse");
+        assert_eq!(
+            c.interface.shape,
+            Shape::Raw(paqetz_tcpwire::rawip::Shell::Icmp)
+        );
+        assert_eq!(c.interface.shape.protocol(), 1);
+        assert!(!c.interface.shape.has_ports(), "a ping has no ports");
+        assert!(
+            c.interface.shape.rotates(),
+            "but it has an identifier to move, which is the point"
+        );
+        assert_eq!(c.interface.shape.guarding(), Guarding::IcmpIds);
+
+        // Twenty-eight bytes of outer header, and the same slack against a
+        // 1500-byte path the other shapes leave.
+        assert_eq!(c.interface.shape.overhead(), 28);
+        assert_eq!(
+            c.interface.mtu as usize
+                + c.interface.shape.overhead()
+                + paqetz_core::framing::OVERHEAD,
+            1488,
+        );
+
+        // The block is the responder's, whichever end is asking. This end
+        // initiates, so it is the peer's key that decides -- and the same
+        // number the peer will derive from its own.
+        let (base, width) = c.icmp_ids().expect("a block");
+        assert_eq!(width, paqetz_core::noise::ICMP_IDS);
+        assert_eq!(
+            base,
+            paqetz_core::noise::icmp_id_base(
+                &c.peer.public_key,
+                &paqetz_core::keys::public_from_private(c.interface.private_key.as_bytes())
+            ),
+            "both keys, in role order: this end asks, so the peer's is the responder's"
+        );
+        assert_eq!(
+            Config::parse(CLIENT)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel")
+                .icmp_ids(),
+            None,
+            "every other carrier has no identifiers to name"
+        );
+
+        // Bare packets on protocol 1 are not pings, and the host's stack and
+        // everything on the path read what follows the header as if they were.
+        let err =
+            with_interface("carrier = \"rawip\"\ncarrier_protocol = 1").expect_err("should refuse");
+        assert!(err.to_string().contains("carrier = \"icmp\""), "{err}");
+    }
+
+    #[test]
     fn a_carrier_without_ports_is_sized_and_filtered_for_its_own_header() {
         let c = with_interface("carrier = \"gre\"").expect("parse");
         assert_eq!(
@@ -2373,6 +2533,58 @@ tunnel_address = "10.8.0.1"
                 .expect_err("should refuse");
             assert!(err.to_string().contains("rawip"), "{carrier}: {err}");
         }
+    }
+
+    #[test]
+    fn two_pings_cannot_share_one_block_of_identifiers() {
+        // The arrangement this is really about: one server identity, several
+        // clients. The block comes from both keys, so these two differ. Taken
+        // from the waiting end's key alone they would have been identical, the
+        // rules would have named the same numbers once per tunnel, and `nft`
+        // refuses a set with a repeated interval -- taking the whole process
+        // with it, since it refuses the transaction.
+        let both = pair(
+            "carrier = \"icmp\"",
+            "203.0.113.5:8443",
+            "carrier = \"icmp\"",
+            "198.51.100.7:8443",
+        );
+        let cfg = Config::parse(&both).expect("two pings off one identity are fine");
+        let mut blocks = cfg.tunnels.iter().filter_map(TunnelConfig::icmp_ids);
+        let first = blocks.next().expect("a block");
+        let second = blocks.next().expect("another block");
+        assert_ne!(first, second, "one identity, two peers, two blocks");
+
+        // A collision is still possible, once in 109 peerings, and it is
+        // refused when the file is read rather than left to fail at `nft` with
+        // no remedy in sight. Found by search here, because a key that lands on
+        // a given block is not something to hard-code.
+        let own = paqetz_core::keys::public_from_private(
+            cfg.tunnels
+                .first()
+                .expect("a tunnel")
+                .interface
+                .private_key
+                .as_bytes(),
+        );
+        let colliding = (0u32..200_000)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&i.to_le_bytes());
+                paqetz_core::PublicKey::from_bytes(bytes)
+            })
+            .find(|k| paqetz_core::noise::icmp_id_base(k, &own) == first.0)
+            .expect("some key lands on that block");
+        let clashing = both.replace(
+            "TmwuUmwHVDe4Q0z0PmVEZ0wYyBIDN0kUq5xkQzk0T3E=",
+            &colliding.to_base64(),
+        );
+        let err = Config::parse(&clashing).expect_err("should refuse");
+        assert!(err.to_string().contains("echo identifiers"), "{err}");
+        assert!(
+            err.to_string().contains("keygen"),
+            "and say what to do: {err}"
+        );
     }
 
     #[test]

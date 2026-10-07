@@ -7,6 +7,7 @@
 #   CARRIER=gre ./scripts/test-e2e.sh      # the same suite, other wire shape
 #   CARRIER=handshake ./scripts/test-e2e.sh    # a connection that opens first
 #   CARRIER=midstream-fh ./scripts/test-e2e.sh # one that announces it, and goes on
+#   CARRIER=icmp ./scripts/test-e2e.sh     # pings, with the identifier moving
 #   CARRIER=rawip PROTO=143 ./scripts/test-e2e.sh
 #   DATAPATH=simple ./scripts/test-e2e.sh
 #
@@ -124,6 +125,42 @@ tunnel_address = "${SRV_INNER}"
 [socks5]
 listen = "127.0.0.1:1080"
 EOF
+
+# A ping under a chosen identifier, for the one check no standard tool can
+# make: `ping` numbers its own, and what matters here is whether the host
+# answers the identifiers belonging to the tunnel. Exits 0 if answered.
+cat > "${WORK}/echo.py" <<'PY'
+import socket, struct, sys, time
+
+
+def cksum(b):
+    if len(b) % 2:
+        b += b"\x00"
+    s = 0
+    for i in range(0, len(b), 2):
+        s += (b[i] << 8) | b[i + 1]
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+dst, ident = sys.argv[1], int(sys.argv[2])
+body = b"paqetz-e2e"
+head = struct.pack("!BBHHH", 8, 0, cksum(struct.pack("!BBHHH", 8, 0, 0, ident, 1) + body), ident, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+s.settimeout(2.0)
+s.sendto(head + body, (dst, 0))
+end = time.time() + 2.0
+while time.time() < end:
+    try:
+        pkt, _ = s.recvfrom(2048)
+    except socket.timeout:
+        break
+    kind, _, _, got, _ = struct.unpack("!BBHHH", pkt[20:28])
+    if kind == 0 and got == ident:
+        sys.exit(0)
+sys.exit(1)
+PY
 
 # --- the reverse arrangement ------------------------------------------------
 # Config level on purpose: nothing in the datapath learns which arrangement it
@@ -469,6 +506,10 @@ rawip)
     FILTER="ip proto ${PROTO}"
     WHAT="IP protocol ${PROTO}"
     ;;
+icmp)
+    FILTER="icmp"
+    WHAT="ICMP echo"
+    ;;
 *)
     FILTER="tcp port ${PORT}"
     WHAT="TCP on port ${PORT}"
@@ -530,6 +571,55 @@ if [[ -s ${WORK}/wire.pcap ]]; then
             ok "all ${gre_all} packets are GREv0 with no optional fields"
         else
             bad "${gre_plain} of ${gre_all} GRE packets are plain GREv0"
+        fi
+    elif [[ ${CARRIER} == icmp ]]; then
+        # Asserted positively: every packet an echo, nothing else on protocol
+        # 1, and the identifiers all from the one block both ends derive from
+        # the key. A packet that was not an echo would be read by the host's own
+        # stack rather than by the tunnel.
+        echoes=$(sudo tcpdump -r "${WORK}/wire.pcap" -n 2>/dev/null |
+            grep -c "ICMP echo re" || true)
+        if [[ ${captured} -gt 0 && ${echoes} -eq ${captured} ]]; then
+            ok "all ${echoes} packets are echo requests or replies"
+        else
+            bad "${echoes} of ${captured} packets are echoes"
+        fi
+
+        # One block, from the log line both ends print at start-up. The
+        # identifier moves while the tunnel runs; the block does not.
+        block=$(grep -o "echo identifiers [0-9]*-[0-9]*" "${WORK}/server.log" |
+            head -1 | awk '{print $3}')
+        first=${block%-*}
+        last=${block#*-}
+        outside=0
+        for id in $(sudo tcpdump -r "${WORK}/wire.pcap" -n 2>/dev/null |
+            grep -o "id [0-9]*" | awk '{print $2}' | sort -u); do
+            if [[ ${id} -lt ${first} || ${id} -gt ${last} ]]; then
+                outside=$((outside + 1))
+            fi
+        done
+        if [[ -n ${block} && ${outside} -eq 0 ]]; then
+            ok "every identifier is inside the agreed block ${block}"
+        else
+            bad "${outside} identifiers fall outside ${block:-no block was logged}"
+        fi
+
+        # The rule the carrier cannot work without: left to itself the host
+        # answers an echo request with the tunnel's own payload, echoed back to
+        # the peer at the full sending rate. Answered means the rule is missing.
+        if sudo ip netns exec "${CLI_NS}" python3 -I "${WORK}/echo.py" \
+            "${SRV_OUTER}" "${first}" >/dev/null 2>&1; then
+            bad "the server's kernel answered a ping belonging to the tunnel"
+        else
+            ok "the server's kernel does not answer the tunnel's own pings"
+        fi
+
+        # And only those: a host that stopped answering every ping would be a
+        # host the carrier had broken in order to hide on.
+        if sudo ip netns exec "${CLI_NS}" ping -c2 -W2 "${SRV_OUTER}" >/dev/null 2>&1; then
+            ok "every other ping is still answered"
+        else
+            bad "the host stopped answering ordinary pings"
         fi
     else
         # No SYN once the connection is open: never at all mid-stream (D14),

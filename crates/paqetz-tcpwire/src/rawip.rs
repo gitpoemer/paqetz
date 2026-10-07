@@ -6,19 +6,24 @@
 //! and where a *malformed* GRE packet was dropped, so something on that path
 //! parses that header even though nothing needs to.
 //!
-//! Two shells, because one path answered to each and neither is discoverable
+//! Three shells, because one path answered to each and none is discoverable
 //! from anywhere but the path itself. [`Shell::Gre`] is RFC 2784 on protocol
-//! 47: a real protocol with a legitimate meaning, four bytes, and the more
-//! likely of the two to survive a change of provider. [`Shell::Bare`] is
+//! 47: a real protocol with a legitimate meaning, four bytes, and the most
+//! likely of the three to survive a change of provider. [`Shell::Bare`] is
 //! nothing at all under a protocol number of the operator's choosing -- twenty
 //! bytes total, the least an IP-routable tunnel can pay, and as conspicuous as
-//! whatever number is chosen makes it.
+//! whatever number is chosen makes it. [`Shell::Icmp`] is a ping: eight bytes
+//! on protocol 1, the one shape of the one protocol a network forwards even
+//! when it forwards nothing else.
 //!
-//! Twenty-four bytes of outer header against fake-TCP's fifty-odd, no ports, no
-//! sequence numbers, no per-packet state at all. What it costs is reachability:
-//! neither has ports, so neither survives NAT, and plenty of networks drop
-//! everything that is not TCP, UDP or ICMP. That is a property of the path, not
-//! a setting, which is why this is a choice rather than a default.
+//! Twenty-four or twenty-eight bytes of outer header against fake-TCP's
+//! fifty-odd, no sequence numbers, and no per-packet state beyond an echo
+//! identifier. What the first two cost is reachability: they have no ports, so
+//! neither survives NAT, and plenty of networks drop everything that is not
+//! TCP, UDP or ICMP. A ping has an identifier that NAT does carry, and pays
+//! instead in shape: nothing can make a tunnel's traffic ratio look like a
+//! ping's. All of that is a property of the path, not a setting, which is why
+//! these are choices rather than defaults.
 //!
 //! Everything above the wire is unchanged. This produces and consumes the same
 //! opaque byte slices the fake-TCP carrier does, and the tunnel's handshake,
@@ -38,6 +43,18 @@ pub const PROTO_GRE: u8 = 47;
 /// no sequence number, version 0.
 pub const GRE_LEN: usize = 4;
 
+/// IP protocol number for ICMP.
+pub const PROTO_ICMP: u8 = crate::toobig::PROTO_ICMP;
+
+/// The ICMP echo header: type, code, checksum, identifier, sequence number.
+pub const ICMP_LEN: usize = 8;
+
+/// ICMP type: echo request, what a ping is.
+pub const ECHO_REQUEST: u8 = 8;
+
+/// ICMP type: echo reply, what answers one.
+pub const ECHO_REPLY: u8 = 0;
+
 /// Bytes of outer header a GRE-carried packet pays.
 pub const OVERHEAD: usize = IPV4_LEN + GRE_LEN;
 
@@ -52,6 +69,18 @@ pub enum Shell {
     /// discoverable by trying. It is also the entire signature of the traffic:
     /// there is nothing else in the outer header to vary.
     Bare(u8),
+    /// An eight-byte ICMP echo header on protocol 1: a ping.
+    ///
+    /// For the path that carries neither TCP nor a protocol number it does not
+    /// recognise. ICMP is the third protocol a network almost always forwards,
+    /// and a ping is the one shape of it every host sends.
+    ///
+    /// Unlike the other two this has a sixteen-bit identifier, which both ends
+    /// agree on from the key and the initiator moves through exactly as the
+    /// fake-TCP carrier moves between ports. What it costs is a shape nothing
+    /// can make honest: a download is thousands of replies against almost no
+    /// requests, where a real ping is one for one.
+    Icmp,
 }
 
 impl Shell {
@@ -61,6 +90,7 @@ impl Shell {
         match self {
             Self::Gre => PROTO_GRE,
             Self::Bare(proto) => proto,
+            Self::Icmp => PROTO_ICMP,
         }
     }
 
@@ -70,6 +100,7 @@ impl Shell {
         match self {
             Self::Gre => GRE_LEN,
             Self::Bare(_) => 0,
+            Self::Icmp => ICMP_LEN,
         }
     }
 
@@ -98,6 +129,31 @@ const FLAG_CHECKSUM: u16 = 0x8000;
 const FLAG_KEY: u16 = 0x2000;
 const FLAG_SEQUENCE: u16 = 0x1000;
 
+/// Which half of a ping this end sends, and under which identifier.
+///
+/// Both halves carry the same identifier, because that is what a NAT on the
+/// path keys its state on: it sees the request leave, and the reply coming back
+/// matches only if the identifier does. Ignored by every shell but
+/// [`Shell::Icmp`], which is the only one with anywhere to put it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Echo {
+    /// Send echo replies rather than echo requests.
+    ///
+    /// The end that waits replies, as a host answering a ping does. The end
+    /// that initiates asks. Both ends sending requests would be two hosts
+    /// pinging each other, which no NAT carries in either direction.
+    pub reply: bool,
+    /// The identifier both halves carry.
+    pub id: u16,
+    /// The sequence number to answer with, for the replying end.
+    ///
+    /// A real reply echoes the request's sequence as well as its identifier, so
+    /// the asking end can pair the two; an inspector that does the same pairing
+    /// drops a reply that invents one. The asking end ignores this and numbers
+    /// its own, as `ping` does.
+    pub seq: u16,
+}
+
 /// How this end carries packets over GRE.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -111,6 +167,8 @@ pub struct Config {
     pub shell: Shell,
     /// Whether to set Don't Fragment.
     pub dont_fragment: bool,
+    /// Which half of a ping to send, for [`Shell::Icmp`].
+    pub echo: Echo,
 }
 
 /// A GRE carrier for one peer.
@@ -126,6 +184,7 @@ pub struct Carrier {
     profile: OsProfile,
     shell: Shell,
     dont_fragment: bool,
+    echo: Echo,
     /// Packets sent, feeding the IP Identification.
     ///
     /// Deliberately `u32`: the hash below multiplies and then shifts down
@@ -147,6 +206,7 @@ impl Carrier {
             profile: cfg.profile,
             shell: cfg.shell,
             dont_fragment: cfg.dont_fragment,
+            echo: cfg.echo,
             counter: 0,
         }
     }
@@ -160,6 +220,31 @@ impl Carrier {
     /// Follows the peer to a new address.
     pub const fn set_remote(&mut self, remote: Ipv4Addr) {
         self.remote = remote;
+    }
+
+    /// The echo identifier this end is sending under.
+    #[must_use]
+    pub const fn id(&self) -> u16 {
+        self.echo.id
+    }
+
+    /// Answers as the ping in hand asks: under its identifier, quoting its
+    /// sequence number.
+    ///
+    /// The replying end never chooses either. The identifier is what a NAT
+    /// between the two ends holds state on, so an answer under any other is one
+    /// it will not carry; the sequence is what the asking end pairs the reply
+    /// to. Only ever called for a packet that has already authenticated, so
+    /// nobody on the path can move this by sending a ping.
+    ///
+    /// Nothing for the asking end, which picked its own identifier and is the
+    /// one moving it: the replies still arriving under the one it has just left
+    /// must not pull it back.
+    pub const fn answer_as(&mut self, id: u16, seq: u16) {
+        if self.echo.reply {
+            self.echo.id = id;
+            self.echo.seq = seq;
+        }
     }
 
     /// Writes one packet, returning how many bytes were used.
@@ -201,13 +286,34 @@ impl Carrier {
             c.put(&self.local.octets())?;
             c.put(&self.remote.octets())?;
 
-            if self.shell == Shell::Gre {
+            match self.shell {
                 // The minimal RFC 2784 header, every optional field absent.
                 // Emitted in full rather than zeroed and forgotten: the path
                 // this was measured on drops GRE it cannot parse, so a
                 // well-formed header is load-bearing.
-                c.u16(0)?;
-                c.u16(GRE_PROTO_IPV4)?;
+                Shell::Gre => {
+                    c.u16(0)?;
+                    c.u16(GRE_PROTO_IPV4)?;
+                }
+                Shell::Icmp => {
+                    c.u8(if self.echo.reply {
+                        ECHO_REPLY
+                    } else {
+                        ECHO_REQUEST
+                    })?;
+                    c.u8(0)?; // code 0, the only one either type defines
+                    c.u16(0)?; // checksum, filled below
+                    c.u16(self.echo.id)?;
+                    // Quoted on the replying end, counted on the asking one.
+                    // A ping varies its sequence while its identifier stays
+                    // put, and its answer gives that sequence back.
+                    c.u16(if self.echo.reply {
+                        self.echo.seq
+                    } else {
+                        u16::try_from(self.counter & 0xFFFF).unwrap_or(0)
+                    })?;
+                }
+                Shell::Bare(_) => {}
             }
             debug_assert_eq!(c.pos, overhead);
             c.put(payload)?;
@@ -221,6 +327,21 @@ impl Carrier {
             })?)
         };
         segment::write_at(out, 10, &ip_ck.to_be_bytes())?;
+
+        // Over the echo header and everything it carries. Unlike the IPv4
+        // header's this one covers the payload, so it costs a pass over the
+        // packet -- and it is not optional: a host receiving a ping with a bad
+        // checksum discards it, and so does plenty of what sits in between.
+        if self.shell == Shell::Icmp {
+            let icmp_ck = {
+                let have = out.len();
+                let body = out
+                    .get(IPV4_LEN..total)
+                    .ok_or(Error::Short { need: total, have })?;
+                checksum::of(body)
+            };
+            segment::write_at(out, IPV4_LEN + 2, &icmp_ck.to_be_bytes())?;
+        }
         Ok(total)
     }
 }
@@ -234,6 +355,11 @@ pub struct Received<'a> {
     pub dst: Ipv4Addr,
     /// What the GRE header said it carries.
     pub protocol: u16,
+    /// The echo identifier, under [`Shell::Icmp`]. Zero for the shells that
+    /// have no field to put one in.
+    pub id: u16,
+    /// The echo sequence number, likewise.
+    pub seq: u16,
     /// Everything after the GRE header.
     pub payload: &'a [u8],
 }
@@ -281,21 +407,41 @@ pub fn parse_ipv4(packet: &[u8], shell: Shell) -> Option<Received<'_>> {
     let dst = address(packet, 16)?;
 
     let rest = packet.get(ip_header_len..total_len)?;
-    let (protocol, payload) = match shell {
+    let (protocol, id, seq, payload) = match shell {
         Shell::Gre => {
             let flags = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
             let protocol = u16::from_be_bytes([*rest.get(2)?, *rest.get(3)?]);
-            (protocol, rest.get(payload_offset(flags)?..)?)
+            (protocol, 0, 0, rest.get(payload_offset(flags)?..)?)
+        }
+        Shell::Icmp => {
+            // Echo only, and only code 0. Everything else on protocol 1 is the
+            // network or this host talking -- including the one message the
+            // tunnel reads elsewhere, a hop reporting a packet too big, which
+            // has to fall through to that parser rather than be taken for a
+            // payload here.
+            let kind = *rest.first()?;
+            if (kind != ECHO_REQUEST && kind != ECHO_REPLY) || *rest.get(1)? != 0 {
+                return None;
+            }
+            // The checksum is not verified. It covers the payload, so checking
+            // it would cost a second pass over every packet to reach a weaker
+            // conclusion than the AEAD above already does -- and a middlebox
+            // that rewrote anything has broken the payload either way.
+            let id = u16::from_be_bytes([*rest.get(4)?, *rest.get(5)?]);
+            let seq = u16::from_be_bytes([*rest.get(6)?, *rest.get(7)?]);
+            (GRE_PROTO_IPV4, id, seq, rest.get(ICMP_LEN..)?)
         }
         // Nothing to read and nothing to skip. What the payload is has to be
         // known from configuration, because the wire does not say.
-        Shell::Bare(_) => (GRE_PROTO_IPV4, rest),
+        Shell::Bare(_) => (GRE_PROTO_IPV4, 0, 0, rest),
     };
 
     Some(Received {
         src,
         dst,
         protocol,
+        id,
+        seq,
         payload,
     })
 }
@@ -352,12 +498,24 @@ mod tests {
     }
 
     fn shelled(shell: Shell) -> Carrier {
+        echoing(
+            shell,
+            Echo {
+                reply: false,
+                id: 40_000,
+                seq: 1,
+            },
+        )
+    }
+
+    fn echoing(shell: Shell, echo: Echo) -> Carrier {
         Carrier::new(Config {
             local: Ipv4Addr::new(10, 0, 0, 1),
             remote: Ipv4Addr::new(203, 0, 113, 5),
             profile: crate::profile::LINUX_6,
             shell,
             dont_fragment: true,
+            echo,
         })
     }
 
@@ -485,7 +643,7 @@ mod tests {
         // The bit itself, on the wire, for both shells. A knob that changed a
         // field nobody checked would be indistinguishable from one that did
         // nothing.
-        for shell in [Shell::Gre, Shell::Bare(143)] {
+        for shell in [Shell::Gre, Shell::Bare(143), Shell::Icmp] {
             for df in [true, false] {
                 let mut c = Carrier::new(Config {
                     local: Ipv4Addr::new(10, 0, 0, 1),
@@ -493,6 +651,11 @@ mod tests {
                     profile: crate::profile::LINUX_6,
                     shell,
                     dont_fragment: df,
+                    echo: Echo {
+                        reply: false,
+                        id: 40_000,
+                        seq: 1,
+                    },
                 });
                 let mut out = vec![0u8; 200];
                 c.data(b"payload", &mut out).expect("emit");
@@ -644,5 +807,176 @@ mod tests {
         }
         let mut out = vec![0u8; OVERHEAD + 7];
         assert!(c.data(b"payload", &mut out).is_ok());
+    }
+
+    #[test]
+    fn what_is_emitted_is_a_ping_anything_on_the_path_would_accept() {
+        let mut out = vec![0u8; 200];
+        let n = echoing(
+            Shell::Icmp,
+            Echo {
+                reply: false,
+                id: 40_000,
+                seq: 1,
+            },
+        )
+        .data(b"payload", &mut out)
+        .expect("emit");
+        assert_eq!(n, IPV4_LEN + ICMP_LEN + 7);
+        assert_eq!(
+            Shell::Icmp.overhead(),
+            28,
+            "twenty of IPv4 and eight of ICMP"
+        );
+
+        assert_eq!(out[9], PROTO_ICMP);
+        assert_eq!(out[20], ECHO_REQUEST, "the end that initiates asks");
+        assert_eq!(out[21], 0, "code 0");
+        assert_eq!(u16::from_be_bytes([out[24], out[25]]), 40_000, "identifier");
+        assert_eq!(&out[28..n], b"payload");
+
+        // The one field a host checks before looking at anything else. A
+        // checksum over data that includes it comes to zero when it is right.
+        assert_eq!(
+            checksum::of(&out[IPV4_LEN..n]),
+            0,
+            "a receiver would discard this"
+        );
+    }
+
+    #[test]
+    fn the_end_that_waits_answers_rather_than_asking() {
+        // Two hosts pinging each other is a shape no NAT carries: the reply is
+        // what matches the state the request made.
+        let mut out = vec![0u8; 200];
+        let n = echoing(
+            Shell::Icmp,
+            Echo {
+                reply: true,
+                id: 40_000,
+                seq: 1,
+            },
+        )
+        .data(b"payload", &mut out)
+        .expect("emit");
+        assert_eq!(out[20], ECHO_REPLY);
+        assert_eq!(
+            u16::from_be_bytes([out[24], out[25]]),
+            40_000,
+            "under the identifier it was asked with"
+        );
+        assert_eq!(checksum::of(&out[IPV4_LEN..n]), 0);
+    }
+
+    #[test]
+    fn a_ping_is_read_back_with_the_identifier_it_carried() {
+        let mut out = vec![0u8; 200];
+        let mut c = echoing(
+            Shell::Icmp,
+            Echo {
+                reply: true,
+                id: 41_234,
+                seq: 1,
+            },
+        );
+        let n = c.data(b"payload", &mut out).expect("emit");
+        let frame = captured(&out[..n]);
+        let got = parse_ethernet(&frame, Shell::Icmp).expect("parse");
+        assert_eq!(got.id, 41_234);
+        assert_eq!(got.payload, b"payload");
+        assert_eq!(got.src, Ipv4Addr::new(10, 0, 0, 1));
+
+        // The replying end follows the peer to a new identifier and quotes the
+        // sequence it was asked with, because it chooses neither.
+        c.answer_as(41_235, 77);
+        let n = c.data(b"payload", &mut out).expect("emit");
+        let frame = captured(&out[..n]);
+        let got = parse_ethernet(&frame, Shell::Icmp).expect("parse");
+        assert_eq!(got.id, 41_235);
+        assert_eq!(
+            got.seq, 77,
+            "a real reply gives the request's sequence back, and an inspector \
+             that pairs the two drops one that invents it"
+        );
+    }
+
+    #[test]
+    fn the_asking_end_is_not_pulled_back_to_an_identifier_it_has_left() {
+        // The replies in flight when it moves still carry the old number. An
+        // end that followed them would be dragged back onto the identifier it
+        // had just decided to stop using, which is the whole point of moving.
+        let mut c = echoing(
+            Shell::Icmp,
+            Echo {
+                reply: false,
+                id: 41_234,
+                seq: 1,
+            },
+        );
+        c.answer_as(40_000, 9);
+        assert_eq!(c.id(), 41_234);
+
+        // And it numbers its own sequence, as `ping` does, rather than
+        // answering with one.
+        let mut out = vec![0u8; 200];
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            let n = c.data(b"payload", &mut out).expect("emit");
+            let frame = captured(&out[..n]);
+            seqs.push(parse_ethernet(&frame, Shell::Icmp).expect("parse").seq);
+        }
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn the_sequence_number_moves_while_the_identifier_stays_put() {
+        // Which is what a ping does. An identifier that changed per packet
+        // would be a host starting thousands of pings a second.
+        let mut out = vec![0u8; 200];
+        let mut c = shelled(Shell::Icmp);
+        let mut seqs = Vec::new();
+        for _ in 0..4 {
+            let n = c.data(b"payload", &mut out).expect("emit");
+            assert_eq!(u16::from_be_bytes([out[24], out[25]]), 40_000);
+            seqs.push(u16::from_be_bytes([out[26], out[27]]));
+            assert_eq!(checksum::of(&out[IPV4_LEN..n]), 0);
+        }
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn protocol_one_that_is_not_an_echo_is_left_for_the_parser_that_wants_it() {
+        // A hop reporting a packet too big arrives on the same protocol as the
+        // carrier. Taken for a payload it would be decrypted, fail, and be
+        // counted as a rejection -- and the report, which is the one thing the
+        // network volunteers about a shrunken path, would be lost.
+        let mut packet = vec![0u8; 36];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&36u16.to_be_bytes());
+        packet[9] = PROTO_ICMP;
+        packet[12..16].copy_from_slice(&[203, 0, 113, 5]);
+        packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        packet[20] = crate::toobig::DEST_UNREACHABLE;
+        packet[21] = crate::toobig::FRAGMENTATION_NEEDED;
+        assert!(parse_ipv4(&packet, Shell::Icmp).is_none());
+
+        // Nor is a code this type does not define.
+        packet[20] = ECHO_REQUEST;
+        packet[21] = 7;
+        assert!(parse_ipv4(&packet, Shell::Icmp).is_none());
+        packet[21] = 0;
+        assert!(parse_ipv4(&packet, Shell::Icmp).is_some());
+    }
+
+    #[test]
+    fn no_length_of_ping_panics_the_parser() {
+        let mut out = vec![0u8; 200];
+        let n = shelled(Shell::Icmp)
+            .data(b"payload", &mut out)
+            .expect("emit");
+        let frame = captured(&out[..n]);
+        for i in 0..frame.len() {
+            let _ = parse_ethernet(&frame[..i], Shell::Icmp);
+        }
     }
 }

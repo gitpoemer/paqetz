@@ -91,6 +91,16 @@ pub const SYN_ACK_ISN_LABEL: &[u8] = b"paqetz-synack-isn-v1";
 /// handshake.
 pub const RESPONDER_TS_LABEL: &[u8] = b"paqetz-responder-ts-v1";
 
+/// Domain-separation label for the ICMP carrier's block of echo identifiers.
+pub const ICMP_ID_LABEL: &[u8] = b"paqetz-icmp-id-v1";
+
+/// Echo identifiers in the block the ICMP carrier draws from.
+///
+/// Wide enough for the largest pool the carrier may rotate through, so both
+/// ends cover the same numbers in their firewall rules whatever each has
+/// configured its own pool size to be.
+pub const ICMP_IDS: u16 = 256;
+
 /// Seconds in one period of the clock a SYN's proof is bound to.
 ///
 /// A SYN proves itself for the period it was sent in and the ones either side,
@@ -286,6 +296,44 @@ pub fn responder_ts_base(
         &from.0,
         &from.1.to_le_bytes(),
     ])
+}
+
+/// The first of the [`ICMP_IDS`] echo identifiers this peering uses.
+///
+/// Both ends need the same block before either has sent anything: the
+/// initiator draws the identifier it pings with from it, the responder echoes
+/// whichever one arrives, and both install firewall rules naming the whole
+/// block so neither kernel answers an echo request that belongs to the tunnel.
+///
+/// Keyed on **both** static public keys, which each end holds for the other,
+/// and in role order so the two compute the same number. The responder's alone
+/// would have been simpler and wrong: a server with one identity and several
+/// clients would put every one of them on the same block, and then its rules
+/// would name those numbers once per tunnel and each tunnel would read the
+/// others' pings.
+///
+/// Secrecy is neither available nor needed: the identifier is in clear on the
+/// wire the moment a packet is sent. What this buys is that two peerings land on
+/// different blocks, and that a block is a plausible one -- it sits in the range
+/// a Linux host's own `ping` draws from, because that identifier is the
+/// ephemeral port its socket was given.
+#[must_use]
+pub fn icmp_id_base(responder_static: &PublicKey, initiator_static: &PublicKey) -> u16 {
+    /// Blocks of [`ICMP_IDS`] fitting between 32768 and 60999, the ephemeral
+    /// range a Linux host numbers its own pings from.
+    const BLOCKS: u32 = 109;
+    let h = hash32(&[
+        ICMP_ID_LABEL,
+        responder_static.as_bytes(),
+        initiator_static.as_bytes(),
+    ]);
+    // Exact: the product is below 61440, which a u16 holds.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by 32768 + BLOCKS * ICMP_IDS"
+    )]
+    let base = (32_768 + (h % BLOCKS) * u32::from(ICMP_IDS)) as u16;
+    base
 }
 
 /// Parses the fixed Noise pattern.
@@ -790,6 +838,65 @@ mod tests {
     }
 
     const TEST_EPOCH: u32 = 0xC0FF_EE01;
+
+    #[test]
+    fn an_icmp_block_is_agreed_without_configuration_and_looks_like_a_hosts_own() {
+        // The whole point: neither end sends anything to agree on this, so the
+        // keys are all it may depend on. Each end holds both.
+        let server = KeyPair::generate().expect("generate");
+        let client = KeyPair::generate().expect("generate");
+        let base = icmp_id_base(&server.public, &client.public);
+        assert_eq!(
+            base,
+            icmp_id_base(&server.public, &client.public),
+            "same keys, same block"
+        );
+
+        // One server, two clients: the natural arrangement, and the one that
+        // the responder's key alone would have put on a single block. Its rules
+        // would then have named those numbers twice, which `nft` refuses, and
+        // each tunnel would have read the other's pings.
+        //
+        // Fixed keys, because there are only 109 blocks: two generated pairs
+        // collide once in that many, and a test that asserted otherwise would
+        // fail that often for no reason. What a collision actually means is
+        // handled where it can be: the configuration refuses two tunnels on one
+        // block, and the rule generator names a block once however often it is
+        // given.
+        let a = PublicKey::from_bytes([1; 32]);
+        let b = PublicKey::from_bytes([2; 32]);
+        let c = PublicKey::from_bytes([3; 32]);
+        assert_ne!(
+            icmp_id_base(&a, &b),
+            icmp_id_base(&a, &c),
+            "two peerings off one server identity must not share a block"
+        );
+        // And the roles are not interchangeable: the pair is hashed in order,
+        // so both ends of one peering agree while nothing else does.
+        assert_ne!(icmp_id_base(&a, &b), icmp_id_base(&b, &a));
+
+        // Where a Linux host numbers its own pings from, so the identifiers
+        // are not themselves the signature.
+        assert!(base >= 32_768, "{base} is below the ephemeral range");
+        assert!(
+            base + (ICMP_IDS - 1) <= 60_999,
+            "{base} runs past the ephemeral range"
+        );
+
+        // Two peerings on one host must not share a block, or each would
+        // answer the other's pings and both kernels would see traffic the
+        // rules were meant to cover for one tunnel only.
+        let mut seen = std::collections::HashSet::new();
+        let mut blocks = 0;
+        for _ in 0..200 {
+            let kp = KeyPair::generate().expect("generate");
+            blocks += usize::from(seen.insert(icmp_id_base(&server.public, &kp.public)));
+        }
+        // There are only 109 blocks, so two peerings can still collide by
+        // accident. That is caught where it matters, when the configuration is
+        // read: see `Config`'s cross-checks.
+        assert!(blocks > 50, "only {blocks} distinct blocks in 200 keys");
+    }
 
     /// Runs a full handshake and returns both established sessions.
     fn handshake_at(now: Millis) -> (Pair, KeyPair, KeyPair) {

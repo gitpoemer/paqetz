@@ -36,12 +36,14 @@ pub const COMMENT: &str = "paqetz-tunnel";
 /// neighbours. One table, one transaction, every port.
 #[must_use]
 pub fn nft_apply(guard: &Guard) -> String {
-    let (pre, out, rst) = match guard {
+    let (pre, input, out, rst) = match guard {
         // One rule each, matching every port as a set: the kernel looks a port
         // up rather than walking a rule per port. With a rule per port, a pool
         // of two hundred cost each packet six hundred rules, and halved what
         // the tunnel could carry.
-        Guard::Ports(ports) if ports.is_empty() => (String::new(), String::new(), String::new()),
+        Guard::Ports(ports) if ports.is_empty() => {
+            (String::new(), String::new(), String::new(), String::new())
+        }
         Guard::Ports(ports) => {
             let set = ports
                 .iter()
@@ -50,12 +52,58 @@ pub fn nft_apply(guard: &Guard) -> String {
                 .join(", ");
             (
                 format!("        tcp dport {{ {set} }} notrack\n"),
+                String::new(),
                 format!("        tcp sport {{ {set} }} notrack\n"),
                 format!("        tcp sport {{ {set} }} tcp flags & rst == rst drop\n"),
             )
         }
+        Guard::IcmpIds(blocks) if blocks.is_empty() => {
+            (String::new(), String::new(), String::new(), String::new())
+        }
+        Guard::IcmpIds(blocks) => {
+            let set = distinct(blocks)
+                .iter()
+                .map(|(first, last)| format!("{first}-{last}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                // Untracked both ways, as every other guard does: with
+                // rotation these are a new identifier every few seconds, and
+                // each would otherwise leave a conntrack entry behind for a
+                // flow the kernel does not own.
+                format!(
+                    "        icmp type {{ echo-request, echo-reply }} icmp id {{ {set} }} \
+                     notrack\n"
+                ),
+                // The rule this guard exists for. Left alone, the host answers
+                // an echo request itself -- with our own payload echoed back to
+                // the peer, at the full sending rate. So the tunnel's pings
+                // must never reach its ICMP stack.
+                //
+                // In `input` rather than `prerouting`, so a gateway goes on
+                // forwarding other hosts' pings whatever identifier they carry;
+                // and by identifier rather than by type, so the host goes on
+                // answering pings outside the block. Inside it, it stops: the
+                // block sits where a Linux host numbers its own pings from, so
+                // a little under one percent of ordinary pingers get silence
+                // instead of a reply. That is the price of hiding here, and it
+                // is paid by the identifier rather than by every ping on the
+                // machine.
+                format!("        icmp type echo-request icmp id {{ {set} }} drop\n"),
+                format!(
+                    "        icmp type {{ echo-request, echo-reply }} icmp id {{ {set} }} \
+                     notrack\n"
+                ),
+                // Nothing to swallow on the way out. The kernel's unwanted
+                // answer to a ping is the echo reply, which the rule above
+                // stops it ever composing; it has no reset to send, and no
+                // unreachable, because protocol 1 is one it handles.
+                String::new(),
+            )
+        }
         Guard::Protocol(proto) => (
             format!("        ip protocol {proto} notrack\n"),
+            String::new(),
             format!("        ip protocol {proto} notrack\n"),
             // The kernel's answer to a protocol nothing is listening for, and
             // this carrier's equivalent of the reset: an ICMP destination
@@ -71,20 +119,32 @@ pub fn nft_apply(guard: &Guard) -> String {
                 .to_owned(),
         ),
     };
+    // Each only when something needs it: an empty chain is still a hook every
+    // packet on the host walks past, and no carrier fills all four.
+    let chain = |name: &str, hook: &str, rules: &str| {
+        if rules.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "    chain {name} {{
+        type filter hook {hook}; policy accept;
+{rules}    }}
+"
+            )
+        }
+    };
+    let chains = format!(
+        "{}{}{}{}",
+        chain("prerouting", "prerouting priority raw", &pre),
+        chain("input", "input priority raw", &input),
+        chain("output_notrack", "output priority raw", &out),
+        chain("output_quiet", "output priority mangle", &rst),
+    );
     format!(
         "add table ip {TABLE}
 delete table ip {TABLE}
 table ip {TABLE} {{
-    chain prerouting {{
-        type filter hook prerouting priority raw; policy accept;
-{pre}    }}
-    chain output_notrack {{
-        type filter hook output priority raw; policy accept;
-{out}    }}
-    chain output_quiet {{
-        type filter hook output priority mangle; policy accept;
-{rst}    }}
-}}
+{chains}}}
 "
     )
 }
@@ -174,6 +234,10 @@ impl Op {
 pub fn iptables_rules(guard: &Guard) -> Vec<IptablesRule> {
     match guard {
         Guard::Ports(ports) => ports.iter().flat_map(|p| rules_for(*p)).collect(),
+        Guard::IcmpIds(blocks) => distinct(blocks)
+            .iter()
+            .flat_map(|b| rules_for_echo(*b))
+            .collect(),
         Guard::Protocol(proto) => rules_for_protocol(*proto),
     }
 }
@@ -186,6 +250,13 @@ pub fn iptables_rules(guard: &Guard) -> Vec<IptablesRule> {
 pub enum Guard {
     /// The fake-TCP carrier's outer ports.
     Ports(Vec<u16>),
+    /// Blocks of ICMP echo identifiers, each a first and a last, for the
+    /// carrier that is a ping.
+    ///
+    /// One block per tunnel: they are derived from keys, so a process carrying
+    /// several has several, and rules naming only one would leave the rest to
+    /// the kernel.
+    IcmpIds(Vec<(u16, u16)>),
     /// An IP protocol number, for a carrier with no ports.
     Protocol(u8),
 }
@@ -218,6 +289,79 @@ fn rules_for_protocol(proto: u8) -> Vec<IptablesRule> {
             "icmp",
             "--icmp-type",
             "protocol-unreachable",
+            "-j",
+            "DROP",
+        ]),
+    ]
+}
+
+/// The blocks, with duplicates removed.
+///
+/// A configuration naming the same block twice is refused when it is read, with
+/// a remedy; this is the mechanical half of that, because the shape of the
+/// failure is bad out of proportion to its cause. `nft` refuses a set with a
+/// repeated interval, and it refuses the whole transaction, so one duplicate
+/// means no rules at all and a process that will not start.
+fn distinct(blocks: &[(u16, u16)]) -> Vec<(u16, u16)> {
+    let mut out = blocks.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The three rules covering one block of echo identifiers.
+///
+/// `iptables` has no `icmp id` match, so the identifier is read out of the
+/// packet with `u32`: start at the end of the IPv4 header, take the word four
+/// bytes in, and keep its top half. The same offset under a different ICMP type
+/// is some other field, which is why the drop names the type as well -- and why
+/// the untracking rules do not have to: no type puts anything in the ephemeral
+/// range there except an echo.
+fn rules_for_echo(block: (u16, u16)) -> Vec<IptablesRule> {
+    let (first, last) = block;
+    let id = format!("0>>22&0x3C@4>>16={first}:{last}");
+    let build = |parts: &[&str]| -> IptablesRule {
+        let mut spec: Vec<String> = parts.iter().map(|s| (*s).to_owned()).collect();
+        spec.extend(
+            ["-m", "comment", "--comment", COMMENT]
+                .iter()
+                .map(|s| (*s).to_owned()),
+        );
+        IptablesRule { spec }
+    };
+    vec![
+        build(&[
+            "-t",
+            "raw",
+            "PREROUTING",
+            "-p",
+            "icmp",
+            "-m",
+            "u32",
+            "--u32",
+            &id,
+            "-j",
+            "NOTRACK",
+        ]),
+        build(&[
+            "-t", "raw", "OUTPUT", "-p", "icmp", "-m", "u32", "--u32", &id, "-j", "NOTRACK",
+        ]),
+        // The kernel's own answer, stopped before it composes one. In `INPUT`
+        // rather than `PREROUTING` so a gateway still forwards other hosts'
+        // pings -- and so in `mangle`, which is the first table with an `INPUT`
+        // chain: `raw` has only `PREROUTING` and `OUTPUT`.
+        build(&[
+            "-t",
+            "mangle",
+            "INPUT",
+            "-p",
+            "icmp",
+            "--icmp-type",
+            "echo-request",
+            "-m",
+            "u32",
+            "--u32",
+            &id,
             "-j",
             "DROP",
         ]),
@@ -493,6 +637,110 @@ mod tests {
         assert!(!script.contains("tcp dport"), "{script}");
         assert!(!script.contains("tcp sport"), "{script}");
         assert!(!script.contains("flags & rst"), "{script}");
+    }
+
+    #[test]
+    fn an_echo_guard_stops_the_kernel_answering_the_tunnels_own_pings() {
+        // The failure this exists for: an echo request the host answers itself
+        // is answered with the tunnel's own payload, echoed back to the peer at
+        // the full sending rate.
+        let script = nft_apply(&Guard::IcmpIds(vec![(40_000, 40_255)]));
+        assert!(
+            script.contains("chain input"),
+            "the answer has to be stopped before the stack composes it: {script}"
+        );
+        assert!(
+            script.contains("icmp type echo-request icmp id { 40000-40255 } drop"),
+            "{script}"
+        );
+        // By identifier, so every other ping this host is sent is still
+        // answered; and in `input`, so a gateway still forwards other hosts'.
+        assert!(!script.contains("icmp type echo-request drop"), "{script}");
+        assert!(
+            !script.contains(
+                "hook prerouting priority raw; policy accept;\n        icmp type \
+                              echo-request"
+            ),
+            "{script}"
+        );
+        assert_eq!(
+            script.matches("icmp id { 40000-40255 } notrack").count(),
+            2,
+            "inbound and outbound both, or conntrack builds state for every \
+             identifier the carrier moves through: {script}"
+        );
+        assert!(!script.contains("tcp dport"), "{script}");
+        assert!(!script.contains("flags & rst"), "{script}");
+
+        // One block per tunnel, all in one set.
+        let several = nft_apply(&Guard::IcmpIds(vec![(40_000, 40_255), (50_000, 50_255)]));
+        assert!(
+            several.contains("{ 40000-40255, 50000-50255 }"),
+            "{several}"
+        );
+
+        // And nothing at all before a tunnel has been started, as with ports.
+        let none = nft_apply(&Guard::IcmpIds(Vec::new()));
+        assert!(!none.contains("icmp"), "{none}");
+        assert!(!none.contains("chain"), "{none}");
+    }
+
+    #[test]
+    fn one_block_named_twice_is_named_once() {
+        // `nft` refuses a set with a repeated interval, and it refuses the
+        // whole transaction: one duplicate would mean no rules at all and a
+        // process that will not start. Two tunnels deriving one block is
+        // refused when the configuration is read, with a remedy; this is the
+        // half that cannot be got wrong.
+        let twice = nft_apply(&Guard::IcmpIds(vec![(40_000, 40_255), (40_000, 40_255)]));
+        assert_eq!(
+            twice.matches("40000-40255").count(),
+            3,
+            "once per chain, not twice: {twice}"
+        );
+        assert_eq!(
+            iptables_rules(&Guard::IcmpIds(vec![(40_000, 40_255), (40_000, 40_255)])).len(),
+            3,
+            "and one set of iptables rules, not two"
+        );
+        // Order is not an input either: the same blocks either way round are
+        // the same ruleset, so a reload does not churn the table.
+        assert_eq!(
+            nft_apply(&Guard::IcmpIds(vec![(40_000, 40_255), (50_000, 50_255)])),
+            nft_apply(&Guard::IcmpIds(vec![(50_000, 50_255), (40_000, 40_255)])),
+        );
+    }
+
+    #[test]
+    fn an_echo_guard_reads_the_identifier_itself_where_iptables_cannot_match_it() {
+        let rules = iptables_rules(&Guard::IcmpIds(vec![(40_000, 40_255)]));
+        assert_eq!(rules.len(), 3);
+        let all: Vec<String> = rules.iter().map(|r| r.spec.join(" ")).collect();
+        // The IPv4 header length, then the halfword four bytes into ICMP.
+        let id = "0>>22&0x3C@4>>16=40000:40255";
+        assert!(
+            all.iter()
+                .any(|r| r.contains(&format!("raw PREROUTING -p icmp -m u32 --u32 {id}"))),
+            "{all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|r| r.contains(&format!("raw OUTPUT -p icmp -m u32 --u32 {id}"))),
+            "{all:?}"
+        );
+        // `raw` has no INPUT chain, so the drop goes in the first table that
+        // does. A rule naming a chain its table does not have is rejected.
+        assert!(
+            all.iter()
+                .any(|r| r.contains("mangle INPUT -p icmp --icmp-type echo-request")),
+            "{all:?}"
+        );
+        for rule in &all {
+            assert!(rule.contains(COMMENT), "{rule}");
+        }
+        for rule in &rules {
+            assert_eq!(rule.spec.first().map(String::as_str), Some("-t"));
+        }
     }
 
     #[test]
