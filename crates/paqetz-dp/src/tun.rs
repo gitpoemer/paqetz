@@ -42,7 +42,22 @@ pub(crate) mod flags {
     /// Without this every read and write carries a header we would have to skip
     /// or synthesise, for no benefit — we already know these are IP packets.
     pub(crate) const IFF_NO_PI: i16 = 0x1000;
+    /// Every read and write carries a `virtio_net_hdr`.
+    ///
+    /// Which is a header we *do* want, unlike `IFF_NO_PI`'s: it is what lets a
+    /// single write carry many packets for the kernel to split, and the TUN
+    /// device has no other way to accept more than one packet per syscall.
+    pub(crate) const IFF_VNET_HDR: i16 = 0x4000;
 }
+
+/// Bytes of `virtio_net_hdr` on each read and write under `IFF_VNET_HDR`.
+///
+/// Ten, not twelve: the twelve-byte form is `virtio_net_hdr_mrg_rxbuf`, which
+/// TUN uses only when `TUNSETVNETHDRSZ` asks for it.
+pub const VNET_HDR_LEN: usize = 10;
+
+/// The `gso_type` for a frame that is one packet and needs no splitting.
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 
 /// The MTU an inner packet must fit within, given the tunnel's overhead.
 ///
@@ -58,6 +73,12 @@ pub const DEFAULT_MTU: u32 = 1400;
 pub struct Tun {
     fd: OwnedFd,
     name: String,
+    /// Bytes of virtio-net header on every read and write, or zero.
+    ///
+    /// Held here rather than passed in, so the header cannot be forgotten at
+    /// one call site and supplied at another: `recv` and `send` deal with it
+    /// themselves and their signatures do not change.
+    vnet: usize,
 }
 
 impl Tun {
@@ -69,6 +90,25 @@ impl Tun {
     /// Returns the underlying OS error, with a clearer message when the failure
     /// is simply a lack of privilege.
     pub fn create(name: &str) -> io::Result<Self> {
+        Self::open_device(name, false)
+    }
+
+    /// Creates or attaches to a TUN device that carries a virtio-net header.
+    ///
+    /// Which means a write may carry several packets for the kernel to split.
+    /// Reads are unaffected in practice: without `TUNSETOFFLOAD` the kernel
+    /// segments before handing anything over, so what arrives is always one
+    /// packet and the header it arrives with says so.
+    ///
+    /// Requires `CAP_NET_ADMIN`.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub fn create_segmented(name: &str) -> io::Result<Self> {
+        Self::open_device(name, true)
+    }
+
+    fn open_device(name: &str, vnet: bool) -> io::Result<Self> {
         // Validate the name before opening anything, so a bad name costs no
         // syscall and cannot leave a descriptor behind.
         let mut req = IfReq::new(name)?;
@@ -76,7 +116,11 @@ impl Tun {
         let fd = sys::open("/dev/net/tun", libc::O_RDWR | libc::O_CLOEXEC)
             .map_err(|e| sys::explain_privilege(e, "opening /dev/net/tun", "CAP_NET_ADMIN"))?;
 
-        req.set_flags(flags::IFF_TUN | flags::IFF_NO_PI);
+        let mut want = flags::IFF_TUN | flags::IFF_NO_PI;
+        if vnet {
+            want |= flags::IFF_VNET_HDR;
+        }
+        req.set_flags(want);
         // SAFETY: TUNSETIFF expects a pointer to an `ifreq`, which `IfReq` is
         // laid out as.
         unsafe { sys::ioctl_ptr(fd.as_raw_fd(), ioctls::TUNSETIFF, &mut req) }?;
@@ -84,7 +128,14 @@ impl Tun {
         Ok(Self {
             fd,
             name: name.to_owned(),
+            vnet: if vnet { VNET_HDR_LEN } else { 0 },
         })
+    }
+
+    /// Whether a write may carry several packets.
+    #[must_use]
+    pub const fn segments(&self) -> bool {
+        self.vnet > 0
     }
 
     /// The device's name.
@@ -98,7 +149,32 @@ impl Tun {
     /// # Errors
     /// Returns the underlying OS error.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        sys::read(self.fd.as_raw_fd(), buf)
+        self.read_packet(buf)
+    }
+
+    /// One read, with the virtio-net header taken off if there is one.
+    ///
+    /// Every read goes through here. The blocking and non-blocking paths used
+    /// to call `read` separately, and adding the header to one of them left the
+    /// other parsing it as the first ten bytes of an IP packet.
+    fn read_packet(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.vnet == 0 {
+            return sys::read(self.fd.as_raw_fd(), buf);
+        }
+        // Two buffers, one syscall: the header into its own and the packet at
+        // the start of the caller's, so nothing is copied to get it there.
+        let mut head = [0u8; VNET_HDR_LEN];
+        let n = sys::readv2(self.fd.as_raw_fd(), &mut head, buf)?;
+        // Nothing here asks the kernel for segmentation offload, so it segments
+        // before handing anything over and this is always zero. If it ever is
+        // not, the bytes in `buf` are a superpacket being read as one packet,
+        // which is worth an error rather than a silent mis-parse.
+        if head.get(1).copied() != Some(VIRTIO_NET_HDR_GSO_NONE) {
+            return Err(io::Error::other(
+                "the device handed over a segmented frame, which nothing here asked for",
+            ));
+        }
+        Ok(n.saturating_sub(VNET_HDR_LEN))
     }
 
     /// Switches the device between blocking and non-blocking reads.
@@ -135,7 +211,7 @@ impl Tun {
     /// # Errors
     /// Returns the underlying OS error, other than "would block".
     pub fn recv_nonblocking(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        match sys::read(self.fd.as_raw_fd(), buf) {
+        match self.read_packet(buf) {
             Ok(n) => Ok(Some(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
@@ -147,7 +223,34 @@ impl Tun {
     /// # Errors
     /// Returns the underlying OS error.
     pub fn send(&self, packet: &[u8]) -> io::Result<usize> {
-        sys::write(self.fd.as_raw_fd(), packet)
+        if self.vnet == 0 {
+            return sys::write(self.fd.as_raw_fd(), packet);
+        }
+        // One packet, so a header that says exactly that.
+        let head = [0u8; VNET_HDR_LEN];
+        let n = sys::writev2(self.fd.as_raw_fd(), &head, packet)?;
+        Ok(n.saturating_sub(VNET_HDR_LEN))
+    }
+
+    /// Writes one frame that the kernel is to split into several packets.
+    ///
+    /// `header` is a `virtio_net_hdr` describing the split, and `frame` is one
+    /// IPv4 header, one L4 header and the payload of every segment
+    /// concatenated. This is the only way to put more than one packet on a TUN
+    /// device per syscall: a write is one packet however many buffers it is
+    /// gathered from, so `writev` cannot do it and there is no `sendmmsg` here.
+    ///
+    /// # Errors
+    /// Returns the underlying OS error, or a refusal if the device was not
+    /// opened with [`Self::create_segmented`].
+    pub fn send_segmented(&self, header: &[u8; VNET_HDR_LEN], frame: &[u8]) -> io::Result<usize> {
+        if self.vnet == 0 {
+            return Err(io::Error::other(
+                "this device carries no virtio-net header, so it takes one packet per write",
+            ));
+        }
+        let n = sys::writev2(self.fd.as_raw_fd(), header, frame)?;
+        Ok(n.saturating_sub(VNET_HDR_LEN))
     }
 
     /// Assigns an address and netmask, sets the MTU, and brings the link up.

@@ -107,6 +107,47 @@ pub fn write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     check_size(unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) })
 }
 
+/// Reads into two buffers with one syscall, filling the first before the second.
+///
+/// For a TUN device carrying a virtio-net header: the header lands in its own
+/// buffer and the packet lands at the start of the caller's, so nothing has to
+/// be moved afterwards. Returns the total read, header included.
+pub fn readv2(fd: RawFd, first: &mut [u8], second: &mut [u8]) -> io::Result<usize> {
+    let mut iov = [
+        libc::iovec {
+            iov_base: first.as_mut_ptr().cast(),
+            iov_len: first.len(),
+        },
+        libc::iovec {
+            iov_base: second.as_mut_ptr().cast(),
+            iov_len: second.len(),
+        },
+    ];
+    // SAFETY: both buffers are uniquely borrowed for the call and each iovec
+    // states its own exact length, so the kernel cannot write out of bounds.
+    check_size(unsafe { libc::readv(fd, iov.as_mut_ptr(), 2) })
+}
+
+/// Writes two buffers as one with one syscall.
+///
+/// A TUN write is one packet however many buffers it is gathered from, which is
+/// what lets a virtio-net header be prepended without copying the packet.
+pub fn writev2(fd: RawFd, first: &[u8], second: &[u8]) -> io::Result<usize> {
+    let iov = [
+        libc::iovec {
+            iov_base: first.as_ptr().cast_mut().cast(),
+            iov_len: first.len(),
+        },
+        libc::iovec {
+            iov_base: second.as_ptr().cast_mut().cast(),
+            iov_len: second.len(),
+        },
+    ];
+    // SAFETY: both buffers are borrowed for the duration of the call and each
+    // iovec states its own exact length.
+    check_size(unsafe { libc::writev(fd, iov.as_ptr(), 2) })
+}
+
 /// Receives a datagram, discarding the source address.
 pub fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: `buf` is uniquely borrowed and `buf.len()` is its exact capacity.
