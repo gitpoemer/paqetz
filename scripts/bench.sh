@@ -54,16 +54,22 @@ command -v iperf3 >/dev/null || {
 }
 
 cat > "${WORK}/parse.py" <<'PYEOF'
-"""Extracts a throughput figure from iperf3's JSON."""
+"""Extracts raw throughput figures from iperf3's JSON.
+
+Numbers rather than a formatted line, so several runs can be reduced to a
+median before anything is printed. One value per line:
+
+    tcp -> bits_per_second
+    udp -> effective_bits_per_second  delivered_packets  lost_percent
+"""
 import json
 import sys
 
-mode, duration = sys.argv[1], float(sys.argv[2])
+mode = sys.argv[1]
 try:
     report = json.load(sys.stdin)
     if mode == "tcp":
-        bits = report["end"]["sum_received"]["bits_per_second"]
-        print(f"{bits / 1e9:.2f} Gbit/s")
+        print(report["end"]["sum_received"]["bits_per_second"])
     else:
         summary = report["end"]["sum"]
         # iperf3's client-side sum counts what it *sent*. Without the loss
@@ -71,11 +77,32 @@ try:
         # which would make the whole comparison meaningless.
         lost = summary.get("lost_percent", 0.0)
         delivered = summary["packets"] - summary.get("lost_packets", 0)
-        pps = delivered / duration / 1000
-        bits = summary["bits_per_second"] * (1.0 - lost / 100.0)
-        print(f"{bits / 1e9:.2f} Gbit/s ({pps:.0f}k pps, {lost:.1f}% lost)")
+        print(f"{summary['bits_per_second'] * (1.0 - lost / 100.0)} {delivered} {lost}")
 except (ValueError, KeyError, TypeError, ZeroDivisionError):
+    print("")
+PYEOF
+
+# The median of the numbers on stdin, one per line, by column.
+#
+# A median rather than a mean: one run that lost its CPU to something else
+# should not drag the figure it is being compared against.
+cat > "${WORK}/median.py" <<'PYEOF'
+import sys
+
+rows = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
+if not rows:
     print("n/a")
+    sys.exit()
+width = min(len(r) for r in rows)
+out = []
+for col in range(width):
+    try:
+        values = sorted(float(r[col]) for r in rows)
+    except ValueError:
+        print("n/a")
+        sys.exit()
+    out.append(values[len(values) // 2])
+print(" ".join(f"{v:.6f}" for v in out))
 PYEOF
 
 echo "==> building"
@@ -102,6 +129,31 @@ for ns_dev in "${SRV_NS}:veth-bsrv:${SRV_OUTER}" "${CLI_NS}:veth-bcli:${CLI_OUTE
     sudo ip netns exec "${ns}" ip link set lo up
     sudo ip netns exec "${ns}" ip route add default dev "${dev}"
 done
+
+TICKS=$(getconf CLK_TCK)
+
+# Clock ticks of CPU used so far by the paqetz processes in both namespaces.
+#
+# Read straight from /proc rather than sampled with pidstat, because this has
+# to line up exactly with one measurement window, and because the two ends are
+# separate processes whose cost belongs to the same run. Fields 14 and 15 of
+# /proc/pid/stat are utime and stime; the comm field can itself contain spaces,
+# so they are counted from the closing parenthesis rather than from the start.
+cpu_ticks() {
+    local total=0 ns p used
+    for ns in "${SRV_NS}" "${CLI_NS}"; do
+        for p in $(sudo ip netns pids "${ns}" 2>/dev/null); do
+            [[ $(sudo cat "/proc/${p}/comm" 2>/dev/null) == paqetz ]] || continue
+            used=$(sudo awk '{
+                rest = substr($0, index($0, ") ") + 2)
+                split(rest, f, " ")
+                print f[12] + f[13]
+            }' "/proc/${p}/stat" 2>/dev/null)
+            total=$((total + ${used:-0}))
+        done
+    done
+    echo "${total}"
+}
 
 # One run of one configuration.
 run_one() {
@@ -154,18 +206,55 @@ EOF
     sudo ip netns exec "${SRV_NS}" iperf3 -s -1 -B "${SRV_INNER}" >/dev/null 2>&1 &
     sleep 1
 
+    # REPEATS samples of each, reduced to a median. This used to announce a
+    # median and then take one sample: the variable was read once, to print the
+    # word, and never used.
+    local tcp_samples="" udp_samples="" before after i
+    for ((i = 0; i < REPEATS; i++)); do
+        before=$(cpu_ticks)
+        local bits
+        bits=$(sudo ip netns exec "${CLI_NS}" iperf3 -c "${SRV_INNER}" \
+            -t "${SECONDS_PER_RUN}" -J 2>/dev/null |
+            python3 "${WORK}/parse.py" tcp)
+        after=$(cpu_ticks)
+        [[ -n ${bits} ]] && tcp_samples+="${bits} $((after - before))"$'\n'
+
+        sudo ip netns exec "${SRV_NS}" iperf3 -s -1 -B "${SRV_INNER}" >/dev/null 2>&1 &
+        sleep 1
+        before=$(cpu_ticks)
+        local line
+        line=$(sudo ip netns exec "${CLI_NS}" iperf3 -c "${SRV_INNER}" -u -b 0 -l 1200 \
+            -t "${SECONDS_PER_RUN}" -J 2>/dev/null |
+            python3 "${WORK}/parse.py" udp)
+        after=$(cpu_ticks)
+        [[ -n ${line} ]] && udp_samples+="${line} $((after - before))"$'\n'
+
+        # Another one-shot server for the next repeat, and for the UDP half of
+        # this one, which has just consumed the previous one.
+        if ((i + 1 < REPEATS)); then
+            sudo ip netns exec "${SRV_NS}" iperf3 -s -1 -B "${SRV_INNER}" >/dev/null 2>&1 &
+            sleep 1
+        fi
+    done
+
     local tcp udp
-    tcp=$(sudo ip netns exec "${CLI_NS}" iperf3 -c "${SRV_INNER}" \
-        -t "${SECONDS_PER_RUN}" -J 2>/dev/null |
-        python3 "${WORK}/parse.py" tcp "${SECONDS_PER_RUN}")
+    tcp=$(printf '%s' "${tcp_samples}" | python3 "${WORK}/median.py" |
+        awk -v t="${TICKS}" '{
+            if ($1 == "n/a") { print "n/a"; exit }
+            printf "%.2f Gbit/s (%.1f cpu-s)", $1 / 1e9, $2 / t
+        }')
+    # Microseconds of CPU per delivered packet is the figure the TUN-offload
+    # question turns on: it is the per-packet cost, with the path's capacity
+    # divided out.
+    udp=$(printf '%s' "${udp_samples}" | python3 "${WORK}/median.py" |
+        awk -v t="${TICKS}" -v d="${SECONDS_PER_RUN}" '{
+            if ($1 == "n/a") { print "n/a"; exit }
+            pps = $2 / d
+            printf "%.2f Gbit/s %.0fk pps %.1f%% lost %.2f us/pkt",
+                $1 / 1e9, pps / 1000, $3, ($4 / t) * 1e6 / $2
+        }')
 
-    sudo ip netns exec "${SRV_NS}" iperf3 -s -1 -B "${SRV_INNER}" >/dev/null 2>&1 &
-    sleep 1
-    udp=$(sudo ip netns exec "${CLI_NS}" iperf3 -c "${SRV_INNER}" -u -b 0 -l 1200 \
-        -t "${SECONDS_PER_RUN}" -J 2>/dev/null |
-        python3 "${WORK}/parse.py" udp "${SECONDS_PER_RUN}")
-
-    printf '  %-28s TCP %-16s UDP %s\n' "${label}" "${tcp}" "${udp}"
+    printf '  %-28s TCP %-26s UDP %s\n' "${label}" "${tcp}" "${udp}"
 
     sudo pkill -INT -f "paqetz run -c ${WORK}/" 2>/dev/null
     sleep 2
@@ -200,3 +289,16 @@ echo
 echo "    UDP packet rate is the more useful of the two figures. TCP throughput"
 echo "    here is largely a measure of how few, large packets iperf3 can push;"
 echo "    the tunnel is bounded by packets, not bytes."
+echo
+echo "    us/pkt is the one to watch for anything that claims to reduce"
+echo "    per-packet cost, and is the microseconds of CPU both ends spend"
+echo "    together per delivered packet. Throughput over a veth pair is bounded"
+echo "    by how fast this can push packets, so a change that lowers us/pkt"
+echo "    without raising throughput has not been measured properly, and one"
+echo "    that raises throughput without lowering us/pkt bought it somewhere"
+echo "    other than the datapath."
+echo
+echo "    cpu-s is the same measurement for the TCP run, undivided: the CPU"
+echo "    seconds both ends spent during it. On a host with steal time it is"
+echo "    the number to compare, since wall-clock throughput there says more"
+echo "    about the hypervisor than about this code."
