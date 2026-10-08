@@ -52,6 +52,7 @@ const TUNSETIFF: libc::Ioctl = 0x4004_54ca;
 const TUNSETOFFLOAD: libc::Ioctl = 0x4004_54d0;
 const TUN_F_CSUM: libc::c_uint = 0x01;
 const TUN_F_USO4: libc::c_uint = 0x20;
+const TUN_F_USO6: libc::c_uint = 0x40;
 
 /// `virtio_net_hdr`, which precedes every frame once `IFF_VNET_HDR` is set.
 ///
@@ -101,13 +102,18 @@ fn open_tun(vnet: bool) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     if vnet {
-        let features = TUN_F_CSUM | TUN_F_USO4;
+        // Both USO bits, not just the IPv4 one. `set_offload` in the kernel
+        // reads them as a pair -- "TODO: for now USO4 and USO6 should work
+        // simultaneously" -- so with only USO4 the bit is left unconsumed and
+        // the ioctl returns EINVAL at the end, which looks exactly like the
+        // kernel being too old to know the feature at all.
+        let features = TUN_F_CSUM | TUN_F_USO4 | TUN_F_USO6;
         // SAFETY: TUNSETOFFLOAD takes the feature bits by value.
         if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETOFFLOAD, features) } < 0 {
             return Err(io::Error::other(format!(
-                "TUNSETOFFLOAD(TUN_F_CSUM|TUN_F_USO4) failed: {}. UDP segmentation offload \
-                 needs Linux 6.2 or later; without it this probe cannot measure the \"uso\" \
-                 half and the plain figure is all there is",
+                "TUNSETOFFLOAD(TUN_F_CSUM|TUN_F_USO4|TUN_F_USO6) failed: {}. UDP \
+                 segmentation offload needs Linux 6.2 or later; without it this probe \
+                 cannot measure the \"uso\" half and the plain figure is all there is",
                 io::Error::last_os_error()
             )));
         }
@@ -251,13 +257,20 @@ fn vnet_header(gso_size: usize) -> Vec<u8> {
     h
 }
 
-/// This process's CPU time, in microseconds.
+/// This thread's CPU time, in microseconds.
+///
+/// `RUSAGE_THREAD` rather than `RUSAGE_SELF`, so the drainer's `recv` is not
+/// counted against the write. The kernel work the write itself triggers -- the
+/// route lookup, the netfilter traversal, the socket enqueue -- happens in the
+/// writer's own context and is counted, which is right: the datapath pays that
+/// too. What the thing at the far end of the socket spends is Xray's problem,
+/// not this one's.
 fn cpu_micros() -> u64 {
     // SAFETY: `rusage` is plain integers, for which all-zero is valid, and
     // `getrusage` overwrites it before anything reads it.
     let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
     // SAFETY: `getrusage` fills the struct it is given.
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } < 0 {
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &raw mut usage) } < 0 {
         return 0;
     }
     [usage.ru_utime, usage.ru_stime]
