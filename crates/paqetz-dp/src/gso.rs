@@ -130,8 +130,12 @@ fn parse(bytes: &[u8]) -> Option<Packet<'_>> {
     })
 }
 
-/// Whether `b` continues the run that `a` is part of.
-fn continues(a: &Packet<'_>, b: &Packet<'_>, gso_size: usize) -> bool {
+/// Whether `b` continues a run whose previous packet was `a`, carrying
+/// `a_payload` bytes.
+///
+/// The payload length is passed rather than read from `a`, because what is kept
+/// between packets is headers; the bytes are already in the frame.
+fn continues_after(a: &Packet<'_>, a_payload: usize, b: &Packet<'_>, gso_size: usize) -> bool {
     // The first packet's headers are the ones every segment gets, so anything
     // an observer would read off them has to match.
     if a.ip.get(..2) != b.ip.get(..2) || a.ip.get(4..) != b.ip.get(4..) {
@@ -156,80 +160,172 @@ fn continues(a: &Packet<'_>, b: &Packet<'_>, gso_size: usize) -> bool {
             return false;
         }
     }
-    if a.proto == PROTO_TCP && b.seq != a.seq.wrapping_add(size32(a.payload.len())) {
+    if a.proto == PROTO_TCP && b.seq != a.seq.wrapping_add(size32(a_payload)) {
         return false;
     }
     // Every segment but the last carries exactly `gso_size`, which is the whole
     // meaning of the field. A short one in the middle would be re-split at the
     // wrong boundaries.
-    a.payload.len() == gso_size && !b.payload.is_empty() && b.payload.len() <= gso_size
+    a_payload == gso_size && !b.payload.is_empty() && b.payload.len() <= gso_size
 }
 
 fn size32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// How many packets from `from` may be written as one, and what each segment
-/// carries.
+/// Holds inner packets until they can be written as one frame.
 ///
-/// A count of one means the packet has to go on its own, and `gso_size` is then
-/// meaningless. The count never exceeds what an IPv4 header can describe.
-#[must_use]
-pub fn mergeable(packets: &[&[u8]], from: usize) -> (usize, usize) {
-    let Some(first) = packets.get(from).and_then(|p| parse(p)) else {
-        return (1, 0);
-    };
-    let gso_size = first.payload.len();
-    if gso_size == 0 {
-        return (1, 0);
-    }
-    let mut count = 1;
-    let mut bytes = IPV4_LEN + first.l4.len() + gso_size;
-    let mut prev = first;
-    while let Some(next) = packets.get(from + count).and_then(|p| parse(p)) {
-        if !continues(&prev, &next, gso_size) || bytes + next.payload.len() > MAX_IP_TOTAL {
-            break;
-        }
-        bytes += next.payload.len();
-        count += 1;
-        prev = next;
-    }
-    (count, gso_size)
+/// One copy per packet, into the frame being built, which is the copy the
+/// kernel would have made from each separate write anyway. A run of one pays
+/// that copy for nothing, so a batch of entirely unrelated packets is slightly
+/// worse off than writing each directly -- roughly a sixth of what one write
+/// costs, against three quarters of it saved at a run of four.
+#[derive(Debug, Default)]
+pub struct Coalescer {
+    /// The first packet's headers, then every payload.
+    frame: Vec<u8>,
+    /// Returned alongside the frame, so the caller writes both in one call.
+    header: [u8; VNET_HDR_LEN],
+    run: Option<Run>,
+    /// Whether the frame is waiting to be written.
+    ///
+    /// Tracked rather than read off the frame's length, because `take` hands
+    /// out a borrow of the frame and so cannot clear it. The next `hold`
+    /// overwrites it instead.
+    pending: bool,
 }
 
-/// Builds the one frame that stands for `packets[from..from + count]`.
-///
-/// Returns the `virtio_net_hdr` to write alongside it. `frame` is cleared
-/// first. Returns `None` if the run is a single packet, which has nothing to
-/// assemble and should be written as it is.
-#[must_use]
-pub fn assemble(
-    packets: &[&[u8]],
-    from: usize,
-    count: usize,
+/// The run being built.
+#[derive(Debug)]
+struct Run {
+    proto: u8,
+    l4_len: usize,
     gso_size: usize,
-    frame: &mut Vec<u8>,
-) -> Option<[u8; VNET_HDR_LEN]> {
-    if count < 2 {
-        return None;
-    }
-    let first = packets.get(from).and_then(|p| parse(p))?;
-    let payload: usize = (from..from + count)
-        .map(|i| {
-            packets
-                .get(i)
-                .and_then(|p| parse(p))
-                .map_or(0, |p| p.payload.len())
-        })
-        .sum();
-    let total = IPV4_LEN + first.l4.len() + payload;
-    let ip_total = u16::try_from(total).ok()?;
+    count: usize,
+    payload: usize,
+    /// The last packet admitted, which the next one is compared against.
+    last_ip: [u8; IPV4_LEN],
+    last_l4: Vec<u8>,
+    last_seq: u32,
+    last_payload: usize,
+}
 
-    frame.clear();
-    frame.reserve(total);
-    frame.extend_from_slice(first.ip);
-    // The length is the whole frame's; the checksum has to be right for it,
-    // because the kernel validates this header before it splits anything.
+impl Coalescer {
+    /// Whether `packet` can join what is already held.
+    ///
+    /// True with nothing held, since anything can start a run. False for
+    /// anything this cannot describe, which is then written on its own.
+    #[must_use]
+    pub fn joins(&self, packet: &[u8]) -> bool {
+        let Some(next) = parse(packet) else {
+            return false;
+        };
+        let Some(run) = self.run.as_ref() else {
+            // Nothing merges onto something this did not understand, which is
+            // held as it arrived and has to go out before anything else.
+            return !self.pending && !next.payload.is_empty();
+        };
+        let last = Packet {
+            ip: &run.last_ip,
+            l4: &run.last_l4,
+            payload: &[],
+            proto: run.proto,
+            seq: run.last_seq,
+        };
+        if !continues_after(&last, run.last_payload, &next, run.gso_size) {
+            return false;
+        }
+        IPV4_LEN + run.l4_len + run.payload + next.payload.len() <= MAX_IP_TOTAL
+    }
+
+    /// Adds `packet` to the run.
+    ///
+    /// Call [`Self::joins`] first, or [`Self::take`] if it said no. A packet
+    /// added without either is written on its own, which is correct but wastes
+    /// the frame it was being accumulated into.
+    pub fn hold(&mut self, packet: &[u8]) {
+        self.pending = true;
+        let Some(next) = parse(packet) else {
+            // Not something this understands. Held as it is, so it still goes
+            // out, as one packet with no segmentation asked for.
+            self.frame.clear();
+            self.frame.extend_from_slice(packet);
+            self.run = None;
+            return;
+        };
+        match self.run.as_mut() {
+            Some(run) => {
+                self.frame.extend_from_slice(next.payload);
+                run.count += 1;
+                run.payload += next.payload.len();
+                run.last_l4.clear();
+                run.last_l4.extend_from_slice(next.l4);
+                run.last_seq = next.seq;
+                run.last_payload = next.payload.len();
+            }
+            None => {
+                self.frame.clear();
+                self.frame.extend_from_slice(next.ip);
+                self.frame.extend_from_slice(next.l4);
+                self.frame.extend_from_slice(next.payload);
+                let mut last_ip = [0u8; IPV4_LEN];
+                if let Some(slot) = next.ip.get(..IPV4_LEN) {
+                    last_ip.copy_from_slice(slot);
+                }
+                self.run = Some(Run {
+                    proto: next.proto,
+                    l4_len: next.l4.len(),
+                    gso_size: next.payload.len(),
+                    count: 1,
+                    payload: next.payload.len(),
+                    last_ip,
+                    last_l4: next.l4.to_vec(),
+                    last_seq: next.seq,
+                    last_payload: next.payload.len(),
+                });
+            }
+        }
+    }
+
+    /// The frame to write and the header to write with it, if anything is held.
+    ///
+    /// A run of one yields a header asking for no segmentation, so the caller
+    /// writes every case the same way.
+    pub fn take(&mut self) -> Option<(&[u8; VNET_HDR_LEN], &[u8])> {
+        if !self.pending {
+            return None;
+        }
+        self.pending = false;
+        let Some(run) = self.run.take() else {
+            // Something unparsed, going out exactly as it arrived.
+            self.header = [0u8; VNET_HDR_LEN];
+            return Some((&self.header, &self.frame));
+        };
+        if run.count == 1 {
+            self.header = [0u8; VNET_HDR_LEN];
+            return Some((&self.header, &self.frame));
+        }
+        self.header = finish(&mut self.frame, &run)?;
+        Some((&self.header, &self.frame))
+    }
+
+    /// Whether anything is waiting to be written.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.pending
+    }
+
+    /// Forgets whatever is held, for a caller that could not write it.
+    pub fn clear(&mut self) {
+        self.frame.clear();
+        self.run = None;
+        self.pending = false;
+    }
+}
+
+/// Rewrites the frame's headers for the whole run and returns its header.
+fn finish(frame: &mut [u8], run: &Run) -> Option<[u8; VNET_HDR_LEN]> {
+    let ip_total = u16::try_from(IPV4_LEN + run.l4_len + run.payload).ok()?;
     frame
         .get_mut(2..4)?
         .copy_from_slice(&ip_total.to_be_bytes());
@@ -237,29 +333,22 @@ pub fn assemble(
     let ip_ck = !fold(sum16(frame.get(..IPV4_LEN)?));
     frame.get_mut(10..12)?.copy_from_slice(&ip_ck.to_be_bytes());
 
-    frame.extend_from_slice(first.l4);
-    if first.proto == PROTO_UDP {
-        // UDP states its own length, and for a superpacket it states the whole
-        // one, as the kernel's own segmenter expects.
-        let udp_total = u16::try_from(UDP_LEN + payload).ok()?;
+    if run.proto == PROTO_UDP {
+        // UDP states its own length, and a superpacket states the whole one,
+        // which is what the kernel's segmenter expects to find.
+        let udp_total = u16::try_from(UDP_LEN + run.payload).ok()?;
         frame
             .get_mut(IPV4_LEN + 4..IPV4_LEN + 6)?
             .copy_from_slice(&udp_total.to_be_bytes());
     }
     // The half of the checksum the kernel cannot derive: the pseudo-header for
-    // one segment, which is the convention `NEEDS_CSUM` expects to find.
-    let partial = pseudo_header(&first, gso_size)?;
-    let csum_at = IPV4_LEN + usize::from(csum_offset(first.proto));
+    // one segment, which is what `NEEDS_CSUM` expects to find there.
+    let partial = pseudo_header(frame, run)?;
+    let at = IPV4_LEN + usize::from(csum_offset(run.proto));
     frame
-        .get_mut(csum_at..csum_at + 2)?
+        .get_mut(at..at + 2)?
         .copy_from_slice(&partial.to_be_bytes());
-
-    for i in from..from + count {
-        let p = packets.get(i).and_then(|p| parse(p))?;
-        frame.extend_from_slice(p.payload);
-    }
-
-    Some(header(&first, gso_size))
+    Some(header(run))
 }
 
 const fn csum_offset(proto: u8) -> u16 {
@@ -271,29 +360,33 @@ const fn csum_offset(proto: u8) -> u16 {
 }
 
 /// The `virtio_net_hdr` describing how to split a frame.
-fn header(first: &Packet<'_>, gso_size: usize) -> [u8; VNET_HDR_LEN] {
+fn header(run: &Run) -> [u8; VNET_HDR_LEN] {
     let mut h = [0u8; VNET_HDR_LEN];
     h[0] = NEEDS_CSUM;
-    h[1] = if first.proto == PROTO_TCP {
+    h[1] = if run.proto == PROTO_TCP {
         GSO_TCPV4
     } else {
         GSO_UDP_L4
     };
-    let hdr_len = u16::try_from(IPV4_LEN + first.l4.len()).unwrap_or(u16::MAX);
+    let hdr_len = u16::try_from(IPV4_LEN + run.l4_len).unwrap_or(u16::MAX);
     h[2..4].copy_from_slice(&hdr_len.to_le_bytes());
-    h[4..6].copy_from_slice(&u16::try_from(gso_size).unwrap_or(u16::MAX).to_le_bytes());
+    h[4..6].copy_from_slice(
+        &u16::try_from(run.gso_size)
+            .unwrap_or(u16::MAX)
+            .to_le_bytes(),
+    );
     h[6..8].copy_from_slice(&u16::try_from(IPV4_LEN).unwrap_or(0).to_le_bytes());
-    h[8..10].copy_from_slice(&csum_offset(first.proto).to_le_bytes());
+    h[8..10].copy_from_slice(&csum_offset(run.proto).to_le_bytes());
     h
 }
 
 /// The ones' complement sum of the pseudo-header for one segment.
-fn pseudo_header(first: &Packet<'_>, gso_size: usize) -> Option<u16> {
+fn pseudo_header(frame: &[u8], run: &Run) -> Option<u16> {
     let mut head = [0u8; 12];
-    head.get_mut(..4)?.copy_from_slice(first.ip.get(12..16)?);
-    head.get_mut(4..8)?.copy_from_slice(first.ip.get(16..20)?);
-    head[9] = first.proto;
-    let len = u16::try_from(first.l4.len() + gso_size).ok()?;
+    head.get_mut(..4)?.copy_from_slice(frame.get(12..16)?);
+    head.get_mut(4..8)?.copy_from_slice(frame.get(16..20)?);
+    head[9] = run.proto;
+    let len = u16::try_from(run.l4_len + run.gso_size).ok()?;
     head.get_mut(10..12)?.copy_from_slice(&len.to_be_bytes());
     Some(fold(sum16(&head)))
 }
@@ -410,15 +503,56 @@ mod tests {
             .collect()
     }
 
-    fn refs(packets: &[Vec<u8>]) -> Vec<&[u8]> {
-        packets.iter().map(Vec::as_slice).collect()
+    /// One write the coalescer would make.
+    struct Written {
+        count: usize,
+        header: [u8; VNET_HDR_LEN],
+        frame: Vec<u8>,
+    }
+
+    impl Written {
+        fn gso(&self) -> usize {
+            usize::from(u16::from_le_bytes([self.header[4], self.header[5]]))
+        }
+    }
+
+    /// Drives the coalescer over `packets` exactly as the datapath will, and
+    /// returns the writes it would make.
+    fn drive(packets: &[Vec<u8>]) -> Vec<Written> {
+        let mut c = Coalescer::default();
+        let mut out = Vec::new();
+        let mut held = 0usize;
+        for p in packets {
+            if !c.joins(p) {
+                if let Some((header, frame)) = c.take() {
+                    out.push(Written {
+                        count: held,
+                        header: *header,
+                        frame: frame.to_vec(),
+                    });
+                }
+                held = 0;
+            }
+            c.hold(p);
+            held += 1;
+        }
+        if let Some((header, frame)) = c.take() {
+            out.push(Written {
+                count: held,
+                header: *header,
+                frame: frame.to_vec(),
+            });
+        }
+        assert!(c.is_empty(), "the coalescer kept something back");
+        out
     }
 
     #[test]
     fn a_contiguous_stream_merges_whole() {
         let owned = stream(8, 1400);
-        let (count, gso) = mergeable(&refs(&owned), 0);
-        assert_eq!((count, gso), (8, 1400));
+        let w = drive(&owned);
+        assert_eq!(w.len(), 1, "one write for one stream");
+        assert_eq!((w[0].count, w[0].gso()), (8, 1400));
     }
 
     #[test]
@@ -427,11 +561,10 @@ mod tests {
         // must not be told these were one segment.
         let mut owned = stream(8, 1400);
         owned.remove(3);
-        let (count, _) = mergeable(&refs(&owned), 0);
-        assert_eq!(count, 3, "the run has to stop at the hole");
-        // And the rest still merges, starting after it.
-        let (count, _) = mergeable(&refs(&owned), 3);
-        assert_eq!(count, 4);
+        let w = drive(&owned);
+        assert_eq!(w.len(), 2, "one write each side of the hole");
+        assert_eq!(w[0].count, 3, "the run has to stop at the hole");
+        assert_eq!(w[1].count, 4, "and the rest still merges");
     }
 
     #[test]
@@ -443,8 +576,9 @@ mod tests {
             ..Build::default()
         }
         .bytes();
-        let (count, gso) = mergeable(&refs(&owned), 0);
-        assert_eq!((count, gso), (4, 1400), "a short last segment belongs");
+        let w = drive(&owned);
+        assert_eq!(w.len(), 1);
+        assert_eq!((w[0].count, w[0].gso()), (4, 1400), "a short last belongs");
 
         // In the middle it does not: everything but the last carries gso_size,
         // or the kernel re-splits at the wrong boundaries.
@@ -455,8 +589,8 @@ mod tests {
             ..Build::default()
         }
         .bytes();
-        let (count, _) = mergeable(&refs(&owned), 0);
-        assert_eq!(count, 2, "the short one ends it");
+        let w = drive(&owned);
+        assert_eq!(w[0].count, 2, "the short one ends it");
     }
 
     #[test]
@@ -474,8 +608,8 @@ mod tests {
                 }
                 .bytes(),
             ];
-            let (count, _) = mergeable(&refs(&owned), 0);
-            assert_eq!(count, 1, "flags {flags:#04x} should stand alone");
+            let w = drive(&owned);
+            assert_eq!(w[0].count, 1, "flags {flags:#04x} should stand alone");
         }
     }
 
@@ -490,7 +624,7 @@ mod tests {
             }
             .bytes(),
         ];
-        assert_eq!(mergeable(&refs(&owned), 0).0, 1);
+        assert_eq!(drive(&owned)[0].count, 1);
     }
 
     #[test]
@@ -506,7 +640,7 @@ mod tests {
             }
             .bytes(),
         ];
-        assert_eq!(mergeable(&refs(&owned), 0).0, 1);
+        assert_eq!(drive(&owned)[0].count, 1);
     }
 
     #[test]
@@ -532,7 +666,7 @@ mod tests {
             }
             .bytes(),
         ];
-        assert_eq!(mergeable(&refs(&same), 0).0, 2, "one timestamp, one run");
+        assert_eq!(drive(&same)[0].count, 2, "one timestamp, one run");
 
         let differing = vec![
             Build {
@@ -547,7 +681,7 @@ mod tests {
             }
             .bytes(),
         ];
-        assert_eq!(mergeable(&refs(&differing), 0).0, 1);
+        assert_eq!(drive(&differing)[0].count, 1);
     }
 
     #[test]
@@ -556,22 +690,27 @@ mod tests {
         // usable header after the first, and neither is worth the care.
         let mut with_options = Build::default().bytes();
         with_options[0] = 0x46;
-        assert_eq!(mergeable(&[&with_options], 0).0, 1);
-
         let mut fragment = Build::default().bytes();
         fragment[6] = 0x20; // more-fragments
-        assert_eq!(mergeable(&[&fragment], 0).0, 1);
-
-        // And a packet with no payload has no segment size to describe.
         let empty = Build {
             payload: 0,
             ..Build::default()
         }
         .bytes();
-        assert_eq!(mergeable(&[&empty], 0).0, 1);
 
-        assert_eq!(mergeable(&[&[0u8; 4][..]], 0).0, 1, "a runt");
-        assert_eq!(mergeable(&[], 0).0, 1, "nothing at all");
+        for (what, packet) in [
+            ("IP options", with_options),
+            ("a fragment", fragment),
+            ("no payload", empty),
+            ("a runt", vec![0u8; 4]),
+        ] {
+            let w = drive(std::slice::from_ref(&packet));
+            assert_eq!(w.len(), 1, "{what} should still be written");
+            assert_eq!(w[0].count, 1, "{what} should stand alone");
+            assert_eq!(w[0].frame, packet, "{what} should go out unchanged");
+            assert_eq!(w[0].header, [0u8; VNET_HDR_LEN], "{what} asks for no split");
+        }
+        assert!(drive(&[]).is_empty(), "nothing at all");
     }
 
     /// The checksum a correct receiver computes for one segment, from scratch.
@@ -613,18 +752,16 @@ mod tests {
                     .bytes()
                 })
                 .collect();
-            let packets = refs(&owned);
-            let (count, gso) = mergeable(&packets, 0);
-            assert_eq!(count, 4, "{proto}");
-            let mut frame = Vec::new();
-            let head = assemble(&packets, 0, count, gso, &mut frame).expect("assembles");
+            let w = drive(&owned);
+            assert_eq!(w[0].count, 4, "{proto}");
+            let (head, frame, gso) = (w[0].header, w[0].frame.clone(), w[0].gso());
             assert_eq!(head[0], NEEDS_CSUM);
 
             let l4_len = usize::from(u16::from_le_bytes([head[2], head[3]])) - IPV4_LEN;
             let l4 = &frame[IPV4_LEN..IPV4_LEN + l4_len];
             // Each full-size segment the kernel would make, checked as the
             // receiver will check it.
-            for seg in 0..count {
+            for seg in 0..w[0].count {
                 let at = IPV4_LEN + l4_len + seg * gso;
                 let payload = &frame[at..at + gso];
                 let finished = !fold(sum16(&[l4, payload].concat()));
@@ -640,10 +777,8 @@ mod tests {
     #[test]
     fn the_frame_is_one_packet_a_receiver_would_accept() {
         let owned = stream(5, 1400);
-        let packets = refs(&owned);
-        let (count, gso) = mergeable(&packets, 0);
-        let mut frame = Vec::new();
-        let head = assemble(&packets, 0, count, gso, &mut frame).expect("assembles");
+        let w = drive(&owned);
+        let (head, frame) = (w[0].header, w[0].frame.clone());
 
         // The length covers everything, and the checksum covers the length.
         let total = u16::from_be_bytes([frame[2], frame[3]]);
@@ -675,11 +810,9 @@ mod tests {
                 .bytes()
             })
             .collect();
-        let packets = refs(&owned);
-        let (count, gso) = mergeable(&packets, 0);
-        assert_eq!((count, gso), (3, 1200));
-        let mut frame = Vec::new();
-        let head = assemble(&packets, 0, count, gso, &mut frame).expect("assembles");
+        let w = drive(&owned);
+        assert_eq!((w[0].count, w[0].gso()), (3, 1200));
+        let (head, frame) = (w[0].header, w[0].frame.clone());
         assert_eq!(head[1], GSO_UDP_L4);
         assert_eq!(u16::from_le_bytes([head[8], head[9]]), UDP_CSUM_OFFSET);
         let udp_len = u16::from_be_bytes([frame[IPV4_LEN + 4], frame[IPV4_LEN + 5]]);
@@ -687,32 +820,51 @@ mod tests {
     }
 
     #[test]
-    fn one_packet_assembles_to_nothing() {
-        // It has no superpacket to be, and should be written as it arrived.
+    fn one_packet_asks_for_no_split() {
+        // It has no superpacket to be, and goes out as it arrived.
         let owned = stream(1, 1400);
-        let mut frame = vec![0xAA; 99];
-        assert!(assemble(&refs(&owned), 0, 1, 1400, &mut frame).is_none());
+        let w = drive(&owned);
+        assert_eq!(w[0].header, [0u8; VNET_HDR_LEN]);
+        assert_eq!(w[0].frame, owned[0]);
     }
 
     #[test]
-    fn a_reused_buffer_carries_nothing_from_last_time() {
+    fn a_reused_coalescer_carries_nothing_from_last_time() {
+        // One instance lives for the life of the thread, so a frame must not
+        // be able to leak into the next one.
+        let mut c = Coalescer::default();
+        for packets in [stream(3, 1400), stream(2, 900), stream(5, 1400)] {
+            for p in &packets {
+                if !c.joins(p) {
+                    let _ = c.take();
+                }
+                c.hold(p);
+            }
+            let (_, frame) = c.take().expect("something is held");
+            let want: usize = IPV4_LEN + 20 + packets.iter().map(|p| p.len() - 40).sum::<usize>();
+            assert_eq!(frame.len(), want);
+            assert!(c.is_empty());
+        }
+    }
+
+    #[test]
+    fn what_cannot_be_written_can_be_dropped() {
         let owned = stream(3, 1400);
-        let packets = refs(&owned);
-        let mut frame = vec![0xAA; 70_000];
-        let (count, gso) = mergeable(&packets, 0);
-        assert!(assemble(&packets, 0, count, gso, &mut frame).is_some());
-        assert_eq!(frame.len(), IPV4_LEN + 20 + 3 * 1400);
-        assert!(
-            !frame.contains(&0xAA),
-            "the previous frame's bytes reached this one"
-        );
+        let mut c = Coalescer::default();
+        for p in &owned {
+            c.hold(p);
+        }
+        assert!(!c.is_empty());
+        c.clear();
+        assert!(c.is_empty());
+        assert!(c.take().is_none());
     }
 
     #[test]
     fn a_run_stops_at_what_an_ipv4_header_can_describe() {
         // Jumbo inner packets reach the limit inside one batch of thirty-two.
         let owned = stream(32, 9000);
-        let (count, _) = mergeable(&refs(&owned), 0);
+        let count = drive(&owned)[0].count;
         let frame = IPV4_LEN + 20 + count * 9000;
         assert!(frame <= MAX_IP_TOTAL, "{count} segments is {frame} bytes");
         assert!(
