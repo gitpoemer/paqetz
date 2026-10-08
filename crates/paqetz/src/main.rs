@@ -152,7 +152,7 @@ enum Command {
         action: ConfigAction,
     },
 
-    /// Download the latest release and replace this binary.
+    /// Download a release and replace this binary.
     ///
     /// Fetches the build matching this one, checks it against the digest
     /// published with the release, and refuses to install anything it cannot
@@ -162,6 +162,13 @@ enum Command {
         /// Answer yes to both questions: install it, and restart the service.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// A particular release rather than the latest, as 0.20.5 or v0.20.5.
+        ///
+        /// Older ones included, for comparing two releases on one path. An
+        /// older binary refuses configuration keys that did not exist yet, so
+        /// check it with `paqetz doctor -c FILE` before restarting the service.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
     },
 
     /// Start the tunnel service.
@@ -431,7 +438,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Config { action } => match action {
             ConfigAction::Migrate { yes } => migrate::run(&cli.config, yes),
         },
-        Command::Update { yes } => update::run(yes),
+        Command::Update { yes, version } => update::run(yes, version.as_deref()),
         Command::Start => unit_command("start"),
         Command::Stop => unit_command("stop"),
         Command::Restart => unit_command("restart"),

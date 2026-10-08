@@ -1,4 +1,4 @@
-//! Replacing this binary with the latest published one.
+//! Replacing this binary with a published one.
 //!
 //! The same job `scripts/install.sh` does, from inside the program, for a host
 //! that already has it. Both fetch the release, check it against the published
@@ -32,6 +32,55 @@ const TARGET: &str = env!("PAQETZ_TARGET");
 /// What this binary reports as its own version.
 fn running_version() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The tag to install: the one asked for, or the most recent.
+fn release_tag(asked: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    match asked {
+        Some(v) => normalise_tag(v).ok_or_else(|| {
+            format!(
+                "{v:?} is not a version. Write it as 0.20.5 or v0.20.5: this becomes part of a \
+                 download URL for a binary that is about to be installed as root, so anything \
+                 else is refused rather than tried"
+            )
+            .into()
+        }),
+        None => latest_tag(),
+    }
+}
+
+/// `0.20.5` or `v0.20.5` to `v0.20.5`, and anything else to nothing.
+///
+/// Strict on purpose. The result is pasted into a release-download URL, so a
+/// tag carrying a slash or a `..` would fetch from somewhere else on the same
+/// host -- including the digest it is then checked against, which makes the
+/// verification agree with whatever was substituted. Digits and dots only.
+fn normalise_tag(asked: &str) -> Option<String> {
+    let bare = asked.trim().strip_prefix('v').unwrap_or(asked.trim());
+    if bare.is_empty() || bare.len() > 32 {
+        return None;
+    }
+    let parts: Vec<&str> = bare.split('.').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(format!("v{bare}"))
+}
+
+/// A tag as numbers, for telling an upgrade from a downgrade.
+fn ordered(tag: &str) -> Option<(u64, u64, u64)> {
+    let bare = tag.strip_prefix('v')?;
+    let mut parts = bare.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
 }
 
 /// The tag of the most recent release.
@@ -81,25 +130,49 @@ fn digest_for(sums: &str, name: &str) -> Option<String> {
 /// # Errors
 /// Returns an error if the release cannot be fetched, its digest cannot be
 /// fetched or does not match, or the binary cannot be replaced.
-pub(crate) fn run(assume_yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run(
+    assume_yes: bool,
+    version: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let running = running_version();
     println!("Running {running} ({TARGET})");
 
-    let latest = latest_tag()?;
-    if latest == running {
-        println!("Already the latest release. Nothing to do.");
+    let wanted = release_tag(version)?;
+    if wanted == running {
+        println!("Already running {running}. Nothing to do.");
         return Ok(());
     }
-    println!("Latest is  {latest}");
+    if version.is_some() {
+        println!("Asked for  {wanted}");
+    } else {
+        println!("Latest is  {wanted}");
+    }
 
-    if !assume_yes && !confirm(&format!("Replace {running} with {latest}?")) {
+    // Going backwards is a supported thing to do -- comparing two releases on
+    // one path is the reason this takes a version at all -- but it has one
+    // consequence worth saying before it happens rather than after: the
+    // configuration parser refuses keys it does not know, so a release older
+    // than a setting in the file will not start, naming the key.
+    let backwards = match (ordered(&running), ordered(&wanted)) {
+        (Some(from), Some(to)) => to < from,
+        _ => false,
+    };
+    if backwards {
+        println!(
+            "\nThat is older than what is running. An older release refuses configuration keys \
+             it does not know, so check `paqetz doctor -c FILE` with it before restarting the \
+             service."
+        );
+    }
+
+    if !assume_yes && !confirm(&format!("Replace {running} with {wanted}?")) {
         println!("Left alone.");
         return Ok(());
     }
 
     let target = std::env::current_exe()?;
     let name = format!("paqetz-{TARGET}");
-    let base = format!("https://github.com/{REPO}/releases/download/{latest}");
+    let base = format!("https://github.com/{REPO}/releases/download/{wanted}");
 
     let tmp = std::env::temp_dir().join(format!("paqetz-update-{}", std::process::id()));
     let _guard = Cleanup(tmp.clone());
@@ -143,7 +216,7 @@ pub(crate) fn run(assume_yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("    ok  {actual}");
 
     replace(&downloaded, &target)?;
-    println!("==> replaced {} with {latest}", target.display());
+    println!("==> replaced {} with {wanted}", target.display());
 
     restart(assume_yes);
     Ok(())
@@ -235,6 +308,64 @@ mod tests {
         let v = running_version();
         assert!(v.starts_with('v'), "{v}");
         assert!(v[1..].split('.').count() >= 2, "{v}");
+    }
+
+    #[test]
+    fn a_version_is_accepted_with_or_without_its_v() {
+        for asked in ["0.20.5", "v0.20.5", " v0.20.5 ", "1.0", "0.20.13"] {
+            let got = normalise_tag(asked).unwrap_or_else(|| panic!("{asked:?} should parse"));
+            assert!(got.starts_with('v'), "{asked:?} became {got}");
+        }
+        assert_eq!(normalise_tag("0.20.5").as_deref(), Some("v0.20.5"));
+        assert_eq!(normalise_tag("v0.20.5").as_deref(), Some("v0.20.5"));
+    }
+
+    #[test]
+    fn anything_that_is_not_a_version_is_refused() {
+        // The tag is pasted into a release-download URL, and the digest it
+        // would be checked against comes from that same URL -- so a tag that
+        // can walk out of the release path makes the verification agree with
+        // whatever it was pointed at. Nothing but digits and dots.
+        for bad in [
+            "../../other/releases/download/v1.0",
+            "latest",
+            "v0.20.5/../../x",
+            "0.20.5-rc1",
+            "v",
+            "",
+            "0",
+            "0.20.5.1",
+            "0..5",
+            "v0.20.5;id",
+            "v0.20.5 && id",
+            "https://example.com/x",
+        ] {
+            assert_eq!(normalise_tag(bad), None, "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_version_asked_for_wins_over_the_latest() {
+        // The only part reachable without the network: the asked-for tag is
+        // what comes back, normalised, and a malformed one is an error rather
+        // than a request.
+        assert_eq!(release_tag(Some("0.20.5")).expect("parses"), "v0.20.5");
+        assert!(release_tag(Some("latest")).is_err());
+    }
+
+    #[test]
+    fn versions_order_so_a_downgrade_can_be_named() {
+        assert!(
+            ordered("v0.20.5") < ordered("v0.20.13"),
+            "20.5 before 20.13"
+        );
+        assert!(ordered("v0.20.13") < ordered("v0.21.0"));
+        assert!(
+            ordered("v0.9.0") < ordered("v0.10.0"),
+            "not a string compare"
+        );
+        assert_eq!(ordered("v1.2"), Some((1, 2, 0)));
+        assert_eq!(ordered("0.20.5"), None, "a tag carries its v");
     }
 
     #[test]

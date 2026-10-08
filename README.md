@@ -61,6 +61,20 @@ less install.sh
 sudo sh install.sh
 ```
 
+Afterwards, `sudo paqetz update` does the same job from inside the program.
+Both take a particular release rather than the latest, which is for running two
+of them against one path and seeing which behaves:
+
+```bash
+sudo paqetz update --version 0.20.5
+curl -fsSL .../install.sh | sudo sh -s -- v0.20.5    # or PAQETZ_VERSION=v0.20.5
+```
+
+Going backwards has one consequence worth knowing: an unknown configuration key
+is an error rather than something ignored, so a release older than a setting in
+your file will refuse to start and name the key. `paqetz doctor -c FILE` with
+the older binary says so without changing anything.
+
 <details>
 <summary>Or build it yourself</summary>
 

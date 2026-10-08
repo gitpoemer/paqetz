@@ -1,8 +1,18 @@
 #!/usr/bin/env sh
 #
-# Downloads the latest release, verifies it, and installs it.
+# Downloads a release, verifies it, and installs it.
 #
 #   curl -fsSL https://raw.githubusercontent.com/gitpoemer/paqetz/main/scripts/install.sh | sudo sh && sudo paqetz setup
+#
+# The latest, unless a version is named. Either of these installs an older one,
+# which is for comparing two releases on one path:
+#
+#   curl -fsSL .../install.sh | sudo sh -s -- v0.20.5
+#   curl -fsSL .../install.sh | sudo PAQETZ_VERSION=v0.20.5 sh
+#
+# An older binary refuses configuration keys that did not exist when it was
+# built, naming the key, so check it with `paqetz doctor -c FILE` before
+# restarting the service.
 #
 # Setup is chained rather than run from here, so that installing inside a
 # provisioning script does not drop into an interactive wizard. Set
@@ -23,15 +33,50 @@
 #   PAQETZ_PREFIX   where the binary goes         (default /usr/local/bin)
 #   PAQETZ_TARGET   force a target triple         (default: detected)
 #   PAQETZ_SETUP    1 to run `paqetz setup` after (default 0)
+#   PAQETZ_VERSION  a release tag, or empty       (default: the latest)
 
 set -eu
 
 REPO=${PAQETZ_REPO:-gitpoemer/paqetz}
 PREFIX=${PAQETZ_PREFIX:-/usr/local/bin}
-BASE="https://github.com/${REPO}/releases/latest/download"
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# An argument wins over the environment, so both ways of saying it work when
+# this is piped into a shell. `--version X` is accepted as well as a bare `X`,
+# because `paqetz update` spells it that way and nobody should have to remember
+# which of the two takes a flag.
+if [ "${1:-}" = "--version" ]; then
+    [ -n "${2:-}" ] || die "--version needs a version, as 0.20.5 or v0.20.5"
+    VERSION=$2
+else
+    VERSION=${1:-${PAQETZ_VERSION:-}}
+fi
+
+# Digits and dots only, with or without the leading v. Strict because this
+# becomes part of a download URL for a binary about to be installed as root:
+# a tag carrying a slash or a `..` would fetch from elsewhere on the same host,
+# including the SHA256SUMS it is then checked against, which would make the
+# verification agree with whatever it was pointed at.
+if [ -n "$VERSION" ]; then
+    bare=${VERSION#v}
+    case "$bare" in
+        ''|*[!0-9.]*|.*|*.|*..*)
+            die "$VERSION is not a version; write it as 0.20.5 or v0.20.5" ;;
+    esac
+    # And at least two components, so a bare number is a mistake caught here
+    # rather than a 404 three steps later.
+    case "$bare" in
+        *.*) ;;
+        *) die "$VERSION is not a version; write it as 0.20.5 or v0.20.5" ;;
+    esac
+    TAG="v${bare}"
+    BASE="https://github.com/${REPO}/releases/download/${TAG}"
+else
+    TAG="the latest release"
+    BASE="https://github.com/${REPO}/releases/latest/download"
+fi
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"
@@ -71,7 +116,7 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "==> downloading ${NAME}"
+say "==> downloading ${NAME} (${TAG})"
 curl -fsSL --max-time 300 -o "$tmp/paqetz" "${BASE}/${NAME}" \
     || die "could not download ${BASE}/${NAME}"
 
