@@ -23,8 +23,11 @@ Two things bound a run, and loss is only one of them:
 
 Feed it a capture of real inner traffic, which is the evidence that counts:
 
-    tcpdump -i paqetz0 -c 200000 -w inner.pcap      # on either end
+    sudo tcpdump -i paqetz0 -s 60 -c 200000 -w inner.pcap   # on either end
     ./scripts/coalesce-model.py inner.pcap --loss 0 0.5 2
+
+`-s 60` keeps only the headers, which is all this reads, and turns a capture
+that would be hundreds of megabytes into about fifteen.
 
 Or model it, to see the shape before capturing anything:
 
@@ -59,9 +62,17 @@ def predicted_us(run: float) -> float:
 
 
 def read_pcap(path):
-    """Yields (flow_key, seq, length, ends_run) for each TCP/UDP packet."""
-    with open(path, "rb") as fh:
-        blob = fh.read()
+    """Every TCP/UDP packet in `path`, as (flow, seq, wire, payload, ends_run).
+
+    Read once into a list rather than streamed, because the model runs over the
+    same packets for each loss rate and each scope, and a capture worth
+    measuring is large enough that reading it six times is noticeable.
+    """
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError as e:
+        sys.exit(f"{path}: {e.strerror}")
     if len(blob) < 24:
         sys.exit(f"{path}: too short to be a pcap")
     magic = struct.unpack("<I", blob[:4])[0]
@@ -77,6 +88,7 @@ def read_pcap(path):
     if offset is None:
         sys.exit(f"{path}: link type {link} not handled")
 
+    packets = []
     at = 24
     while at + 16 <= len(blob):
         _, _, caplen, _ = struct.unpack(end + "IIII", blob[at : at + 16])
@@ -103,7 +115,10 @@ def read_pcap(path):
             seq = None
             ends = False
             payload = max(total - ihl - 8, 0)
-        yield key, seq, total, payload, ends
+        packets.append((key, seq, total, payload, ends))
+    if not packets:
+        sys.exit(f"{path}: no TCP or UDP packets in it")
+    return packets
 
 
 def synthetic(flows, packets, mss=1448):
@@ -194,20 +209,26 @@ def main():
     if not args.pcap and not args.synthetic:
         ap.error("give a pcap, or --synthetic")
 
+    # Before anything is printed, so a missing or unreadable capture is one line
+    # rather than a header followed by an error.
+    captured = read_pcap(args.pcap) if args.pcap else None
+
     print()
     print(f"cost model: {COPY_US:.3f} us per packet + {OVERHEAD_US:.3f} us per write")
     print("            (from the two figures you passed)")
     print(f"batch {BATCH} from the wire, at most {MAX_SEGMENTS} segments per superpacket")
     print()
 
+    if captured:
+        print(f"{len(captured)} packets from {args.pcap}")
+
     for held in (False, True):
         kind = "held across batches" if held else "within one batch only"
         print(f"==> {kind}")
         for loss in args.loss:
-            if args.pcap:
+            if captured:
                 rng = random.Random(args.seed)
-                stream = read_pcap(args.pcap)
-                report(f"{loss}% loss", runs(stream, loss / 100.0, held, rng))
+                report(f"{loss}% loss", runs(captured, loss / 100.0, held, rng))
             else:
                 for flows in args.flows:
                     rng = random.Random(args.seed)
