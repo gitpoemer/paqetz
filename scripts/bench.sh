@@ -154,7 +154,11 @@ cpu_ticks() {
 
 # One run of one configuration.
 run_one() {
-    local datapath=$1 transmit=$2 label=$3
+    local datapath=$1 transmit=$2 label=$3 coalesce=${4:-}
+    local coalesce_line=""
+    if [[ -n ${coalesce} ]]; then
+        coalesce_line='coalesce = true'
+    fi
 
     cat > "${WORK}/server.toml" <<EOF
 [interface]
@@ -164,6 +168,7 @@ listen_port = ${PORT}
 device = "pqb-srv"
 datapath = "${datapath}"
 transmit = "raw"
+${coalesce_line}
 
 [peer]
 public_key = "${CLI_PUB}"
@@ -178,6 +183,7 @@ listen_port = $((PORT + 1))
 device = "pqb-cli"
 datapath = "${datapath}"
 transmit = "${transmit}"
+${coalesce_line}
 
 [peer]
 public_key = "${SRV_PUB}"
@@ -193,7 +199,7 @@ EOF
     sleep 6
 
     if ! sudo ip netns exec "${CLI_NS}" ping -c2 -W3 "${SRV_INNER}" >/dev/null 2>&1; then
-        printf '  %-29s %s\n' "${label}" "tunnel did not come up"
+        printf '  %-31s %s\n' "${label}" "tunnel did not come up"
         sed 's/^/      /' "${WORK}/cli.log" | tail -3
         sudo pkill -INT -f "paqetz run -c ${WORK}/" 2>/dev/null
         sleep 1
@@ -251,7 +257,7 @@ EOF
                 $1 / 1e9, pps / 1000, $3, ($4 / t) * 1e6 / $2
         }')
 
-    printf '  %-29s TCP %-26s UDP %s\n' "${label}" "${tcp}" "${udp}"
+    printf "  %-31s TCP %-26s UDP %s\n" "${label}" "${tcp}" "${udp}"
 
     sudo pkill -INT -f "paqetz run -c ${WORK}/" 2>/dev/null
     sleep 2
@@ -270,6 +276,9 @@ run_one simple  raw      "simple  + raw       [default]"
 run_one simple  afpacket "simple  + af_packet"
 run_one batched raw      "batched + raw"
 run_one batched afpacket "batched + af_packet"
+# Only with the batched datapath: one packet per read leaves nothing to group.
+run_one batched raw      "batched + raw      + coalesce" yes
+run_one batched afpacket "batched + af_packet + coalesce" yes
 
 echo
 echo "==> reading this"
@@ -294,6 +303,15 @@ echo "    by how fast this can push packets, so a change that lowers us/pkt"
 echo "    without raising throughput has not been measured properly, and one"
 echo "    that raises throughput without lowering us/pkt bought it somewhere"
 echo "    other than the datapath."
+echo
+echo "    The coalesce rows are the TUN side of the same idea: the wire side"
+echo "    already takes 32 packets per syscall and a TUN device takes one, so"
+echo "    those rows write a run of a flow as a single frame for the kernel to"
+echo "    split. Expect them to help the UDP figure more than the TCP one --"
+echo "    a flood queues up runs to find, and iperf3's TCP keeps little in"
+echo "    flight over a veth pair, which is the same reason batching does"
+echo "    nothing for TCP here. One copy per packet is the price, so a run of"
+echo "    one is slightly worse than not coalescing at all."
 echo
 echo "    cpu-s is the same measurement for the TCP run, undivided: the CPU"
 echo "    seconds both ends spent during it. On a host with steal time it is"

@@ -3344,8 +3344,17 @@ impl Tunnel {
         if !held.joins(packet) {
             self.write_held(&mut held)?;
         }
-        held.hold(packet);
-        Ok(())
+        // Anything that cannot be part of a run goes straight out rather than
+        // through a frame it would be the only occupant of. On the reverse path
+        // of a bulk transfer that is most of the packets, since a pure
+        // acknowledgement has no payload to carry. Order is kept because
+        // whatever was held has just been written.
+        if gso::Coalescer::can_hold(packet) {
+            held.hold(packet);
+            Ok(())
+        } else {
+            self.write_one(packet)
+        }
     }
 
     /// Writes whatever the coalescer is holding, if anything.

@@ -238,6 +238,18 @@ impl Coalescer {
         IPV4_LEN + run.l4_len + run.payload + next.payload.len() <= MAX_IP_TOTAL
     }
 
+    /// Whether `packet` could ever be part of a run.
+    ///
+    /// A pure-acknowledgement segment carries no payload and so has no segment
+    /// size to describe, and the same goes for anything this cannot parse.
+    /// Both are written on their own, and a caller that checks this first
+    /// spares them a copy into a frame they would be the only occupant of.
+    /// On the reverse path of a bulk transfer that is most of the packets.
+    #[must_use]
+    pub fn can_hold(packet: &[u8]) -> bool {
+        parse(packet).is_some_and(|p| !p.payload.is_empty())
+    }
+
     /// Adds `packet` to the run.
     ///
     /// Call [`Self::joins`] first, or [`Self::take`] if it said no. A packet
@@ -845,6 +857,27 @@ mod tests {
             assert_eq!(frame.len(), want);
             assert!(c.is_empty());
         }
+    }
+
+    #[test]
+    fn what_can_never_be_part_of_a_run_says_so() {
+        // The caller writes these directly, so they never pay a copy into a
+        // frame they would be alone in. On the reverse path of a bulk transfer
+        // the acknowledgements are most of the packets.
+        let ack = Build {
+            payload: 0,
+            ..Build::default()
+        }
+        .bytes();
+        assert!(!Coalescer::can_hold(&ack), "a bare acknowledgement");
+        assert!(!Coalescer::can_hold(&[0u8; 4]), "a runt");
+        assert!(!Coalescer::can_hold(&[]), "nothing");
+
+        let mut fragment = Build::default().bytes();
+        fragment[6] = 0x20;
+        assert!(!Coalescer::can_hold(&fragment), "a fragment");
+
+        assert!(Coalescer::can_hold(&Build::default().bytes()), "data");
     }
 
     #[test]
