@@ -635,9 +635,20 @@ was the only part of the path still paying a syscall per packet.
 `coalesce` is how that half gets fixed: consecutive packets of one flow are
 written as a single frame with a header telling the kernel where to split it,
 which is the one way a TUN device accepts more than one packet at a time.
-Measured on a contended VPS at 16.8 microseconds of CPU per packet written one
-at a time against 3.0 written forty at a time, which was about a quarter of
-everything that datapath spent per packet.
+
+Measured end to end over a veth pair on a bulk TCP transfer, against the same
+configuration without it:
+
+| | CPU | throughput |
+| --- | --- | --- |
+| with `transmit = "raw"` | -29% | +9% |
+| with `transmit = "afpacket"` | -31% | +12% |
+
+Both moving the right way at once is the signature of work removed rather than
+traded, and it matches what a microbenchmark of the TUN write alone predicted:
+one write was about a third of what the datapath spent per packet, and this
+removes most of it. Run `./scripts/bench.sh` for the figures on your own host,
+which are the only ones worth acting on.
 
 It is **off by default**, and worth knowing why. The frames it builds carry an
 IP header, an L4 header and half a checksum for the kernel to finish, and a

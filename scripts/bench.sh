@@ -313,6 +313,12 @@ echo "    flight over a veth pair, which is the same reason batching does"
 echo "    nothing for TCP here. One copy per packet is the price, so a run of"
 echo "    one is slightly worse than not coalescing at all."
 echo
+echo "    Read the TCP rows for coalescing, not the UDP ones. The UDP flood"
+echo "    overruns the link by about six times, so most of the sending end's"
+echo "    work is on packets that never arrive -- and coalescing only helps"
+echo "    the receiving side. That dilutes us/pkt badly. TCP paces itself, so"
+echo "    sent and received match and the figure means what it says."
+echo
 echo "    cpu-s is the same measurement for the TCP run, undivided: the CPU"
 echo "    seconds both ends spent during it. On a host with steal time it is"
 echo "    the number to compare, since wall-clock throughput there says more"
