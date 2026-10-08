@@ -50,6 +50,8 @@ const PROTO_UDP: u8 = 17;
 const TCP_SEQ: core::ops::Range<usize> = 4..8;
 const TCP_CSUM: core::ops::Range<usize> = 16..18;
 const UDP_CSUM: core::ops::Range<usize> = 6..8;
+/// A UDP datagram states its own length, and the last of a run may be shorter.
+const UDP_LENGTH: core::ops::Range<usize> = 4..6;
 
 /// Where each protocol keeps its checksum, for the kernel to be pointed at.
 const TCP_CSUM_OFFSET: u16 = 16;
@@ -137,8 +139,25 @@ fn parse(bytes: &[u8]) -> Option<Packet<'_>> {
 /// between packets is headers; the bytes are already in the frame.
 fn continues_after(a: &Packet<'_>, a_payload: usize, b: &Packet<'_>, gso_size: usize) -> bool {
     // The first packet's headers are the ones every segment gets, so anything
-    // an observer would read off them has to match.
-    if a.ip.get(..2) != b.ip.get(..2) || a.ip.get(4..) != b.ip.get(4..) {
+    // an observer would read off them has to match -- but only the fields that
+    // are *meant* to be the same. Three are not:
+    //
+    // - the total length, which differs by definition
+    // - the Identification, which a real sender advances on every packet, and
+    //   which the kernel assigns afresh to each segment it makes
+    // - the header checksum, which follows from the other two
+    //
+    // Comparing those made every run exactly one packet long, for real traffic
+    // and only real traffic: a synthetic stream with a fixed Identification
+    // merged perfectly, which is how the tests missed it and the benchmark
+    // found it.
+    // Version and header length, TOS; the fragment flags, TTL and protocol;
+    // and the addresses. Everything between is a field that differs by design.
+    const SAME: [core::ops::Range<usize>; 3] = [0..2, 6..10, 12..20];
+    if SAME
+        .iter()
+        .any(|r| a.ip.get(r.clone()) != b.ip.get(r.clone()))
+    {
         return false;
     }
     if a.proto != b.proto || a.l4.len() != b.l4.len() {
@@ -150,7 +169,7 @@ fn continues_after(a: &Packet<'_>, a_payload: usize, b: &Packet<'_>, gso_size: u
     let varies = if a.proto == PROTO_TCP {
         [TCP_SEQ, TCP_CSUM]
     } else {
-        [UDP_CSUM, UDP_CSUM]
+        [UDP_LENGTH, UDP_CSUM]
     };
     for (i, (x, y)) in a.l4.iter().zip(b.l4.iter()).enumerate() {
         if varies.iter().any(|r| r.contains(&i)) {
@@ -441,6 +460,9 @@ mod tests {
         options: Vec<u8>,
         sport: u16,
         ttl: u8,
+        /// Advanced per packet, as a real sender does. Fixed at one value for
+        /// every packet, this fixture hid the defect the benchmark found.
+        ip_id: u16,
     }
 
     impl Default for Build {
@@ -453,6 +475,7 @@ mod tests {
                 options: Vec::new(),
                 sport: 40000,
                 ttl: 64,
+                ip_id: 0x1234,
             }
         }
     }
@@ -469,13 +492,17 @@ mod tests {
             p.push(0x45);
             p.push(0);
             p.extend_from_slice(&u16::try_from(total).expect("fits").to_be_bytes());
-            p.extend_from_slice(&0x1234u16.to_be_bytes());
+            p.extend_from_slice(&self.ip_id.to_be_bytes());
             p.extend_from_slice(&0x4000u16.to_be_bytes()); // Don't Fragment
             p.push(self.ttl);
             p.push(self.proto);
-            p.extend_from_slice(&0u16.to_be_bytes());
+            p.extend_from_slice(&0u16.to_be_bytes()); // checksum, below
             p.extend_from_slice(&SRC);
             p.extend_from_slice(&DST);
+            // A real header checksum, which therefore differs between packets
+            // because the Identification and the length do.
+            let ck = !fold(sum16(&p[..IPV4_LEN]));
+            p[10..12].copy_from_slice(&ck.to_be_bytes());
 
             p.extend_from_slice(&self.sport.to_be_bytes());
             p.extend_from_slice(&443u16.to_be_bytes());
@@ -508,6 +535,7 @@ mod tests {
                 Build {
                     seq: 1000 + u32::try_from(i * payload).expect("fits"),
                     payload,
+                    ip_id: 0x1234 + u16::try_from(i).expect("fits"),
                     ..Build::default()
                 }
                 .bytes()
@@ -637,6 +665,72 @@ mod tests {
             .bytes(),
         ];
         assert_eq!(drive(&owned)[0].count, 1);
+    }
+
+    #[test]
+    fn the_fields_that_differ_by_design_do_not_end_a_run() {
+        // The defect this exists for: comparing the whole IP header past the
+        // total length meant the Identification and the checksum, which differ
+        // on every real packet, made every run exactly one packet long. The
+        // benchmark found it because the fixture then used a fixed
+        // Identification and a zero checksum, so nothing here could.
+        let owned = stream(6, 1400);
+        let ids: Vec<u16> = owned
+            .iter()
+            .map(|p| u16::from_be_bytes([p[4], p[5]]))
+            .collect();
+        assert_eq!(ids.len(), 6);
+        assert!(
+            ids.windows(2).all(|w| w[0] != w[1]),
+            "the fixture has to advance the Identification: {ids:?}"
+        );
+        let checksums: Vec<u16> = owned
+            .iter()
+            .map(|p| u16::from_be_bytes([p[10], p[11]]))
+            .collect();
+        assert!(
+            checksums.windows(2).all(|w| w[0] != w[1]),
+            "and carry a real checksum, which then differs: {checksums:?}"
+        );
+        for p in &owned {
+            assert_eq!(fold(sum16(&p[..IPV4_LEN])), 0xFFFF, "a valid checksum");
+        }
+
+        let w = drive(&owned);
+        assert_eq!(w.len(), 1, "a real stream has to merge whole");
+        assert_eq!(w[0].count, 6);
+    }
+
+    #[test]
+    fn a_short_final_datagram_joins_a_udp_run() {
+        // UDP states its own length, so the last datagram's header differs
+        // from the rest. The kernel writes each segment's own length, which
+        // makes it the same kind of field as TCP's sequence number.
+        let mut owned: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                Build {
+                    proto: PROTO_UDP,
+                    payload: 1200,
+                    ip_id: 0x900 + i,
+                    ..Build::default()
+                }
+                .bytes()
+            })
+            .collect();
+        owned.push(
+            Build {
+                proto: PROTO_UDP,
+                payload: 400,
+                ip_id: 0x903,
+                ..Build::default()
+            }
+            .bytes(),
+        );
+        let w = drive(&owned);
+        assert_eq!(w.len(), 1, "the short one belongs to the run");
+        assert_eq!((w[0].count, w[0].gso()), (4, 1200));
+        let udp_len = u16::from_be_bytes([w[0].frame[IPV4_LEN + 4], w[0].frame[IPV4_LEN + 5]]);
+        assert_eq!(usize::from(udp_len), UDP_LEN + 3 * 1200 + 400);
     }
 
     #[test]
