@@ -208,6 +208,10 @@ pub struct Endpoint {
     records: bool,
 
     local_isn: u32,
+    /// Where this connection's IPv4 Identification counts from, for a profile
+    /// that counts. Fixed here rather than read from `local_isn`, which a real
+    /// handshake replaces once it has numbered its SYN.
+    ip_id_base: u32,
     /// Payload bytes sent, plus one for each SYN or FIN we have sent.
     sent: u32,
     /// The next byte expected from the peer: the end of the furthest segment
@@ -270,6 +274,7 @@ impl Endpoint {
             records: cfg.records,
             dont_fragment: cfg.dont_fragment,
             local_isn: cfg.isn,
+            ip_id_base: cfg.isn,
             sent: 0,
             peer_next: if waits { None } else { Some(cfg.peer_isn) },
             // Derived, not seen: right for a peer that started when we did,
@@ -470,7 +475,7 @@ impl Endpoint {
         if self.syn_seq.is_some() {
             return;
         }
-        let ts = timestamp(self.ts_base, now);
+        let ts = timestamp(self.ts_base, now, self.profile.ts_hz);
         self.syn_ts = Some(ts);
         self.local_isn = isn_for(ts);
     }
@@ -481,7 +486,9 @@ impl Endpoint {
     /// retransmission, because a responder that checks the SYN checks it
     /// against both numbers together.
     fn syn(&mut self, seq: u32, out: &mut [u8], now: u64) -> Result<usize> {
-        let ts_val = *self.syn_ts.get_or_insert(timestamp(self.ts_base, now));
+        let ts_val = *self
+            .syn_ts
+            .get_or_insert(timestamp(self.ts_base, now, self.profile.ts_hz));
         let fields = Fields {
             seq,
             // A SYN acknowledges nothing, and carries no ACK flag to say so.
@@ -683,7 +690,7 @@ impl Endpoint {
         // an established connection advertising half a kilobyte is not what a
         // real one looks like.
         let scaled = if self.carrier.opens() {
-            self.profile.window >> self.profile.window_scale
+            self.profile.window >> self.profile.window_scale.unwrap_or(0)
         } else {
             self.profile.window.min(u32::from(u16::MAX))
         };
@@ -711,19 +718,17 @@ impl Endpoint {
         u16::try_from(varied.clamp(1, u64::from(u16::MAX))).unwrap_or(u16::MAX)
     }
 
-    /// A varying IPv4 Identification.
+    /// The IPv4 Identification the profile calls for.
     ///
-    /// Knuth's multiplicative hash of the packet counter: uniform-looking to an
-    /// observer and one multiply to compute. Carried over from paqet, which got
-    /// this part right.
+    /// Every segment from here belongs to a connection, so this never takes
+    /// the zero branch; the reply that does is in `answer_syn`.
     fn ip_id(&self) -> u16 {
-        // The shift leaves 16 significant bits, so the narrowing is exact.
-        u16::try_from(self.counter.wrapping_mul(0x9E37_79B9) >> 16).unwrap_or(0)
+        segment::ip_id(&self.profile, self.ip_id_base, self.counter)
     }
 
     /// The RFC 7323 timestamp to send.
     fn ts_val(&self, now: u64) -> u32 {
-        timestamp(self.ts_base, now)
+        timestamp(self.ts_base, now, self.profile.ts_hz)
     }
 
     /// Folds an inbound segment into the connection state.
@@ -826,13 +831,14 @@ impl Endpoint {
 /// Public so a caller can know a SYN's timestamp before sending it: the real
 /// handshake's sequence number is computed from it.
 #[must_use]
-pub const fn timestamp(ts_base: u32, now: u64) -> u32 {
+pub const fn timestamp(ts_base: u32, now: u64, hz: u32) -> u32 {
+    let ticks = now.wrapping_mul(hz as u64) / 1_000;
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the TCP timestamp clock is defined to wrap at 32 bits"
     )]
-    let ms = now as u32;
-    ts_base.wrapping_add(ms)
+    let ticks = ticks as u32;
+    ts_base.wrapping_add(ticks)
 }
 
 /// How much sequence space a segment occupies: its payload, and one more for a
@@ -872,9 +878,11 @@ pub fn answer_syn(
         seq: isn,
         ack: syn.seq.wrapping_add(1),
         window: profile.syn_window,
-        // Knuth's multiplicative hash, as for every other segment, of the one
-        // varying number this has.
-        ip_id: u16::try_from(isn.wrapping_mul(0x9E37_79B9) >> 16).unwrap_or(0),
+        // The one packet here that no connection owns: it is composed from the
+        // SYN alone, before there is any state to own it, which is the case a
+        // counting profile writes zero for. The ISN is the one varying number
+        // it has, for the profiles that do not.
+        ip_id: segment::unconnected_ip_id(profile, dont_fragment, isn),
         ts_val,
         ts_ecr: syn.ts_val.unwrap_or(0),
         dont_fragment,
@@ -888,7 +896,7 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
-    use crate::profile::{LINUX_6, WINDOWS_11};
+    use crate::profile::{IOS_15, LINUX_6, WINDOWS_11};
     use crate::segment::{MAX_OVERHEAD, parse_ipv4};
 
     const CLIENT: (Ipv4Addr, u16) = (Ipv4Addr::new(192, 168, 1, 10), 41000);
@@ -969,6 +977,112 @@ mod tests {
     }
 
     #[test]
+    fn an_unscaled_profile_advertises_its_window_whole() {
+        // With no scale factor negotiated there is nothing to shift by, so the
+        // field is the window itself and the SYN is the small one the device
+        // really sends.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::FakeHandshake, IOS_15));
+        let mut buf = [0u8; 2048];
+
+        let n = e.handshake(&mut buf, 0).expect("syn").expect("some");
+        let syn = parse_ipv4(&buf[..n]).expect("parse");
+        assert_eq!(syn.window, IOS_15.syn_window);
+
+        let n = e.data(&[0u8; 100], &mut buf, 0).expect("data");
+        let data = parse_ipv4(&buf[..n]).expect("parse");
+        let floor = IOS_15.window - IOS_15.window / 8;
+        assert!(
+            u32::from(data.window) >= floor,
+            "{} is below the band {floor}..={}",
+            data.window,
+            IOS_15.window
+        );
+    }
+
+    #[test]
+    fn a_slower_clock_ticks_more_slowly() {
+        // One second of a 100 Hz clock is a hundred ticks, not a thousand.
+        assert_eq!(timestamp(0, 1_000, 1_000), 1_000);
+        assert_eq!(timestamp(0, 1_000, 100), 100);
+        assert_eq!(timestamp(7, 0, 100), 7);
+    }
+
+    #[test]
+    fn a_counting_profile_counts_the_identification() {
+        // A stack with a socket behind the packet advances a counter, which is
+        // what `inet_id` is and what two consecutive packets of one flow show.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
+        let mut ids = Vec::new();
+        for i in 0..8u64 {
+            let packet = emitted(|b| e.data(b"x", b, i));
+            ids.push(u16::from_be_bytes([packet[4], packet[5]]));
+        }
+        for w in ids.windows(2) {
+            assert_eq!(w[1], w[0].wrapping_add(1), "{ids:?} does not count");
+        }
+
+        // One counter per connection, not one across every peer: that would be
+        // a single monotonic sequence spanning all of them, a stronger
+        // identifier than anything else on this wire.
+        let mut other = Endpoint::new(Config {
+            isn: CLIENT_ISN ^ 0x5555_5555,
+            ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+        });
+        let packet = emitted(|b| other.data(b"x", b, 0));
+        assert_ne!(
+            u16::from_be_bytes([packet[4], packet[5]]),
+            ids[0],
+            "two connections start their counters in the same place"
+        );
+    }
+
+    #[test]
+    fn a_random_profile_does_not_count_it() {
+        // IOS randomises the field -- `TI=RD` -- so consecutive packets must
+        // not be readable as a sequence.
+        let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, IOS_15));
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..64u64 {
+            let packet = emitted(|b| e.data(b"x", b, i));
+            seen.insert(u16::from_be_bytes([packet[4], packet[5]]));
+        }
+        assert!(
+            seen.len() > 32,
+            "IP ID should look uniform, saw {}",
+            seen.len()
+        );
+        // And never zero: alongside Don't Fragment that is a quirk a
+        // classifier reads as a stack that does not randomise.
+        assert!(!seen.contains(&0), "{seen:?} includes a zero");
+    }
+
+    #[test]
+    fn the_reply_no_connection_owns_is_zero_where_the_profile_counts() {
+        // Composed from the SYN alone, before any state exists to count from,
+        // which is the kernel's condition for writing zero and the packet nmap
+        // reads `TI=Z` off. Not zero for a profile that randomises, and not
+        // zero on a packet a hop may split, whatever the profile: a shared zero
+        // has the fragments of two packets reassembled into each other.
+        let mut c = client();
+        let syn = opening(&mut c, 0);
+        let syn = parse_ipv4(&syn).expect("parse");
+        for (profile, whole, want_zero) in [
+            (LINUX_6, true, true),
+            (LINUX_6, false, false),
+            (IOS_15, true, false),
+        ] {
+            let reply = emitted(|b| answer_syn(&profile, SERVER, &syn, 77, 1, whole, b));
+            let id = u16::from_be_bytes([reply[4], reply[5]]);
+            assert_eq!(
+                id == 0,
+                want_zero,
+                "{} with dont_fragment = {whole} wrote {id}",
+                profile.name
+            );
+        }
+    }
+
+    #[test]
     fn the_advertised_window_actually_covers_its_band() {
         // The check the old test could not make. Jitter that only reaches a
         // fraction of its intended range is not jitter -- it is a narrow,
@@ -1038,7 +1152,7 @@ mod tests {
         let mut buf = [0u8; 2048];
         // Drive it past the handshake so the segments are data, not SYN.
         let _ = e.handshake(&mut buf, 0).expect("syn");
-        let expected = LINUX_6.window >> LINUX_6.window_scale;
+        let expected = LINUX_6.window >> LINUX_6.window_scale.expect("linux scales");
         assert!(expected < 1_000, "sanity: the scaled value is small");
     }
 
@@ -1387,7 +1501,7 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let base = LINUX_6.window >> LINUX_6.window_scale;
+        let base = LINUX_6.window >> LINUX_6.window_scale.expect("linux scales");
         let mut seen = std::collections::BTreeSet::new();
         for i in 0..64u64 {
             let packet = emitted(|b| c.data(b"x", b, i));
@@ -1400,23 +1514,6 @@ mod tests {
             );
         }
         assert!(seen.len() > 1, "a constant window is itself a signature");
-    }
-
-    #[test]
-    fn the_ip_identification_varies() {
-        let (mut c, mut s) = (client(), server());
-        connect(&mut c, &mut s);
-
-        let mut seen = std::collections::BTreeSet::new();
-        for i in 0..64u64 {
-            let packet = emitted(|b| c.data(b"x", b, i));
-            seen.insert(u16::from_be_bytes([packet[4], packet[5]]));
-        }
-        assert!(
-            seen.len() > 32,
-            "IP ID should look uniform, saw {}",
-            seen.len()
-        );
     }
 
     #[test]
@@ -1808,7 +1905,7 @@ mod tests {
         );
         assert_eq!(first.seq, again.seq);
         assert_eq!(first.ts_val, again.ts_val);
-        assert_eq!(first.ts_val, Some(timestamp(5_000, 100)));
+        assert_eq!(first.ts_val, Some(timestamp(5_000, 100, LINUX_6.ts_hz)));
     }
 
     #[test]
@@ -1944,7 +2041,7 @@ mod tests {
         c.number_syn(250, |ts| ts.wrapping_mul(3));
         let syn = opening(&mut c, 900);
         let syn = parse_ipv4(&syn).expect("parse");
-        let ts = timestamp(5_000, 250);
+        let ts = timestamp(5_000, 250, LINUX_6.ts_hz);
         assert_eq!(
             syn.ts_val,
             Some(ts),
@@ -1966,8 +2063,17 @@ mod tests {
         let mut c = client();
         let syn = opening(&mut c, 0);
         let syn = parse_ipv4(&syn).expect("parse");
-        let synack =
-            emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 1, timestamp(123_456, 10), true, b));
+        let synack = emitted(|b| {
+            answer_syn(
+                &LINUX_6,
+                SERVER,
+                &syn,
+                1,
+                timestamp(123_456, 10, LINUX_6.ts_hz),
+                true,
+                b,
+            )
+        });
         c.on_receive(&parse_ipv4(&synack).expect("parse"));
         let hello = emitted(|b| c.data(b"hello", b, 20));
 
@@ -1976,7 +2082,7 @@ mod tests {
         let reply = emitted(|b| s.data(b"hi", b, 30));
         assert_eq!(
             parse_ipv4(&reply).expect("parse").ts_val,
-            Some(timestamp(123_456, 30))
+            Some(timestamp(123_456, 30, LINUX_6.ts_hz))
         );
     }
 

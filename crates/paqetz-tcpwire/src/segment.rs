@@ -7,7 +7,7 @@
 use core::net::Ipv4Addr;
 
 use crate::checksum;
-use crate::profile::OsProfile;
+use crate::profile::{OsProfile, SynOption};
 use crate::{Error, Result};
 
 /// Ethernet header length.
@@ -22,12 +22,17 @@ pub const ETHERTYPE_IPV4: u16 = 0x0800;
 /// IP protocol number for TCP.
 pub const PROTO_TCP: u8 = 6;
 
-/// TCP option bytes on a SYN when timestamps are negotiated:
-/// MSS(4) + SACK-permitted(2) + timestamps(10) + NOP(1) + window scale(3).
-const SYN_OPTS_TS: usize = 20;
-/// TCP option bytes on a SYN without timestamps, in the order Windows emits:
-/// MSS(4) + NOP(1) + window scale(3) + NOP(1) + NOP(1) + SACK-permitted(2).
-const SYN_OPTS_NO_TS: usize = 12;
+/// The most a TCP header can be, option block included.
+///
+/// The data offset counts 32-bit words in four bits, so fifteen words.
+const MAX_TCP_HEADER: usize = 60;
+
+/// The most TCP option bytes any profile puts on a SYN.
+///
+/// Every layout in [`crate::profile`] comes to twenty, and a test holds them
+/// there; this exists so buffer sizing does not depend on which profile is in
+/// use.
+const SYN_OPTS_MAX: usize = 20;
 /// TCP option bytes on a non-SYN segment with timestamps: NOP + NOP + TS(10).
 const DATA_OPTS_TS: usize = 12;
 
@@ -136,11 +141,17 @@ pub struct Fields {
 #[must_use]
 pub const fn option_len(kind: Kind, profile: &OsProfile) -> usize {
     if kind.is_syn() {
-        if profile.timestamps {
-            SYN_OPTS_TS
-        } else {
-            SYN_OPTS_NO_TS
+        let mut total = 0;
+        let mut i = 0;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "a const fn cannot call get(); the bound is the slice's own length"
+        )]
+        while i < profile.syn_options.len() {
+            total += profile.syn_options[i].bytes();
+            i += 1;
         }
+        total
     } else if profile.timestamps {
         DATA_OPTS_TS
     } else {
@@ -155,7 +166,7 @@ pub const fn packet_len(kind: Kind, profile: &OsProfile, payload_len: usize) -> 
 }
 
 /// The largest header overhead any segment can have, for buffer sizing.
-pub const MAX_OVERHEAD: usize = IPV4_LEN + TCP_LEN + SYN_OPTS_TS;
+pub const MAX_OVERHEAD: usize = IPV4_LEN + TCP_LEN + SYN_OPTS_MAX;
 
 /// A bounds-checked forward writer.
 ///
@@ -228,6 +239,13 @@ pub fn emit_parts(
     let payload_len: usize = parts.iter().map(|p| p.len()).sum();
     let opts = option_len(kind, profile);
     let tcp_total = TCP_LEN + opts;
+    // Checked rather than assumed, because the profile is public and anything
+    // can build one: the data offset counts words and has four bits, so a
+    // block that is not a whole number of words, or a header past sixty bytes,
+    // cannot be described at all.
+    if !opts.is_multiple_of(4) || tcp_total > MAX_TCP_HEADER {
+        return Err(Error::Options { len: opts });
+    }
     let total = IPV4_LEN + tcp_total + payload_len;
     if out.len() < total {
         return Err(Error::Short {
@@ -273,7 +291,15 @@ pub fn emit_parts(
         c.u16(0)?; // urgent pointer
 
         write_options(&mut c, kind, profile, fields)?;
-        debug_assert_eq!(c.pos, tcp_total);
+        // A real check rather than a debug one. The length is derived twice --
+        // once by `option_len` to size the header and reserve the space, once
+        // by the writer filling it -- and the two drifting apart in a release
+        // build is not a cosmetic bug: a writer that fills less than was
+        // reserved leaves whatever the last packet left in a buffer these
+        // reuse, on the wire, inside the option block.
+        if c.pos != tcp_total {
+            return Err(Error::Options { len: opts });
+        }
         for part in parts {
             c.put(part)?;
         }
@@ -303,38 +329,100 @@ pub fn emit_parts(
     Ok(total)
 }
 
+/// The IPv4 Identification for a packet a connection owns.
+///
+/// Counted from `base` where the profile counts, because that is what a stack
+/// with a socket behind the packet does and because consecutive packets of one
+/// flow are where an observer can see the difference between counting and not.
+/// `base` is per connection, so nothing joins two of them: a single counter
+/// spanning every peer would be a stronger identifier than anything else on
+/// this wire, which is the mistake the scheme this borrows from makes.
+#[must_use]
+pub fn ip_id(profile: &OsProfile, base: u32, counter: u32) -> u16 {
+    match profile.ip_id {
+        crate::profile::IpId::PerConnection => {
+            // The shift leaves 16 significant bits, so the narrowing is exact.
+            let start = u16::try_from(base.wrapping_mul(0x9E37_79B9) >> 16).unwrap_or(0);
+            // Wrapping at sixteen bits is what the field does and what the
+            // kernel's own counter does with it.
+            start.wrapping_add(u16::try_from(counter & 0xFFFF).unwrap_or(0))
+        }
+        crate::profile::IpId::Random => unpredictable_ip_id(counter),
+    }
+}
+
+/// The IPv4 Identification for a packet no connection owns.
+///
+/// A listener's reply, and the one place a profile that counts writes zero:
+/// there is no socket to count from, which is the kernel's condition for it and
+/// is what nmap reads off a SYN+ACK as `TI=Z`. Only while Don't Fragment is
+/// set, again following the kernel, because a shared zero across packets a hop
+/// may split gets their fragments reassembled into each other.
+#[must_use]
+pub fn unconnected_ip_id(profile: &OsProfile, dont_fragment: bool, entropy: u32) -> u16 {
+    if profile.ip_id == crate::profile::IpId::PerConnection && dont_fragment {
+        return 0;
+    }
+    unpredictable_ip_id(entropy)
+}
+
+/// Knuth's multiplicative hash: uniform-looking to an observer and one multiply
+/// to compute.
+///
+/// Public for the raw-IP carrier, which models no socket either way. What a
+/// kernel's own encapsulation path writes in this field was not established
+/// here, so rather than guess at a third rule those shells keep the
+/// unpredictable value they have always emitted.
+///
+/// Never zero. The counter starts at zero on every connection and the bare
+/// hash of zero is zero, so the first packet of every flow carried a zero
+/// Identification -- which for a profile that randomises is the one value it
+/// must not write, since a zero alongside Don't Fragment is a quirk a
+/// classifier reads as a different stack. Offsetting first keeps the first
+/// packet out of that case and the floor covers the one remaining input that
+/// hashes to it.
+#[must_use]
+pub fn unpredictable_ip_id(entropy: u32) -> u16 {
+    // The shift leaves 16 significant bits, so the narrowing is exact.
+    let v = u16::try_from(entropy.wrapping_add(0x9E37_79B9).wrapping_mul(0x9E37_79B9) >> 16)
+        .unwrap_or(1);
+    v.max(1)
+}
+
 /// Writes the TCP option block for this kind and profile.
+///
+/// Walks the profile's layout, so the order on the wire is the order the
+/// profile declares and nothing here knows which stack it is imitating.
 fn write_options(c: &mut Cursor<'_>, kind: Kind, profile: &OsProfile, f: &Fields) -> Result<()> {
     if kind.is_syn() {
-        if profile.timestamps {
-            // MSS, SACK-permitted, timestamps, NOP, window scale.
-            c.u8(2)?;
-            c.u8(4)?;
-            c.u16(profile.mss)?;
-            c.u8(4)?;
-            c.u8(2)?;
-            c.u8(8)?;
-            c.u8(10)?;
-            c.u32(f.ts_val)?;
-            // A SYN has nothing to echo; SYN+ACK echoes the peer's SYN.
-            c.u32(if kind == Kind::SynAck { f.ts_ecr } else { 0 })?;
-            c.u8(1)?;
-            c.u8(3)?;
-            c.u8(3)?;
-            c.u8(profile.window_scale)?;
-        } else {
-            // MSS, NOP, window scale, NOP, NOP, SACK-permitted.
-            c.u8(2)?;
-            c.u8(4)?;
-            c.u16(profile.mss)?;
-            c.u8(1)?;
-            c.u8(3)?;
-            c.u8(3)?;
-            c.u8(profile.window_scale)?;
-            c.u8(1)?;
-            c.u8(1)?;
-            c.u8(4)?;
-            c.u8(2)?;
+        for opt in profile.syn_options {
+            match opt {
+                SynOption::Mss => {
+                    c.u8(2)?;
+                    c.u8(4)?;
+                    c.u16(profile.mss)?;
+                }
+                SynOption::SackPermitted => {
+                    c.u8(4)?;
+                    c.u8(2)?;
+                }
+                SynOption::Timestamps => {
+                    c.u8(8)?;
+                    c.u8(10)?;
+                    c.u32(f.ts_val)?;
+                    // A SYN has nothing to echo; SYN+ACK echoes the peer's SYN.
+                    c.u32(if kind == Kind::SynAck { f.ts_ecr } else { 0 })?;
+                }
+                SynOption::Nop => c.u8(1)?,
+                SynOption::EndOfList => c.u8(0)?,
+                SynOption::WindowScale => {
+                    c.u8(3)?;
+                    c.u8(3)?;
+                    // A layout carrying the option alongside no scale factor is
+                    // refused by a test rather than handled here.
+                    c.u8(profile.window_scale.unwrap_or(0))?;
+                }
+            }
         }
     } else if profile.timestamps {
         c.u8(1)?;
@@ -524,7 +612,7 @@ mod tests {
     #![allow(clippy::indexing_slicing)]
 
     use super::*;
-    use crate::profile::{ANDROID_14, LINUX_6, WINDOWS_11};
+    use crate::profile::{self, ANDROID_14, LINUX_6, WINDOWS_11};
 
     fn fields() -> Fields {
         Fields {
@@ -549,14 +637,14 @@ mod tests {
 
     #[test]
     fn emitted_lengths_match_the_predicted_ones() {
-        for profile in [LINUX_6, WINDOWS_11, ANDROID_14] {
+        for profile in profile::ALL {
             for kind in [Kind::Syn, Kind::SynAck, Kind::Ack, Kind::Data, Kind::Fin] {
                 for payload_len in [0usize, 1, 100, 1400] {
                     let payload = vec![0x5A; payload_len];
-                    let packet = emit_vec(kind, &profile, &payload);
+                    let packet = emit_vec(kind, profile, &payload);
                     assert_eq!(
                         packet.len(),
-                        packet_len(kind, &profile, payload_len),
+                        packet_len(kind, profile, payload_len),
                         "{} {kind:?} with {payload_len} bytes",
                         profile.name
                     );
@@ -692,7 +780,119 @@ mod tests {
         // Window scale is the final option in the timestamps layout.
         assert_eq!(opts[17], 3);
         assert_eq!(opts[18], 3);
-        assert_eq!(opts[19], LINUX_6.window_scale);
+        assert_eq!(opts[19], LINUX_6.window_scale.expect("linux scales"));
+    }
+
+    #[test]
+    fn no_layout_outgrows_the_space_reserved_for_it() {
+        // MAX_OVERHEAD sizes the datapath's buffers and the inner MTU is
+        // derived from it, so a profile with a longer option block than this
+        // would not merely look wrong: its SYN would fail to emit, and the MTU
+        // would have been computed from a smaller header than the one sent.
+        for p in profile::ALL {
+            for kind in [Kind::Syn, Kind::SynAck, Kind::Data] {
+                let len = option_len(kind, p);
+                assert!(
+                    len <= SYN_OPTS_MAX,
+                    "{} {kind:?} wants {len} option bytes, more than the {SYN_OPTS_MAX} reserved",
+                    p.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_profile_s_syn_options_are_the_bytes_they_were_before() {
+        // Written out rather than derived from `syn_options`, because a test
+        // that reads the declaration proves only that the writer agrees with
+        // it: transposing two entries of a layout would change the wire and
+        // pass every other test here. These were taken from `tcpdump`'s own
+        // decoding of an emitted SYN, checked against the matching nmap entry.
+        //
+        // `fields()` supplies ts_val 0x00112233, and a SYN echoes nothing.
+        let golden = [
+            // MSS 1460, SACK, timestamp, NOP, window scale 7.
+            ("linux-6", "020405b40402080a001122330000000001030307"),
+            // MSS, NOP, window scale 8, NOP, NOP, SACK.
+            ("windows-11", "020405b40103030801010402"),
+            ("android-14", "020405b40402080a001122330000000001030308"),
+            ("routeros-6", "020405b40402080a001122330000000001030304"),
+            // MSS, SACK, NOP, NOP, timestamp, end-of-list twice.
+            ("ios-15", "020405b404020101080a00112233000000000000"),
+        ];
+        assert_eq!(golden.len(), profile::ALL.len(), "a profile has no golden");
+        for (name, want) in golden {
+            let p = profile::by_name(name).expect("named");
+            let packet = emit_vec(Kind::Syn, &p, b"");
+            let got: String = packet[IPV4_LEN + TCP_LEN..]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_layout_no_header_could_describe_is_refused() {
+        // The types are public and anything can build a profile. A block that
+        // is not a whole number of 32-bit words cannot be stated in the data
+        // offset, so emitting it would mean a length field disagreeing with
+        // the bytes beside it -- which the far end reads as a frame starting
+        // in the wrong place, every packet, with only a counter to show it.
+        let bad = OsProfile {
+            syn_options: &[SynOption::Mss, SynOption::SackPermitted],
+            ..LINUX_6
+        };
+        let mut buf = [0u8; MAX_OVERHEAD];
+        assert!(matches!(
+            emit(Kind::Syn, &bad, &fields(), b"", &mut buf),
+            Err(Error::Options { len: 6 })
+        ));
+
+        // And the same for one that would not fit a header at all.
+        let huge: &[SynOption] = &[SynOption::Timestamps; 8];
+        let bad = OsProfile {
+            syn_options: huge,
+            ..LINUX_6
+        };
+        let mut buf = [0u8; 256];
+        assert!(matches!(
+            emit(Kind::Syn, &bad, &fields(), b"", &mut buf),
+            Err(Error::Options { len: 80 })
+        ));
+    }
+
+    #[test]
+    fn a_syn_carries_exactly_the_layout_its_profile_declares() {
+        for profile in profile::ALL {
+            let packet = emit_vec(Kind::Syn, profile, b"");
+            let opts = &packet[IPV4_LEN + TCP_LEN..];
+            let mut at = 0;
+            for want in profile.syn_options {
+                let expected = match want {
+                    SynOption::EndOfList => 0,
+                    SynOption::Nop => 1,
+                    SynOption::Mss => 2,
+                    SynOption::WindowScale => 3,
+                    SynOption::SackPermitted => 4,
+                    SynOption::Timestamps => 8,
+                };
+                assert_eq!(opts[at], expected, "{} at byte {at}", profile.name);
+                // Padding is one byte and states no length; everything else
+                // carries its own, and a wrong one desynchronises every option
+                // after it.
+                if !matches!(want, SynOption::Nop | SynOption::EndOfList) {
+                    assert_eq!(
+                        usize::from(opts[at + 1]),
+                        want.bytes(),
+                        "{} length at byte {at}",
+                        profile.name
+                    );
+                }
+                at += want.bytes();
+            }
+            assert_eq!(at, opts.len(), "{} has bytes left over", profile.name);
+        }
     }
 
     #[test]

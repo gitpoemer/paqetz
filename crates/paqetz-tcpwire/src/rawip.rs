@@ -267,7 +267,7 @@ impl Carrier {
         // peer is a single monotonic sequence spanning all of them, which is a
         // stronger identifier than anything else on the wire here.
         self.counter = self.counter.wrapping_add(1);
-        let ip_id = u16::try_from(self.counter.wrapping_mul(0x9E37_79B9) >> 16).unwrap_or(0);
+        let ip_id = segment::unpredictable_ip_id(self.counter);
 
         {
             let mut c = segment::Cursor::new(out);
@@ -510,13 +510,24 @@ mod tests {
 
     fn echoing(shell: Shell, echo: Echo) -> Carrier {
         Carrier::new(Config {
+            echo,
+            ..config(shell)
+        })
+    }
+
+    fn config(shell: Shell) -> Config {
+        Config {
             local: Ipv4Addr::new(10, 0, 0, 1),
             remote: Ipv4Addr::new(203, 0, 113, 5),
             profile: crate::profile::LINUX_6,
             shell,
             dont_fragment: true,
-            echo,
-        })
+            echo: Echo {
+                reply: false,
+                id: 40_000,
+                seq: 1,
+            },
+        }
     }
 
     /// Wraps an emitted packet in an Ethernet header, as capture would see it.
@@ -687,6 +698,12 @@ mod tests {
         // One counter for every peer would be a single monotonic sequence
         // spanning all of them -- a stronger identifier than anything else on
         // this wire, and the mistake the scheme this borrows from makes.
+        //
+        // Unpredictable whatever the profile says, unlike the fake-TCP
+        // carrier's: these shells model no socket either way, and what a
+        // kernel's own encapsulation path writes here was not established, so
+        // they keep what they have always emitted rather than take a third
+        // rule on faith.
         let mut c = carrier();
         let mut out = vec![0u8; 200];
         let mut seen = Vec::new();

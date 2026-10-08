@@ -2816,7 +2816,11 @@ impl Tunnel {
 
         let private = &self.cfg.interface.private_key;
         let isn = noise::syn_ack_isn(private, seg.seq, (seg.src.0.octets(), seg.src.1));
-        let ts = paqetz_tcpwire::endpoint::timestamp(self.responder_clock(seg.src), now);
+        let ts = paqetz_tcpwire::endpoint::timestamp(
+            self.responder_clock(seg.src),
+            now,
+            self.cfg.interface.profile.ts_hz,
+        );
         let df = self.cfg.interface.fragment == crate::config::Fragment::Never;
         let n = paqetz_tcpwire::endpoint::answer_syn(
             &self.cfg.interface.profile,

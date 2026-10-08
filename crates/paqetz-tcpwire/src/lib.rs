@@ -11,9 +11,16 @@
 //!
 //! # What was carried over from paqet, and what was fixed
 //!
-//! Kept, because they were right: varying IP Identification, and echoing the
-//! peer's observed TCP timestamp so a middlebox checking timestamp reciprocity
-//! sees real semantics.
+//! Kept, because it was right: echoing the peer's observed TCP timestamp, so a
+//! middlebox checking timestamp reciprocity sees real semantics.
+//!
+//! The IP Identification was varied on every packet, which is close but not
+//! what the stacks it claimed to be do: Linux and Windows keep a counter on the
+//! connection, so consecutive packets of one flow differ by one rather than
+//! looking unrelated, and only a reply no connection owns gets a zero. It now
+//! follows the profile, like everything else at that layer, and the counter is
+//! per connection -- one across every peer would be a stronger identifier than
+//! anything else on this wire.
 //!
 //! Fixed, because each was a signature:
 //!
@@ -64,6 +71,20 @@ pub enum Error {
     #[error("packet of {len} bytes exceeds what IPv4 can express")]
     TooLong {
         /// The offending length.
+        len: usize,
+    },
+
+    /// A profile's option layout cannot be written into a TCP header.
+    ///
+    /// The header states its own length in 32-bit words and has four bits to
+    /// do it in, so an option block has to be a multiple of four bytes and the
+    /// header has to come to sixty or less. A layout that is neither would
+    /// otherwise be written with a length field that disagrees with the bytes
+    /// beside it, which the far end reads as the frame starting in the wrong
+    /// place.
+    #[error("TCP options of {len} bytes cannot be expressed in a header")]
+    Options {
+        /// The offending option-block length.
         len: usize,
     },
 

@@ -445,6 +445,72 @@ the far end is paqetz, so the decoy is simply the first bytes of the stream at
 the numbers they belong at. A filter that validates sequence numbers reads it
 just as one that does not.
 
+### What the stack claims to be
+
+Every packet carries a handful of fields a sender chooses once and then never
+varies: the initial TTL, the advertised window, which TCP options a SYN offers
+and in what order, how fast the timestamp clock runs, whether the IPv4
+Identification is counted or random. Together they are what
+`p0f` reads and what `nmap` matches, and a flow whose fields belong to no real
+stack is a flow that stands out for that alone. `profile` picks whose they are:
+
+```toml
+# under [tunnel.interface], on both hosts
+profile = "routeros-6"     # MikroTik RouterOS 6.x
+# profile = "ios-15"       # Cisco IOS 15.x
+# profile = "linux-6"      # the default
+# profile = "windows-11"
+# profile = "android-14"
+```
+
+Both ends want the same one. A flow whose two halves claim different stacks is
+stranger than either claim.
+
+The two device profiles are there for a path where a tunnel between two routers
+is ordinary traffic and a tunnel between two hosts is not. `routeros-6` is
+Linux's option layout with a router's numbers: a window scale of 4, an initial
+window of ten segments, and a 100 Hz timestamp clock, which is the kernel
+`CONFIG_HZ` of the embedded builds RouterOS ships. `ios-15` is further from
+everything else here, and is the one worth knowing the shape of:
+
+| | `linux-6` | `ios-15` |
+| --- | --- | --- |
+| initial TTL | 64 | 255 |
+| SYN window | 64240 | 4128 |
+| window scale | 7 | not offered |
+| option order | MSS, SACK, TS, NOP, scale | MSS, SACK, NOP, NOP, TS, EOL, EOL |
+| Don't Fragment | set | clear |
+
+Two of those have consequences worth stating. Offering no window scale means
+the window on the wire is the whole window, so it can never exceed 65535
+however much is in flight. And IOS does not set Don't Fragment, which used to
+be a setting of its own here: **a profile now brings the settings its device
+implies,** so naming `ios-15` clears the bit by itself, and clearing it caps
+the inner MTU at a size no hop needs to split, around 1190 rather than around
+1395. Nobody naming a Cisco has to know that follows.
+
+`fragment` is still writable, in both directions, because clearing the bit is
+also something done deliberately for a path whose inspection dislikes it, and
+only your file knows whether that is why. Writing the one the profile would not
+have chosen is kept, and said out loud in the log at start-up and in
+`paqetz doctor`, with what it costs.
+
+One combination is refused rather than noted: a cleared Don't Fragment caps the
+MTU below 1280, and IPv6 inside the tunnel needs at least that, so `ios-15` and
+`address6` cannot both be had. The refusal names the profile as the reason.
+
+The port is the other half, and it needs no feature: a MikroTik is recognised by
+Winbox on 8291 and its API on 8728, so `listen_port = 8291` is the cheapest
+thing in this document. It does not combine with `spoof_sni`, though: Winbox
+does not speak TLS, so a flow on 8291 that opens with a ClientHello is lying in
+two directions at once. Pick one disguise -- 443 with a name, or a device port
+without one. The profile goes with either.
+
+What a profile cannot do is answer anything. Nothing here listens except to the
+peer the configuration names, so a scan of that port is met with silence rather
+than a Winbox handshake, and a device identity invites exactly the scanning that
+identity attracts. It is a claim about a flow, not a disguise for a host.
+
 ### When the path will not carry TCP at all
 
 Three carriers drop TCP entirely. Which one a path carries is a property of the

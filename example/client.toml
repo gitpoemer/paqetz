@@ -18,8 +18,14 @@ tunnel_address = "10.7.0.1"
 # --- Everything below is optional. The defaults are what you want. ---
 
 # Which operating system the carrier should resemble on the wire. Affects TTL,
-# MSS, window scale, window, and whether TCP timestamps are negotiated.
-# One of: linux-6 (default), windows-11, android-14.
+# MSS, window scale, window, the order of the TCP options on a SYN, the
+# timestamp clock rate, and the IPv4 Identification. Both ends want the same
+# one. One of: linux-6 (default), windows-11, android-14, routeros-6, ios-15.
+#
+# The last two are router stacks, taken from nmap's fingerprint database, for a
+# path where a tunnel between two routers is ordinary and one between two hosts
+# is not. A profile also brings the settings its device implies: ios-15 clears
+# Don't Fragment, so it sets `fragment` for you, and that caps the inner MTU.
 #profile = "linux-6"
 
 # Whether the carrier performs a synthetic TCP handshake. "midstream" (default)

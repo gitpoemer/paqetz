@@ -9,6 +9,8 @@
 #   CARRIER=midstream-fh ./scripts/test-e2e.sh # one that announces it, and goes on
 #   CARRIER=icmp ./scripts/test-e2e.sh     # pings, with the identifier moving
 #   SPOOF_SNI=www.cloudflare.com ./scripts/test-e2e.sh  # with a decoy handshake
+#   PROFILE=ios-15 CARRIER=handshake ./scripts/test-e2e.sh  # as a Cisco router
+#   PROFILE=routeros-6 CARRIER=handshake ./scripts/test-e2e.sh  # as a MikroTik
 #   CARRIER=rawip PROTO=143 ./scripts/test-e2e.sh
 #   DATAPATH=simple ./scripts/test-e2e.sh
 #
@@ -77,6 +79,13 @@ CLI_PUB=$(echo "${cli_keys}"  | awk -F'"' '/public/  {print $2}')
 CARRIER=${CARRIER:-midstream}
 PROTO=${PROTO:-143}
 
+# Written only when asked for, and then on both ends: a fingerprint only holds
+# together if both halves of the flow claim the same stack.
+PROFILE_LINE=""
+if [[ -n ${PROFILE:-} ]]; then
+    PROFILE_LINE="profile = \"${PROFILE}\""
+fi
+
 # Written only when asked for, and then on both ends: one asks, one answers.
 SPOOF=""
 if [[ -n ${SPOOF_SNI:-} ]]; then
@@ -98,6 +107,7 @@ device = "pq-srv"
 carrier = "${CARRIER}"
 ${CARRIER_PROTO}
 ${SPOOF}
+${PROFILE_LINE}
 datapath = "${DATAPATH:-batched}"
 health_interval = 2
 
@@ -122,6 +132,7 @@ device = "pq-cli"
 carrier = "${CARRIER}"
 ${CARRIER_PROTO}
 ${SPOOF}
+${PROFILE_LINE}
 datapath = "${DATAPATH}"
 health_interval = 2
 persistent_keepalive = 5
@@ -670,6 +681,56 @@ if [[ -s ${WORK}/wire.pcap ]]; then
             ok "no SYN was emitted on an open connection"
         else
             bad "${syns} SYN segments were emitted on an open connection"
+        fi
+    fi
+
+    # The profile, where one was asked for. These are the fields nmap and p0f
+    # read, so a profile that does not put them on the wire is a profile that
+    # names a device and resembles nothing.
+    if [[ -n ${PROFILE:-} && ${CARRIER} != icmp ]]; then
+        case ${PROFILE} in
+            ios-15) want_ttl=255 want_win=4128 want_scale="" ;;
+            routeros-6) want_ttl=64 want_win=14600 want_scale="wscale 4" ;;
+            *) want_ttl="" ;;
+        esac
+        if [[ -n ${want_ttl} ]]; then
+            # Ours only: the capture also holds the peer's packets, and both
+            # ends run the same profile, so either direction will do -- but
+            # anything the kernel sent (an ICMP report, an ARP) would not.
+            ttls=$(sudo tcpdump -r "${WORK}/wire.pcap" -n -v 2>/dev/null |
+                grep -oE "ttl [0-9]+" | sort -u | tr '\n' ' ')
+            if [[ ${ttls} == "ttl ${want_ttl} " ]]; then
+                ok "every packet carries the profile's TTL of ${want_ttl}"
+            else
+                bad "the capture holds ${ttls}, not ttl ${want_ttl} alone"
+            fi
+
+            # The SYN is where the window and the options are read from, so
+            # this only applies to a carrier that sends one -- and it is sent
+            # once, at the start, which is what `opening.pcap` was there to
+            # catch.
+            syn_from="${WORK}/wire.pcap"
+            if [[ -s ${WORK}/opening.pcap ]]; then
+                syn_from="${WORK}/opening.pcap"
+            fi
+            syn=$(sudo tcpdump -r "${syn_from}" -n -v \
+                "tcp[tcpflags] & tcp-syn != 0" 2>/dev/null | grep -m1 "options" || true)
+            if [[ -z ${syn} ]]; then
+                ok "no SYN to read a window from under carrier ${CARRIER}"
+            elif [[ ${syn} == *"win ${want_win}"* ]]; then
+                ok "the SYN advertises the profile's window of ${want_win}"
+            else
+                bad "the SYN is not ${want_win}: ${syn}"
+            fi
+            if [[ -n ${syn} ]]; then
+                if [[ -z ${want_scale} && ${syn} != *wscale* ]]; then
+                    ok "the SYN offers no window scale, as the profile says"
+                elif [[ -n ${want_scale} && ${syn} == *"${want_scale}"* ]]; then
+                    ok "the SYN offers ${want_scale}"
+                else
+                    bad "the window scale is wrong: ${syn}"
+                fi
+            fi
         fi
     fi
 else

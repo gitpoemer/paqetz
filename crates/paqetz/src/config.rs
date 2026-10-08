@@ -465,6 +465,18 @@ impl Shape {
     }
 }
 
+/// The profiles whose devices do, or do not, set Don't Fragment.
+///
+/// Named from the list rather than written out, so a profile added later turns
+/// up in the advice without anyone remembering to put it there.
+fn named(sets_df: bool) -> Vec<&'static str> {
+    paqetz_tcpwire::profile::ALL
+        .iter()
+        .filter(|p| p.dont_fragment == sets_df)
+        .map(|p| p.name)
+        .collect()
+}
+
 /// What the carrier does about a hop too small to pass a packet whole.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum Fragment {
@@ -1634,10 +1646,26 @@ impl Config {
             ));
         }
 
-        let fragment = match iface.fragment.as_deref().unwrap_or("never") {
-            "never" => Fragment::Never,
-            "path" => Fragment::Path,
-            other => {
+        // The profile decides this bit when nothing else does. Don't Fragment
+        // is on every packet rather than in a field a fingerprint is read from
+        // now and then, so a flow that disagrees with the device it claims
+        // contradicts the profile everywhere at once -- and an operator naming
+        // a device should not have to know which other setting that device
+        // implies. Still writable, because clearing the bit is also a thing
+        // done deliberately for a path whose inspection dislikes it, and a
+        // profile is not a reason to take that away. A file that writes the
+        // other one is told what it costs rather than overridden.
+        let wants_df = if profile.dont_fragment {
+            Fragment::Never
+        } else {
+            Fragment::Path
+        };
+        let asked_fragment = iface.fragment.as_deref();
+        let fragment = match asked_fragment {
+            None => wants_df,
+            Some("never") => Fragment::Never,
+            Some("path") => Fragment::Path,
+            Some(other) => {
                 return Err(invalid(
                     "interface.fragment",
                     format!("expected \"never\" or \"path\", got {other:?}"),
@@ -1713,10 +1741,70 @@ impl Config {
         }
 
         // After the carrier, because the room left for an inner packet is
-        // whatever its outer header does not take -- and after `fragment`,
-        // because clearing Don't Fragment is only safe below a size no hop
-        // needs to split.
+        // whatever its outer header does not take.
         let cap = shape.fragment_free_mtu(spoof_records);
+
+        // Said here rather than where it was decided, because what it costs is
+        // the MTU and that is not known until the carrier is.
+        //
+        // Both ways round. A file that disagrees with the profile is told what
+        // it is giving up; a file that said nothing and had the profile choose
+        // for it is told too, because that is the case with a consequence --
+        // the inner MTU moves, both ends have to agree on the profile for
+        // their MTUs to match, and an operator who wrote one line would
+        // otherwise find that out from a capture.
+        if fragment != wants_df {
+            notes.push(Note {
+                what: "fragment".to_owned(),
+                detail: if profile.dont_fragment {
+                    format!(
+                        "profile {:?} describes a device that sets Don't Fragment, and this file \
+                         clears it, so the bit disagrees with the rest of the profile on every \
+                         packet. Left as asked for: a path whose inspection dislikes the bit is \
+                         the reason to clear it, and only this file knows whether that is why",
+                        profile.name
+                    )
+                } else {
+                    format!(
+                        "profile {:?} describes a device that clears Don't Fragment, and this \
+                         file sets it, so the bit disagrees with the rest of the profile on \
+                         every packet. Left as asked for, and it buys the reports from a hop too \
+                         small to pass a packet whole, which a cleared bit gives up",
+                        profile.name
+                    )
+                },
+                remedy: format!(
+                    "drop the fragment line to follow the profile, which {}, or keep it and \
+                     name a profile whose device agrees: {:?} set the bit, {:?} clear it",
+                    if profile.dont_fragment {
+                        "sets the bit and leaves the inner MTU where it is".to_owned()
+                    } else {
+                        format!("clears the bit at an inner MTU of {cap}")
+                    },
+                    named(true),
+                    named(false),
+                ),
+            });
+        } else if asked_fragment.is_none() && fragment == Fragment::Path {
+            notes.push(Note {
+                what: "fragment".to_owned(),
+                detail: format!(
+                    "profile {:?} describes a device that clears Don't Fragment, so fragment = \
+                     \"path\" follows from naming it, and with it an inner MTU of {cap} rather \
+                     than the usual {}. Nothing here reassembles what a hop splits, because the \
+                     capture socket sees the pieces before the kernel joins them, and nothing \
+                     reports a hop too small either, since that report is what the bit asks for",
+                    profile.name,
+                    shape.default_mtu(spoof_records),
+                ),
+                remedy: format!(
+                    "nothing is wrong: this is what the profile implies. Both ends need the same \
+                     profile, or their MTUs differ. {:?} keep the bit and the larger MTU",
+                    named(true),
+                ),
+            });
+        }
+
         let mtu = iface.mtu.unwrap_or_else(|| match fragment {
             Fragment::Never => shape.default_mtu(spoof_records),
             Fragment::Path => cap,
@@ -1725,14 +1813,6 @@ impl Config {
             return Err(invalid(
                 "interface.mtu",
                 format!("{mtu} is outside the usable range 576-9000"),
-            ));
-        }
-        // IPv6 has no fragmentation on the path, so a link narrower than
-        // this floor is not one it runs over.
-        if address6.is_some() && mtu < 1280 {
-            return Err(invalid(
-                "interface.mtu",
-                format!("{mtu} is below 1280, the least a link carrying IPv6 may offer"),
             ));
         }
         // Lowered rather than refused. A configuration that worked yesterday
@@ -1751,6 +1831,27 @@ impl Config {
         } else {
             mtu
         };
+        // IPv6 has no fragmentation on the path, so a link narrower than this
+        // floor is not one it runs over. Checked after the cap rather than
+        // before it: the cap is what the device will actually carry, and
+        // checking the number the file asked for let an IPv6 tunnel through on
+        // a written MTU of 1400 that was then quietly lowered past the floor.
+        if address6.is_some() && mtu < 1280 {
+            return Err(invalid(
+                "interface.mtu",
+                if fragment == Fragment::Path && mtu == cap {
+                    format!(
+                        "{mtu} is below 1280, the least a link carrying IPv6 may offer: profile \
+                         {:?} clears Don't Fragment, which caps the inner MTU at {cap} because \
+                         nothing reassembles what a hop splits. IPv6 inside the tunnel and a \
+                         profile that clears the bit cannot both be had",
+                        profile.name
+                    )
+                } else {
+                    format!("{mtu} is below 1280, the least a link carrying IPv6 may offer")
+                },
+            ));
+        }
 
         // A connection seen to open is one a middlebox can track from its
         // first byte, and numbers that describe no stream would contradict
@@ -2486,6 +2587,90 @@ mod tests {
             Sequencing::Opaque,
             "a written choice stands"
         );
+    }
+
+    #[test]
+    fn a_device_profile_brings_the_settings_its_device_implies() {
+        // A router sets Don't Fragment, which is what the default was anyway.
+        let r = with_interface("profile = \"routeros-6\"").expect("parses");
+        assert_eq!(r.interface.profile.name, "routeros-6");
+        assert_eq!(r.interface.fragment, Fragment::Never);
+        assert!(r.interface.notes.iter().all(|n| n.what != "fragment"));
+
+        // IOS clears it, and nobody naming a Cisco should have to know that a
+        // second setting follows from it. So it follows, and the MTU with it.
+        let c = with_interface("profile = \"ios-15\"").expect("parses");
+        assert_eq!(c.interface.profile.name, "ios-15");
+        assert_eq!(c.interface.fragment, Fragment::Path);
+        assert_eq!(
+            c.interface.mtu,
+            c.interface.shape.fragment_free_mtu(false),
+            "a cleared bit is only safe below a size no hop needs to split"
+        );
+        // Said out loud even though nothing was overridden: this is the case
+        // with a consequence, since the MTU moved and both ends now have to
+        // agree on the profile for theirs to match.
+        let note = c
+            .interface
+            .notes
+            .iter()
+            .find(|n| n.what == "fragment")
+            .expect("a profile that moves the MTU says so");
+        assert!(
+            note.detail
+                .contains(&c.interface.shape.fragment_free_mtu(false).to_string()),
+            "{note:?}"
+        );
+        assert!(note.remedy.contains("Both ends need the same"), "{note:?}");
+
+        // Writing the other one is still allowed, in both directions, because
+        // a path whose inspection dislikes the bit is the reason to clear it
+        // and only the file knows whether that is why. Said out loud, since it
+        // disagrees with the profile on every packet.
+        for (lines, want) in [
+            (
+                "profile = \"ios-15\"\nfragment = \"never\"",
+                Fragment::Never,
+            ),
+            ("profile = \"linux-6\"\nfragment = \"path\"", Fragment::Path),
+        ] {
+            let c = with_interface(lines).expect("parses");
+            assert_eq!(c.interface.fragment, want, "{lines}");
+            let note = c
+                .interface
+                .notes
+                .iter()
+                .find(|n| n.what == "fragment")
+                .unwrap_or_else(|| panic!("{lines} should earn a word"));
+            assert!(note.remedy.contains("drop the fragment line"), "{note:?}");
+        }
+
+        // Both negotiate timestamps, so both can carry the decoy handshake on
+        // the carrier it belongs on.
+        for name in ["routeros-6", "ios-15"] {
+            with_interface(&format!(
+                "profile = {name:?}\ncarrier = \"handshake\"\nspoof_sni = \"www.example.com\""
+            ))
+            .unwrap_or_else(|e| panic!("{name} should carry a handshake: {e}"));
+        }
+    }
+
+    #[test]
+    fn ipv6_inside_cannot_have_a_profile_that_clears_dont_fragment() {
+        // The floor is 1280 and a cleared bit caps the MTU below it, so the
+        // two are not both available. Refused with the reason rather than with
+        // a bare number, because the number came from the profile.
+        let err = with_interface("profile = \"ios-15\"\naddress6 = \"fd00:7::2/64\"")
+            .expect_err("should refuse");
+        assert!(err.to_string().contains("ios-15"), "{err}");
+        assert!(err.to_string().contains("1280"), "{err}");
+
+        // And the floor is checked against the MTU that will actually be used:
+        // a written MTU above the floor but above the cap too was passing the
+        // check and then being lowered past it.
+        let err = with_interface("fragment = \"path\"\naddress6 = \"fd00:7::2/64\"\nmtu = 1400")
+            .expect_err("should refuse");
+        assert!(err.to_string().contains("1280"), "{err}");
     }
 
     #[test]
