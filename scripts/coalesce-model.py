@@ -47,18 +47,22 @@ BATCH = 32
 MAX_SEGMENTS = 45
 MAX_BYTES = 65535
 
-# Fitted to the two points `tun_ceiling` measured, as cost = copy + overhead/run:
-#   two measured points, supplied rather than baked in
-# which gives a per-write overhead that batching divides, and a per-byte copy
-# that it does not.
-# Supplied via --cost rather than baked in, because they describe a machine.
-OVERHEAD_US = 0.0
-COPY_US = 0.0
+# Run lengths are a property of the traffic and say nothing about the machine.
+# Turning one into a cost does, so the two figures that takes are supplied
+# rather than baked in: run `tun_ceiling plain` and `tun_ceiling uso` on the
+# host in question and pass what they report. Without them this reports run
+# lengths and writes per packet, which is most of the answer.
+BATCHED_AT = 40  # what `tun_ceiling uso` puts in one write
 
 
-def predicted_us(run: float) -> float:
-    """CPU per packet at a mean run length of `run`."""
-    return COPY_US + OVERHEAD_US / max(run, 1.0)
+def cost_model(one: float, many: float):
+    """Splits two measured points into a per-write overhead and a per-packet copy.
+
+    `cost = copy + overhead / run`, so a write that carries `BATCHED_AT`
+    packets divides the overhead that many ways and the copy not at all.
+    """
+    overhead = (one - many) / (1 - 1 / BATCHED_AT)
+    return one - overhead, overhead
 
 
 def read_pcap(path):
@@ -182,18 +186,22 @@ def runs(stream, loss, held, rng):
     return finished
 
 
-def report(label, lengths):
+def report(label, lengths, model):
     if not lengths:
         print(f"  {label:<22} no runs")
         return
     lengths.sort()
     mean = sum(lengths) / len(lengths)
     packets = sum(lengths)
-    # The figure that matters: writes per packet, and what that costs.
+    cost = ""
+    if model:
+        copy, overhead = model
+        cost = f"   {copy + overhead / max(mean, 1.0):.2f} us/pkt"
+    # The figure that matters without a cost model: writes per packet, which
+    # the saving is proportional to.
     print(
         f"  {label:<22} mean run {mean:5.1f}   median {lengths[len(lengths) // 2]:3d}"
-        f"   writes/pkt {len(lengths) / packets:.3f}"
-        f"   {predicted_us(mean):.2f} us/pkt"
+        f"   writes/pkt {len(lengths) / packets:.3f}{cost}"
     )
 
 
@@ -205,6 +213,14 @@ def main():
     ap.add_argument("--loss", type=float, nargs="+", default=[0, 0.5, 2])
     ap.add_argument("--packets", type=int, default=200_000)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument(
+        "--cost",
+        type=float,
+        nargs=2,
+        metavar=("ONE", "MANY"),
+        help="microseconds per packet from `tun_ceiling plain` and `tun_ceiling uso`, "
+        "measured on the host in question, which turns run lengths into a predicted cost",
+    )
     args = ap.parse_args()
     if not args.pcap and not args.synthetic:
         ap.error("give a pcap, or --synthetic")
@@ -213,9 +229,16 @@ def main():
     # rather than a header followed by an error.
     captured = read_pcap(args.pcap) if args.pcap else None
 
+    model = cost_model(*args.cost) if args.cost else None
+
     print()
-    print(f"cost model: {COPY_US:.3f} us per packet + {OVERHEAD_US:.3f} us per write")
-    print("            (from the two figures you passed)")
+    if model:
+        copy, overhead = model
+        print(f"cost model: {copy:.3f} us per packet + {overhead:.3f} us per write")
+        print("            (from the two figures you passed)")
+    else:
+        print("no cost model: pass --cost ONE MANY from `tun_ceiling` on the host")
+        print("               in question to turn run lengths into microseconds")
     print(f"batch {BATCH} from the wire, at most {MAX_SEGMENTS} segments per superpacket")
     print()
 
@@ -228,7 +251,7 @@ def main():
         for loss in args.loss:
             if captured:
                 rng = random.Random(args.seed)
-                report(f"{loss}% loss", runs(captured, loss / 100.0, held, rng))
+                report(f"{loss}% loss", runs(captured, loss / 100.0, held, rng), model)
             else:
                 for flows in args.flows:
                     rng = random.Random(args.seed)
@@ -236,6 +259,7 @@ def main():
                     report(
                         f"{flows} flow(s), {loss}% loss",
                         runs(stream, loss / 100.0, held, rng),
+                        model,
                     )
         print()
 

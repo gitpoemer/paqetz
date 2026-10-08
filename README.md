@@ -641,8 +641,8 @@ configuration without it:
 
 | | CPU | throughput |
 | --- | --- | --- |
-| with `transmit = "raw"` | -29% | +9% |
-| with `transmit = "afpacket"` | -31% | +12% |
+| with `transmit = "raw"` | −29% | +9% |
+| with `transmit = "afpacket"` | −31% | +12% |
 
 Both moving the right way at once is the signature of work removed rather than
 traded, and it matches what a microbenchmark of the TUN write alone predicted:
@@ -660,7 +660,8 @@ for no saving, and `paqetz doctor` says so.
 What it will not fix is a host that is slow per syscall to begin with. The same
 probe found a plain TUN write an order of magnitude more expensive on a
 contended VPS than on an idle machine, so if your throughput is short of what
-the path offers, measure before assuming any setting here is the answer.
+the path offers, measure before assuming any setting here is the answer:
+`cargo run --release -p paqetz-dp --example tun_ceiling -- plain` reports it.
 
 ### When the link itself is losing packets
 
