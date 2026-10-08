@@ -82,27 +82,24 @@ except (ValueError, KeyError, TypeError, ZeroDivisionError):
     print("")
 PYEOF
 
-# The median of the numbers on stdin, one per line, by column.
+# The median run among the lines on stdin, printed whole.
 #
-# A median rather than a mean: one run that lost its CPU to something else
-# should not drag the figure it is being compared against.
+# The median *row*, not a median of each column independently: those can come
+# from different runs, and a per-packet figure built from one run's packet
+# count and another run's CPU is not a measurement of anything. Ranked on the
+# first field, which is throughput for both modes.
 cat > "${WORK}/median.py" <<'PYEOF'
 import sys
 
 rows = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
+try:
+    rows.sort(key=lambda r: float(r[0]))
+except (ValueError, IndexError):
+    rows = []
 if not rows:
     print("n/a")
-    sys.exit()
-width = min(len(r) for r in rows)
-out = []
-for col in range(width):
-    try:
-        values = sorted(float(r[col]) for r in rows)
-    except ValueError:
-        print("n/a")
-        sys.exit()
-    out.append(values[len(values) // 2])
-print(" ".join(f"{v:.6f}" for v in out))
+else:
+    print(" ".join(rows[len(rows) // 2]))
 PYEOF
 
 echo "==> building"
@@ -196,7 +193,7 @@ EOF
     sleep 6
 
     if ! sudo ip netns exec "${CLI_NS}" ping -c2 -W3 "${SRV_INNER}" >/dev/null 2>&1; then
-        printf '  %-28s %s\n' "${label}" "tunnel did not come up"
+        printf '  %-29s %s\n' "${label}" "tunnel did not come up"
         sed 's/^/      /' "${WORK}/cli.log" | tail -3
         sudo pkill -INT -f "paqetz run -c ${WORK}/" 2>/dev/null
         sleep 1
@@ -254,7 +251,7 @@ EOF
                 $1 / 1e9, pps / 1000, $3, ($4 / t) * 1e6 / $2
         }')
 
-    printf '  %-28s TCP %-26s UDP %s\n' "${label}" "${tcp}" "${udp}"
+    printf '  %-29s TCP %-26s UDP %s\n' "${label}" "${tcp}" "${udp}"
 
     sudo pkill -INT -f "paqetz run -c ${WORK}/" 2>/dev/null
     sleep 2
