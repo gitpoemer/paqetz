@@ -25,6 +25,7 @@
 //! super-packets in userspace, which is several hundred lines of its own.
 
 pub mod bpf;
+pub mod gso;
 pub mod neigh;
 pub mod rx;
 pub mod sys;
