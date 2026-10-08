@@ -134,6 +134,19 @@ pub(crate) struct Interface {
     /// anything reading past the hello walks straight into. Five bytes per
     /// packet, off the inner MTU.
     pub(crate) spoof_records: bool,
+    /// Whether inbound packets are grouped into one write per run.
+    ///
+    /// Off by default. A TUN write is one packet however many buffers it is
+    /// gathered from, and there is no `sendmmsg` for a character device, so the
+    /// only way to hand over several at once is to hand over something the
+    /// kernel will segment itself. Writing forty packets at a time measured
+    /// about six times cheaper per packet than one at a time, and the write is
+    /// about a third of what the datapath spends per packet.
+    ///
+    /// Off rather than on because the frames it builds carry headers and a
+    /// partial checksum the kernel completes, and a mistake there is inner
+    /// traffic dropped in silence rather than an error anyone would see.
+    pub(crate) coalesce: bool,
     /// Everything about this tunnel worth saying but not worth refusing.
     pub(crate) notes: Vec<Note>,
     /// Whether to forward and translate the peer's traffic to the internet.
@@ -943,6 +956,7 @@ struct RawInterface {
     spoof_sni: Option<String>,
     #[serde(default)]
     spoof_records: Option<bool>,
+    coalesce: Option<bool>,
     #[serde(default)]
     manage_firewall: Option<bool>,
     #[serde(default)]
@@ -1740,6 +1754,23 @@ impl Config {
         // session nothing ever saw begin, which stands out more than the random
         // bytes they replaced -- so that combination is refused rather than
         // noted.
+        let coalesce = iface.coalesce.unwrap_or(false);
+        // One packet per read leaves nothing to group, so every run is one
+        // packet and pays a copy into a frame for no saving at all. Noted
+        // rather than refused: it is a slower tunnel, not a broken one, and
+        // the two settings are read in whichever order the file lists them.
+        if coalesce && iface.datapath.as_deref() == Some("simple") {
+            notes.push(Note {
+                what: "coalesce".to_owned(),
+                detail: "datapath \"simple\" reads one packet at a time, so there is never a \
+                         second packet to group with the first: every write holds one packet and \
+                         pays a copy into a frame for nothing"
+                    .to_owned(),
+                remedy: "datapath = \"batched\" is what gives it something to group, or drop \
+                         coalesce"
+                    .to_owned(),
+            });
+        }
         let spoof_records = iface.spoof_records.unwrap_or(spoof_sni.is_some());
         if spoof_records && spoof_sni.is_none() {
             return Err(invalid(
@@ -2077,6 +2108,7 @@ impl Config {
                 sequencing,
                 spoof_sni,
                 spoof_records,
+                coalesce,
                 notes,
                 datapath,
                 transmit,
@@ -2681,6 +2713,33 @@ mod tests {
         let err = with_interface("fragment = \"path\"\naddress6 = \"fd00:7::2/64\"\nmtu = 1400")
             .expect_err("should refuse");
         assert!(err.to_string().contains("1280"), "{err}");
+    }
+
+    #[test]
+    fn grouping_inbound_writes_is_off_unless_asked_for() {
+        assert!(
+            !Config::parse(CLIENT)
+                .expect("parse")
+                .into_only()
+                .expect("one tunnel")
+                .interface
+                .coalesce
+        );
+
+        let c = with_interface("coalesce = true\ndatapath = \"batched\"").expect("parses");
+        assert!(c.interface.coalesce);
+        assert!(c.interface.notes.iter().all(|n| n.what != "coalesce"));
+
+        // One packet per read has nothing to group with, so every write holds
+        // one packet and pays a copy for no saving.
+        let c = with_interface("coalesce = true\ndatapath = \"simple\"").expect("parses");
+        let note = c
+            .interface
+            .notes
+            .iter()
+            .find(|n| n.what == "coalesce")
+            .expect("said out loud");
+        assert!(note.remedy.contains("batched"), "{note:?}");
     }
 
     #[test]

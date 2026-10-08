@@ -145,6 +145,7 @@ pub(crate) fn run(path: &Path) -> bool {
             t.interface.datapath,
             t.interface.transmit,
             t.peer.endpoint.is_some(),
+            t.interface.coalesce,
         ));
         // What the file asked for that it cannot quite have. Reported here as
         // well as logged at start-up, because this is the command an operator
@@ -588,6 +589,7 @@ fn check_datapath(
     datapath: crate::config::Datapath,
     transmit: crate::config::TransmitPath,
     connects_out: bool,
+    coalesce: bool,
 ) -> Finding {
     use crate::config::TransmitPath;
 
@@ -611,9 +613,17 @@ fn check_datapath(
         TransmitPath::Raw => "raw",
         TransmitPath::AfPacket => "af_packet",
     };
+    // Said whether or not it is on, because it is the setting most likely to be
+    // believed active when it is not: it needs the batched datapath to have
+    // anything to group, and a device opened for it at start-up.
+    let grouping = if coalesce {
+        ", grouping inbound packets into one write"
+    } else {
+        ""
+    };
     Finding::pass(
         "datapath",
-        format!("datapath {datapath}, transmit {transmit}"),
+        format!("datapath {datapath}, transmit {transmit}{grouping}"),
     )
 }
 
@@ -910,21 +920,29 @@ mod tests {
         use crate::config::{Datapath, TransmitPath};
 
         // The end that connects out gets what it asked for.
-        let f = check_datapath(Datapath::Batched, TransmitPath::AfPacket, true);
+        let f = check_datapath(Datapath::Batched, TransmitPath::AfPacket, true, false);
         assert_eq!(f.verdict, Verdict::Pass, "{f:?}");
         assert!(f.detail.contains("batched"), "{f:?}");
         assert!(f.detail.contains("af_packet"), "{f:?}");
 
         // The end that waits cannot, and is told so rather than left to find
         // out from a benchmark.
-        let f = check_datapath(Datapath::Batched, TransmitPath::AfPacket, false);
+        let f = check_datapath(Datapath::Batched, TransmitPath::AfPacket, false, false);
         assert_eq!(f.verdict, Verdict::Warn, "{f:?}");
         assert!(f.detail.contains("will be"), "{f:?}");
+
+        // Grouping is said out loud when it is on, because it is the setting
+        // most likely to be believed active when it is not.
+        let f = check_datapath(Datapath::Batched, TransmitPath::Raw, true, true);
+        assert_eq!(f.verdict, Verdict::Pass, "{f:?}");
+        assert!(f.detail.contains("grouping"), "{f:?}");
+        let f = check_datapath(Datapath::Batched, TransmitPath::Raw, true, false);
+        assert!(!f.detail.contains("grouping"), "{f:?}");
 
         // And asking for nothing unusual says so without a warning, whichever
         // end it is.
         for connects_out in [true, false] {
-            let f = check_datapath(Datapath::Simple, TransmitPath::Raw, connects_out);
+            let f = check_datapath(Datapath::Simple, TransmitPath::Raw, connects_out, false);
             assert_eq!(f.verdict, Verdict::Pass, "{f:?}");
             assert!(f.detail.contains("simple"), "{f:?}");
             assert!(f.detail.contains("raw"), "{f:?}");

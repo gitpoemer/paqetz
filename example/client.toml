@@ -28,6 +28,19 @@ tunnel_address = "10.7.0.1"
 # Don't Fragment, so it sets `fragment` for you, and that caps the inner MTU.
 #profile = "linux-6"
 
+# Whether inbound packets are grouped into one write per run of a flow.
+#
+# Off. A TUN write is one packet however many buffers it is gathered from and
+# there is no `sendmmsg` for one, so the only way to hand the kernel several at
+# once is to hand it something it will segment itself. Writing forty packets at
+# a time measured about six times cheaper per packet than one at a time, and
+# the write was about a third of what the datapath spent per packet.
+#
+# Needs datapath = "batched" to have anything to group, and is off by default
+# because the frames carry headers and a partial checksum the kernel completes:
+# a mistake there is traffic dropped in silence rather than an error.
+#coalesce = false
+
 # Whether the carrier performs a synthetic TCP handshake. "midstream" (default)
 # never emits a SYN, which is how paqet behaves and keeps the responder from
 # answering anything it cannot authenticate. See docs/decisions/D14.

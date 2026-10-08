@@ -9,6 +9,7 @@
 #   CARRIER=midstream-fh ./scripts/test-e2e.sh # one that announces it, and goes on
 #   CARRIER=icmp ./scripts/test-e2e.sh     # pings, with the identifier moving
 #   SPOOF_SNI=www.cloudflare.com ./scripts/test-e2e.sh  # with a decoy handshake
+#   COALESCE=1 ./scripts/test-e2e.sh       # inbound packets grouped per write
 #   PROFILE=ios-15 CARRIER=handshake ./scripts/test-e2e.sh  # as a Cisco router
 #   PROFILE=routeros-6 CARRIER=handshake ./scripts/test-e2e.sh  # as a MikroTik
 #   CARRIER=rawip PROTO=143 ./scripts/test-e2e.sh
@@ -79,6 +80,15 @@ CLI_PUB=$(echo "${cli_keys}"  | awk -F'"' '/public/  {print $2}')
 CARRIER=${CARRIER:-midstream}
 PROTO=${PROTO:-143}
 
+# Written only when asked for, and on both ends, since each end coalesces what
+# it receives. This is the validation that matters for it: the frames it builds
+# carry headers and a partial checksum the kernel completes, and the only thing
+# that can say whether a real TCP receiver accepts them is a real TCP receiver.
+COALESCE_LINE=""
+if [[ -n ${COALESCE:-} ]]; then
+    COALESCE_LINE="coalesce = true"
+fi
+
 # Written only when asked for, and then on both ends: a fingerprint only holds
 # together if both halves of the flow claim the same stack.
 PROFILE_LINE=""
@@ -108,6 +118,7 @@ carrier = "${CARRIER}"
 ${CARRIER_PROTO}
 ${SPOOF}
 ${PROFILE_LINE}
+${COALESCE_LINE}
 datapath = "${DATAPATH:-batched}"
 health_interval = 2
 
@@ -133,6 +144,7 @@ carrier = "${CARRIER}"
 ${CARRIER_PROTO}
 ${SPOOF}
 ${PROFILE_LINE}
+${COALESCE_LINE}
 datapath = "${DATAPATH}"
 health_interval = 2
 persistent_keepalive = 5

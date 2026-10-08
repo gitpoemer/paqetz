@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use paqetz_core::noise::{self, Initiator, PendingResponder, Session};
 use paqetz_core::{Millis, PublicKey};
-use paqetz_dp::{AfPacketTx, MAX_FRAME, PacketRx, RawTx, Transmit, Tun, sys};
+use paqetz_dp::{AfPacketTx, MAX_FRAME, PacketRx, RawTx, Transmit, Tun, gso, sys};
 use paqetz_tcpwire::segment::{self, MAX_OVERHEAD};
 use paqetz_tcpwire::{Endpoint as Carrier, Role};
 
@@ -1175,6 +1175,12 @@ pub(crate) struct Tunnel {
     /// Seconds between status lines, which belongs to the process.
     health_interval: u64,
     tun: Arc<Tun>,
+    /// Inbound packets held until they can be written as one frame.
+    ///
+    /// Behind a mutex because the datapath holds the tunnel by `Arc`, and
+    /// uncontended because only the inbound thread ever takes it. Absent
+    /// unless `coalesce` asked for it, so nothing pays for it otherwise.
+    coalescer: Option<std::sync::Mutex<paqetz_dp::gso::Coalescer>>,
     rx: Arc<PacketRx>,
     tx: Arc<Transmit>,
     state: Arc<Mutex<PeerState>>,
@@ -1390,7 +1396,13 @@ impl Tunnel {
             outbound_interface(),
         )?;
 
-        let tun = Tun::create(&cfg.interface.device).map_err(|source| Error::Os {
+        let coalesce = cfg.interface.coalesce;
+        let tun = if coalesce {
+            Tun::create_segmented(&cfg.interface.device)
+        } else {
+            Tun::create(&cfg.interface.device)
+        }
+        .map_err(|source| Error::Os {
             context: format!("creating TUN device {}", cfg.interface.device),
             source,
         })?;
@@ -1485,6 +1497,7 @@ impl Tunnel {
             health_interval,
             label: None,
             tun: Arc::new(tun),
+            coalescer: coalesce.then(|| std::sync::Mutex::new(gso::Coalescer::default())),
             rx: Arc::new(rx),
             tx: Arc::new(tx),
             local: Mutex::new((local_ip, local_port)),
@@ -2426,6 +2439,12 @@ impl Tunnel {
                     self.note_inbound(&e);
                 }
             }
+            // Whatever the batch left held, before waiting on the next read.
+            // Held across a read, a run would wait on a packet that may never
+            // come -- and on an idle tunnel that wait is unbounded.
+            if let Err(e) = self.flush_inner() {
+                self.note_inbound(&e);
+            }
         }
     }
 
@@ -2613,6 +2632,12 @@ impl Tunnel {
                 continue;
             };
             if let Err(e) = self.handle_segment(&seg, &mut inner, &mut reply) {
+                self.note_inbound(&e);
+            }
+            // One packet per read here, so a run can never be more than one
+            // and this writes it immediately. Coalescing is worth nothing on
+            // this path, and the configuration says so.
+            if let Err(e) = self.flush_inner() {
                 self.note_inbound(&e);
             }
         }
@@ -3306,8 +3331,52 @@ impl Tunnel {
     }
 
     /// Writes a checked inner packet to the device.
+    ///
+    /// With `coalesce` on this does not write: the packet joins a run that
+    /// [`Self::flush_inner`] puts across in one syscall at the end of the
+    /// batch. A run that the arriving packet cannot join is written first, so
+    /// nothing is held longer than the packets it is being joined to.
     fn write_inner(&self, packet: &[u8]) -> Result<()> {
-        match self.tun.send(packet) {
+        let Some(held) = self.coalescer.as_ref() else {
+            return self.write_one(packet);
+        };
+        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.joins(packet) {
+            self.write_held(&mut held)?;
+        }
+        held.hold(packet);
+        Ok(())
+    }
+
+    /// Writes whatever the coalescer is holding, if anything.
+    ///
+    /// Called at the end of each batch from the wire, so a run never outlives
+    /// the read that produced it and nothing waits on a packet that may not
+    /// arrive.
+    fn flush_inner(&self) -> Result<()> {
+        let Some(held) = self.coalescer.as_ref() else {
+            return Ok(());
+        };
+        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_held(&mut held)
+    }
+
+    fn write_held(&self, held: &mut gso::Coalescer) -> Result<()> {
+        let Some((header, frame)) = held.take() else {
+            return Ok(());
+        };
+        let outcome = self.tun.send_segmented(header, frame);
+        self.note_write(outcome)
+    }
+
+    /// Writes one inner packet on its own.
+    fn write_one(&self, packet: &[u8]) -> Result<()> {
+        let outcome = self.tun.send(packet);
+        self.note_write(outcome)
+    }
+
+    fn note_write(&self, outcome: io::Result<usize>) -> Result<()> {
+        match outcome {
             Ok(_) => Ok(()),
             // The device is non-blocking in batched mode, so a full queue
             // refuses the write. That is a drop, exactly as a congested link

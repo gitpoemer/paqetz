@@ -615,6 +615,42 @@ tunnel, and routing them out of the country and back is slower, more visible,
 and occasionally refused at the far end for arriving from the wrong place.
 `--block-domestic` sets it without being asked.
 
+### When the host is the bottleneck
+
+Two settings reduce what each packet costs, and they act on different halves of
+the datapath:
+
+```toml
+# under [tunnel.interface]
+datapath = "batched"     # up to 32 packets per syscall on the wire side
+coalesce = true          # inbound packets grouped into one write to the device
+```
+
+`datapath = "batched"` has been here a while and uses `recvmmsg` and
+`sendmmsg`, which take many packets per call. It leaves the TUN device
+untouched, because a TUN write is one packet however many buffers it is
+gathered from and there is no `sendmmsg` for a character device. So the device
+was the only part of the path still paying a syscall per packet.
+
+`coalesce` is how that half gets fixed: consecutive packets of one flow are
+written as a single frame with a header telling the kernel where to split it,
+which is the one way a TUN device accepts more than one packet at a time.
+Measured on a contended VPS at 16.8 microseconds of CPU per packet written one
+at a time against 3.0 written forty at a time, which was about a quarter of
+everything that datapath spent per packet.
+
+It is **off by default**, and worth knowing why. The frames it builds carry an
+IP header, an L4 header and half a checksum for the kernel to finish, and a
+mistake in any of those is inner traffic dropped in silence rather than an
+error anyone would see. It also needs `datapath = "batched"` to have anything
+to group: one packet per read means every run is one packet, which pays a copy
+for no saving, and `paqetz doctor` says so.
+
+What it will not fix is a host that is slow per syscall to begin with. The same
+probe found a plain TUN write an order of magnitude more expensive on a
+contended VPS than on an idle machine, so if your throughput is short of what
+the path offers, measure before assuming any setting here is the answer.
+
 ### When the link itself is losing packets
 
 The tunnel carries no reliability layer, because everything inside it already
