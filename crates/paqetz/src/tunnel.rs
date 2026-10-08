@@ -1467,7 +1467,14 @@ impl Tunnel {
             }
         };
         let _ = tx.set_send_buffer(4 * 1024 * 1024);
-        info!("transmit via {}", tx.name());
+        // Both, on one line. `transmit` was announced here and `datapath` was
+        // not, which had a 17% CPU saving attributed to the wrong setting
+        // because the log could only confirm one of the two.
+        info!(
+            "datapath {}, transmit via {}",
+            cfg.interface.datapath.name(),
+            tx.name()
+        );
 
         Ok(Self {
             state: Arc::new(Mutex::new(PeerState::new(

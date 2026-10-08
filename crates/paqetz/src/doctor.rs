@@ -141,6 +141,11 @@ pub(crate) fn run(path: &Path) -> bool {
             t.interface.shape,
             t.interface.spoof_records,
         ));
+        findings.push(check_datapath(
+            t.interface.datapath,
+            t.interface.transmit,
+            t.peer.endpoint.is_some(),
+        ));
         // What the file asked for that it cannot quite have. Reported here as
         // well as logged at start-up, because this is the command an operator
         // runs *before* starting anything, and a setting quietly overridden is
@@ -572,6 +577,46 @@ fn check_warp(cfg: &TunnelConfig) -> Vec<Finding> {
         .collect()
 }
 
+/// What the datapath will actually be, which is not always what was asked for.
+///
+/// Reported because one of the two settings is announced at start-up and the
+/// other is not, and because `transmit = "afpacket"` silently becomes `raw` on
+/// the end that waits to be contacted. A benchmark run against a transmit path
+/// other than the one in the file measures the wrong thing, and that has
+/// already cost an afternoon once.
+fn check_datapath(
+    datapath: crate::config::Datapath,
+    transmit: crate::config::TransmitPath,
+    connects_out: bool,
+) -> Finding {
+    use crate::config::TransmitPath;
+
+    let datapath = datapath.name();
+    // The same condition `Tunnel::start` applies: the AF_PACKET path needs a
+    // peer address to resolve a next hop toward, and only the initiating end
+    // has one.
+    let falls_back = transmit == TransmitPath::AfPacket && !connects_out;
+    if falls_back {
+        return Finding::warn(
+            "datapath",
+            format!(
+                "datapath {datapath}, and transmit \"afpacket\" will be \"raw\": this end waits \
+                 to be contacted, so it has no peer address to resolve a next hop toward"
+            ),
+            "nothing to fix if one file is shared by both ends: the end that connects out uses it, this one cannot. Write transmit = \"raw\" here to say so explicitly"
+                .to_owned(),
+        );
+    }
+    let transmit = match transmit {
+        TransmitPath::Raw => "raw",
+        TransmitPath::AfPacket => "af_packet",
+    };
+    Finding::pass(
+        "datapath",
+        format!("datapath {datapath}, transmit {transmit}"),
+    )
+}
+
 /// Whether the inner MTU leaves room for the tunnel's overhead.
 ///
 /// The overhead is the carrier's, not a number written down here. Fixed at the
@@ -858,6 +903,32 @@ mod tests {
         );
         let broken = Finding::fail("configuration", "does not parse", "fix it");
         assert!(!super::print(&[warp, broken]));
+    }
+
+    #[test]
+    fn the_transmit_path_reported_is_the_one_that_will_be_used() {
+        use crate::config::{Datapath, TransmitPath};
+
+        // The end that connects out gets what it asked for.
+        let f = check_datapath(Datapath::Batched, TransmitPath::AfPacket, true);
+        assert_eq!(f.verdict, Verdict::Pass, "{f:?}");
+        assert!(f.detail.contains("batched"), "{f:?}");
+        assert!(f.detail.contains("af_packet"), "{f:?}");
+
+        // The end that waits cannot, and is told so rather than left to find
+        // out from a benchmark.
+        let f = check_datapath(Datapath::Batched, TransmitPath::AfPacket, false);
+        assert_eq!(f.verdict, Verdict::Warn, "{f:?}");
+        assert!(f.detail.contains("will be"), "{f:?}");
+
+        // And asking for nothing unusual says so without a warning, whichever
+        // end it is.
+        for connects_out in [true, false] {
+            let f = check_datapath(Datapath::Simple, TransmitPath::Raw, connects_out);
+            assert_eq!(f.verdict, Verdict::Pass, "{f:?}");
+            assert!(f.detail.contains("simple"), "{f:?}");
+            assert!(f.detail.contains("raw"), "{f:?}");
+        }
     }
 
     #[test]

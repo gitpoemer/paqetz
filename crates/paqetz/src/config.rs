@@ -274,6 +274,16 @@ pub(crate) enum Datapath {
     Batched,
 }
 
+impl Datapath {
+    /// The word this is written as in configuration.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Batched => "batched",
+        }
+    }
+}
+
 /// Which mechanism puts frames on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum TransmitPath {
