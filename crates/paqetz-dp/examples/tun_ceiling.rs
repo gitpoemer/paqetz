@@ -26,6 +26,22 @@
 //! sudo ./target/release/examples/tun_ceiling plain
 //! sudo ./target/release/examples/tun_ceiling uso
 //! ```
+//!
+//! The host worth measuring is usually not the host with a toolchain on it,
+//! and the per-packet costs this reports do not transfer between machines --
+//! which is the whole reason to run it on the one in question. Build it static
+//! and copy it, rather than reimplementing it somewhere else and comparing two
+//! different programs:
+//!
+//! ```text
+//! cargo build --release --target x86_64-unknown-linux-musl \
+//!     --example tun_ceiling -p paqetz-dp
+//! scp target/x86_64-unknown-linux-musl/release/examples/tun_ceiling host:/tmp/
+//! ```
+//!
+//! That comes out around half a megabyte, statically linked, and needs nothing
+//! on the far side but `ip` and a kernel of 6.2 or later for the `uso` half.
+//! `dump` needs no privilege and is worth running first to confirm it starts.
 
 use std::io;
 use std::net::{Ipv4Addr, UdpSocket};
