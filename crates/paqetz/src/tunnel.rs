@@ -1770,6 +1770,19 @@ impl Tunnel {
         }
     }
 
+    /// Whether a sealed payload of this length fills a segment.
+    ///
+    /// The record header counts: it is on the wire and takes room a payload
+    /// then does not get.
+    fn fills_a_segment(&self, sealed: usize) -> bool {
+        let records = if self.cfg.interface.spoof_records {
+            paqetz_tcpwire::cover::RECORD_HEADER
+        } else {
+            0
+        };
+        sealed + records >= self.carrier_payload()
+    }
+
     /// The largest payload one segment of this carrier may hold.
     ///
     /// The same number the SYN advertises, less the options every segment past
@@ -2468,6 +2481,12 @@ impl Tunnel {
             Stats::bump(&self.stats.tx_dropped);
             return Ok(None);
         };
+        // A write that did not fill a segment has ended, so it pushes; a full
+        // one may be the middle of a larger write and does not. Without the
+        // second half of that, the reverse direction of a bulk transfer -- all
+        // small packets, one per batch -- pushed on two segments in five, which
+        // matches neither a bulk sender nor a client writing small frames.
+        let push = push || !self.fills_a_segment(payload.len());
         let written = carrier.data(payload, frame, now, push)?;
         let dst = *carrier.remote().ip();
 
