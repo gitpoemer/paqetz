@@ -147,6 +147,12 @@ pub(crate) fn run(path: &Path) -> bool {
             t.peer.endpoint.is_some(),
             t.interface.coalesce,
         ));
+        if t.interface.shape.has_ports() {
+            findings.push(check_acknowledge(
+                t.interface.acknowledge,
+                t.interface.carrier_mss(),
+            ));
+        }
         // What the file asked for that it cannot quite have. Reported here as
         // well as logged at start-up, because this is the command an operator
         // runs *before* starting anything, and a setting quietly overridden is
@@ -624,6 +630,30 @@ fn check_datapath(
     Finding::pass(
         "datapath",
         format!("datapath {datapath}, transmit {transmit}{grouping}"),
+    )
+}
+
+/// What the flow looks like to anything that tracks TCP without reading it.
+///
+/// Two numbers, because both were wrong in a way only a capture showed. A
+/// carrier that acknowledged nothing had the receiving side of a bulk transfer
+/// answering two thousand segments with one data-less one, and a carrier
+/// advertising the profile's maximum segment size never came within twenty
+/// bytes of it. Neither needs payload inspection to see.
+fn check_acknowledge(acknowledge: bool, mss: u16) -> Finding {
+    if !acknowledge {
+        return Finding::warn(
+            "receiver",
+            format!(
+                "acknowledge is off: this end will answer inbound data with nothing, and                  advertises mss {mss}"
+            ),
+            "a receiver that never acknowledges is not a condition TCP has, and recognising              it needs no payload inspection. Drop `acknowledge = false` unless the packets              it saves are worth more than that"
+                .to_owned(),
+        );
+    }
+    Finding::pass(
+        "receiver",
+        format!("acknowledging inbound data, advertising mss {mss}"),
     )
 }
 

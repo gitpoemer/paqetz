@@ -19,7 +19,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -214,11 +214,14 @@ const STANDBY_LEAD_MIN: Millis = 100;
 /// host is expected to recover from.
 const READ_RETRY: Duration = Duration::from_secs(1);
 
-/// A buffer with room for the longest decoy handshake and its outer headers.
+/// A buffer with room for one segment of a decoy handshake and its outer
+/// headers.
 ///
-/// The hello is 517 bytes for every name short enough to pad to it, and grows
-/// with a longer one; this covers the longest a name may be.
-const COVER_FRAME: usize = 1024;
+/// A current hello is around eighteen hundred bytes -- the post-quantum key
+/// share alone is over a kilobyte -- so it does not fit in one segment and goes
+/// out in two, as a real stack sends it. This is one segment's worth, and the
+/// rest of the hello follows in the next.
+const COVER_FRAME: usize = 2048;
 
 /// How long a real handshake's SYN is repeated before a fresh one replaces it.
 ///
@@ -485,12 +488,12 @@ struct PeerState {
     heard_at: Option<Millis>,
     /// How long the last SYN answered took to be answered.
     syn_rtt: Option<Millis>,
-    /// Whether this connection still owes its decoy handshake.
+    /// Which flight of the decoy handshake this connection still owes.
     ///
     /// Set whenever a connection begins, which with rotation is every few
     /// seconds: the decoy is the first bytes of each one, because a filter that
     /// reads a name reads it there or not at all.
-    cover_due: bool,
+    cover_due: Cover,
     /// The session identifier the peer's decoy hello carried, for the answer
     /// to echo.
     ///
@@ -504,6 +507,24 @@ struct PeerState {
     standby_opened_at: Millis,
 }
 
+/// Which flight of the decoy handshake is next.
+///
+/// A real 0-RTT exchange is three flights and they have to be in order: the
+/// client's hello, the server's answer, and the client's Finished. A capture of
+/// the version before this showed the answer arriving eight seconds after the
+/// hello and behind a hundred bytes of application data, which is not an
+/// ordering any implementation can produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    /// Nothing owed: either the exchange is done or there is no decoy.
+    Nothing,
+    /// The flight this end opens with: a hello from the end that connects out,
+    /// an answer from the end that waits.
+    Opening,
+    /// The client's change-cipher-spec and Finished, once the answer is in.
+    Finished,
+}
+
 impl PeerState {
     fn new(endpoint: Option<SocketAddrV4>, repeat: crate::repeat::Limits) -> Self {
         Self {
@@ -512,7 +533,7 @@ impl PeerState {
             previous: None,
             pending: None,
             carrier: None,
-            cover_due: false,
+            cover_due: Cover::Nothing,
             cover_session: None,
             outbox: crate::repeat::Outbox::new(repeat),
             inbox: crate::repeat::Inbox::new(repeat),
@@ -558,7 +579,9 @@ impl PeerState {
         self.carried_bytes = 0;
         self.quiet_since = None;
         self.heard_at = None;
-        self.cover_due = true;
+        // Which flight comes first is a matter of role, and the role is the
+        // caller's to know.
+        self.cover_due = Cover::Opening;
     }
 
     /// Counts a packet carried on the current five-tuple.
@@ -1020,14 +1043,18 @@ enum Wire {
 
 impl Wire {
     /// Writes one packet, returning how many bytes it used.
+    ///
+    /// `push` says this is the last packet of the burst, which is when a real
+    /// stack sets PSH. Nothing in a GRE or ICMP header has anywhere to say it.
     fn data(
         &mut self,
         payload: &[u8],
         out: &mut [u8],
         now: Millis,
+        push: bool,
     ) -> core::result::Result<usize, paqetz_tcpwire::Error> {
         match self {
-            Self::Tcp(c) => c.data(payload, out, now),
+            Self::Tcp(c) => c.data(payload, out, now, push),
             // No clock: nothing in a GRE header is a function of time. The
             // fake-TCP carrier needs one for its timestamp option.
             Self::Raw(c) => c.data(payload, out),
@@ -1041,12 +1068,32 @@ impl Wire {
         payload: &[u8],
         out: &mut [u8],
         now: Millis,
+        push: bool,
     ) -> core::result::Result<usize, paqetz_tcpwire::Error> {
         match self {
-            Self::Tcp(c) => c.bare(payload, out, now),
+            Self::Tcp(c) => c.bare(payload, out, now, push),
             // No clock: nothing in a GRE header is a function of time. The
             // fake-TCP carrier needs one for its timestamp option.
             Self::Raw(c) => c.data(payload, out),
+        }
+    }
+
+    /// Whether a real receiver would have acknowledged what has arrived.
+    ///
+    /// Always false for a shape with no acknowledgement to send: a GRE or ICMP
+    /// header has nowhere to put one.
+    fn owes_ack(&self) -> bool {
+        match self {
+            Self::Tcp(c) => c.owes_ack(),
+            Self::Raw(_) => false,
+        }
+    }
+
+    /// Writes a data-less acknowledgement, or `None` for a shape without one.
+    fn ack(&mut self, out: &mut [u8], now: Millis) -> Option<usize> {
+        match self {
+            Self::Tcp(c) => c.ack(out, now).ok(),
+            Self::Raw(_) => None,
         }
     }
 
@@ -1184,6 +1231,19 @@ pub(crate) struct Tunnel {
     rx: Arc<PacketRx>,
     tx: Arc<Transmit>,
     state: Arc<Mutex<PeerState>>,
+    /// Bytes of the peer's decoy hello still to arrive.
+    ///
+    /// A current hello does not fit in one segment, so its remainder follows in
+    /// the next and has to be recognised there: it is the middle of a TLS
+    /// record, looks like nothing in particular, and would otherwise go to the
+    /// AEAD and be counted as somebody sending garbage at the port.
+    ///
+    /// Outside the per-peer mutex deliberately. It is read before the decrypt
+    /// on every inbound packet, and that mutex is already the ceiling on the
+    /// inbound direction (D16); one relaxed load is not. Counted down rather
+    /// than held as a range, because a lost continuation costs a single dropped
+    /// packet and nothing more.
+    cover_owed: AtomicUsize,
     /// Our own outer address and the port currently in use.
     local: Mutex<(Ipv4Addr, u16)>,
     /// Every port the capture filter accepts, in rotation order.
@@ -1489,6 +1549,7 @@ impl Tunnel {
         );
 
         Ok(Self {
+            cover_owed: AtomicUsize::new(0),
             state: Arc::new(Mutex::new(PeerState::new(
                 cfg.peer.endpoint,
                 cfg.interface.repeat,
@@ -1597,6 +1658,7 @@ impl Tunnel {
                     sequencing: self.cfg.interface.sequencing,
                     records: self.cfg.interface.spoof_records,
                     dont_fragment: df,
+                    mss: Some(self.cfg.interface.carrier_mss()),
                 })))
             }
             crate::config::Shape::Raw(shell) => Wire::Raw(paqetz_tcpwire::rawip::Carrier::new(
@@ -1627,13 +1689,18 @@ impl Tunnel {
         }
     }
 
-    /// Sends the decoy handshake this connection owes, if it owes one.
+    /// Sends whichever flight of the decoy handshake this connection owes.
     ///
     /// Called with the state held and before anything else goes out, because
-    /// what it is for is being the first bytes a filter sees on the connection.
-    /// It goes through the carrier like any other data, so it occupies the
-    /// sequence numbers it claims and whatever reassembles the stream finds a
-    /// hello at the front of it rather than a gap.
+    /// what it is for is being the bytes a filter sees at that point in the
+    /// conversation. It goes through the carrier like any other data, so it
+    /// occupies the sequence numbers it claims and whatever reassembles the
+    /// stream finds a handshake where one belongs rather than a gap.
+    ///
+    /// A hello is longer than one segment -- every current one is, the
+    /// post-quantum key share alone being over a kilobyte -- so it goes out in
+    /// as many as it needs, with the push bit only on the last, exactly as a
+    /// real stack writes it.
     ///
     /// Failure is not an error: the decoy is cover, and a connection without it
     /// carries traffic exactly as well.
@@ -1641,7 +1708,7 @@ impl Tunnel {
         let Some(name) = self.cfg.interface.spoof_sni.as_deref() else {
             return;
         };
-        if !state.cover_due {
+        if state.cover_due == Cover::Nothing {
             return;
         }
         if state.carrier.as_ref().is_none_or(|c| !c.is_ready()) {
@@ -1657,34 +1724,64 @@ impl Tunnel {
         // The end that connects out asks; the end that waits answers, echoing
         // the identifier it was asked with. A responder that has not seen a
         // hello has nothing to answer and says nothing.
-        let record = if self.is_initiator() {
-            paqetz_tcpwire::cover::client_hello(name, &secrets)
-        } else {
-            state
+        let record = match state.cover_due {
+            Cover::Nothing => None,
+            Cover::Opening if self.is_initiator() => {
+                paqetz_tcpwire::cover::client_hello(name, &secrets)
+            }
+            Cover::Opening => state
                 .cover_session
-                .map(|id| paqetz_tcpwire::cover::server_hello(&id, &secrets))
+                .map(|id| paqetz_tcpwire::cover::server_hello(&id, &secrets)),
+            Cover::Finished => Some(paqetz_tcpwire::cover::client_finished(&secrets)),
         };
         let Some(record) = record else {
+            // Cleared whatever follows: a decoy that could not be sent is not
+            // worth retrying on every packet, and one sent late is worse than
+            // none.
+            state.cover_due = Cover::Nothing;
             return;
         };
-        // Cleared whatever follows: a decoy that could not be sent is not worth
-        // retrying on every packet, and one sent late is worse than none.
-        state.cover_due = false;
+        // The client's Finished waits for the answer; nothing waits on it.
+        state.cover_due = Cover::Nothing;
+        let chunk = self.carrier_payload();
         let mut frame = [0u8; COVER_FRAME];
         let Some(carrier) = state.carrier.as_mut() else {
             return;
         };
-        match carrier.bare(&record, &mut frame, now) {
-            Ok(written) => {
-                let dst = *carrier.remote().ip();
-                if let Some(out) = frame.get(..written)
-                    && let Err(e) = self.tx.send(out, dst)
-                {
-                    debug!("could not send the decoy handshake: {e}");
+        let dst = *carrier.remote().ip();
+        let mut rest = record.as_slice();
+        while !rest.is_empty() {
+            let (head, tail) = rest.split_at(rest.len().min(chunk));
+            match carrier.bare(head, &mut frame, now, tail.is_empty()) {
+                Ok(written) => {
+                    if let Some(out) = frame.get(..written)
+                        && let Err(e) = self.tx.send(out, dst)
+                    {
+                        debug!("could not send the decoy handshake: {e}");
+                        return;
+                    }
+                }
+                Err(e) => {
+                    debug!("could not build the decoy handshake: {e}");
+                    return;
                 }
             }
-            Err(e) => debug!("could not build the decoy handshake: {e}"),
+            rest = tail;
         }
+    }
+
+    /// The largest payload one segment of this carrier may hold.
+    ///
+    /// The same number the SYN advertises, less the options every segment past
+    /// it carries. Used to split a flight too long for one segment the way a
+    /// real stack splits it, at the maximum and not somewhere arbitrary.
+    fn carrier_payload(&self) -> usize {
+        usize::from(self.cfg.interface.carrier_mss()).saturating_sub(
+            paqetz_tcpwire::segment::option_len(
+                paqetz_tcpwire::segment::Kind::Data,
+                &self.cfg.interface.profile,
+            ),
+        )
     }
 
     /// Whether this end initiates handshakes.
@@ -2189,7 +2286,11 @@ impl Tunnel {
                     break;
                 };
                 let inner_len = packet.len();
-                match self.seal_into(packet, &mut sealed, frame) {
+                // The push bit belongs on the last segment of the burst, and
+                // the burst is this batch: the drain above took everything the
+                // device had queued, so the last of them is where a real
+                // stack's send buffer would have emptied.
+                match self.seal_into(packet, &mut sealed, frame, i + 1 == count) {
                     Ok(Some((written, dst))) => {
                         if let Some(slot) = lens.get_mut(ready) {
                             *slot = written;
@@ -2292,7 +2393,8 @@ impl Tunnel {
 
     /// Encrypts one inner packet and transmits it immediately.
     fn send_inner(&self, packet: &[u8], sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
-        let Some((written, dst)) = self.seal_into(packet, sealed, frame)? else {
+        // One packet on its own is the whole burst.
+        let Some((written, dst)) = self.seal_into(packet, sealed, frame, true)? else {
             return Ok(());
         };
         let Some(out) = frame.get(..written) else {
@@ -2306,11 +2408,15 @@ impl Tunnel {
     /// Returns the frame's length and where to send it, or `None` when there is
     /// no session yet — in which case the packet is lost, which is what a link
     /// that is not up yet looks like from above.
+    ///
+    /// `push` says this is the last packet of the batch, which is where a real
+    /// stack's send buffer empties and so where it sets PSH.
     fn seal_into(
         &self,
         packet: &[u8],
         sealed: &mut [u8],
         frame: &mut [u8],
+        push: bool,
     ) -> Result<Option<(usize, Ipv4Addr)>> {
         if !worth_carrying(packet) {
             return Ok(None);
@@ -2362,7 +2468,7 @@ impl Tunnel {
             Stats::bump(&self.stats.tx_dropped);
             return Ok(None);
         };
-        let written = carrier.data(payload, frame, now)?;
+        let written = carrier.data(payload, frame, now, push)?;
         let dst = *carrier.remote().ip();
 
         // Half of the liveness question -- but only for a packet carrying data.
@@ -2445,6 +2551,38 @@ impl Tunnel {
             if let Err(e) = self.flush_inner() {
                 self.note_inbound(&e);
             }
+            self.acknowledge(self.now());
+        }
+    }
+
+    /// Acknowledges what has arrived, if a real receiver would have by now.
+    ///
+    /// Called at the end of each inbound batch rather than per packet, so the
+    /// per-peer mutex is taken once for a batch and a burst of inbound traffic
+    /// draws one acknowledgement rather than one each. Nothing here needs the
+    /// acknowledgement; what needs it is the flow looking like a flow. See the
+    /// `endpoint` module documentation.
+    fn acknowledge(&self, now: Millis) {
+        if !self.cfg.interface.acknowledge {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .carrier
+            .as_ref()
+            .is_none_or(|c| !c.is_ready() || !c.owes_ack())
+        {
+            return;
+        }
+        let mut out = [0u8; MAX_OVERHEAD];
+        let Some(carrier) = state.carrier.as_mut() else {
+            return;
+        };
+        let dst = *carrier.remote().ip();
+        if let Some(frame) = carrier.ack(&mut out, now).and_then(|n| out.get(..n))
+            && let Err(e) = self.tx.send(frame, dst)
+        {
+            debug!("could not acknowledge: {e}");
         }
     }
 
@@ -2640,6 +2778,7 @@ impl Tunnel {
             if let Err(e) = self.flush_inner() {
                 self.note_inbound(&e);
             }
+            self.acknowledge(self.now());
         }
     }
 
@@ -2656,10 +2795,12 @@ impl Tunnel {
         if seg.has(segment::flags::SYN) {
             return self.handle_syn(seg, from, reply);
         }
-        // How a connection finishes opening. It carries nothing to decrypt, and
-        // counting it as a rejection would report the peer's own handshake as
-        // someone sending garbage.
-        if payload.is_empty() && self.opening().is_some_and(paqetz_tcpwire::Carrier::opens) {
+        // A segment with no payload: how a connection finishes opening, and
+        // how a receiver acknowledges. Neither carries anything to decrypt, and
+        // counting them as rejections would report the peer's own handshake and
+        // its acknowledgements as someone sending garbage. True whatever opens
+        // the carrier: nothing sealed is ever empty.
+        if payload.is_empty() {
             return Ok(());
         }
 
@@ -2672,12 +2813,48 @@ impl Tunnel {
         // is the 32 bytes the answering decoy echoes. Nothing above can be
         // reached by it: whoever can put a packet on this tuple can already see
         // the flow, and all they can choose is a number in cover traffic.
-        if self.cfg.interface.spoof_sni.is_some() && paqetz_tcpwire::cover::is_cover(payload) {
-            if let Some(id) = paqetz_tcpwire::cover::session_id(payload) {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.cover_session = Some(id);
+        if self.cfg.interface.spoof_sni.is_some() {
+            use paqetz_tcpwire::cover;
+            // The rest of a hello that did not fit in one segment.
+            let owed = self.cover_owed.load(Ordering::Relaxed);
+            if owed > 0 {
+                self.cover_owed
+                    .store(owed.saturating_sub(payload.len()), Ordering::Relaxed);
+                return Ok(());
             }
-            return Ok(());
+            if let Some(more) = cover::owed_after_opening(payload) {
+                if let Some(id) = cover::session_id(payload) {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.cover_session = Some(id);
+                }
+                // Capped here as well as bounded there. The number came from a
+                // packet nothing has authenticated and decides how much real
+                // traffic is discarded next, so the most it may cost is the one
+                // packet a lost continuation already costs.
+                self.cover_owed
+                    .store(more.min(self.carrier_payload()), Ordering::Relaxed);
+                return Ok(());
+            }
+            if cover::is_cover(payload) {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(id) = cover::session_id(payload) {
+                    state.cover_session = Some(id);
+                } else if self.is_initiator() {
+                    // The answer has arrived, so what this end owes next is the
+                    // Finished that completes the exchange. Without it the
+                    // handshake is one a filter tracking the record layer can
+                    // simply time out.
+                    //
+                    // Sent here rather than left for the next outbound packet.
+                    // A real client answers within the round trip; waiting for
+                    // traffic put a quarter of a second between the answer and
+                    // the Finished on an idle tunnel, and however long the
+                    // tunnel stayed idle on a quiet one.
+                    state.cover_due = Cover::Finished;
+                    self.send_cover(&mut state, self.now());
+                }
+                return Ok(());
+            }
         }
 
         // A handshake and a transport packet can be the same length, so the
@@ -2858,9 +3035,12 @@ impl Tunnel {
             &self.cfg.interface.profile,
             seg.dst,
             seg,
-            isn,
-            ts,
-            df,
+            paqetz_tcpwire::endpoint::Reply {
+                isn,
+                ts_val: ts,
+                dont_fragment: df,
+                mss: self.cfg.interface.carrier_mss(),
+            },
             reply,
         )?;
         let Some(synack) = reply.get(..n) else {
@@ -2983,7 +3163,18 @@ impl Tunnel {
             os("announcing the connection", self.tx.send(syn_ack, dst))?;
         }
 
-        let written = carrier.data(msg2, reply, now)?;
+        // The answer goes before the reply underneath it. A server's first
+        // bytes on a connection are its ServerHello; a capture of the version
+        // before this showed them being a hundred bytes of application data,
+        // with the ServerHello arriving eight seconds later on the back of a
+        // keepalive. No implementation can produce that order, and seeing it
+        // costs a filter nothing it was not already doing to read the name.
+        self.send_cover(&mut state, now);
+        let Some(carrier) = state.carrier.as_mut() else {
+            return Ok(());
+        };
+
+        let written = carrier.data(msg2, reply, now, true)?;
 
         state.accept(session);
         state.pending = None;
@@ -3078,7 +3269,7 @@ impl Tunnel {
         // that waits answers the hello it has just been sent, and the end that
         // connects out asks again from wherever the peer now is.
         if fresh {
-            state.cover_due = true;
+            state.cover_due = Cover::Opening;
         }
         if state.endpoint != Some(from) {
             let was = state.endpoint;
@@ -3720,7 +3911,7 @@ impl Tunnel {
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(());
         };
-        let written = carrier.data(msg1, frame, now)?;
+        let written = carrier.data(msg1, frame, now, true)?;
         let dst = *peer.ip();
 
         state.pending = Some(initiator);
@@ -3951,15 +4142,35 @@ fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
 /// session identifier or a key share would say they came from one program
 /// rather than from a browser opening connections.
 fn cover_secrets() -> io::Result<paqetz_tcpwire::cover::Secrets> {
-    let mut bytes = [0u8; 97];
+    use paqetz_tcpwire::cover;
+    let total = 32 * 5
+        + cover::MLKEM_SEED
+        + cover::PQ_SERVER_SHARE
+        + cover::TICKET_LEN
+        + cover::FINISHED_LEN
+        + 1;
+    // One draw, handed out in order, rather than a syscall per field.
+    let mut bytes = vec![0u8; total];
     random_bytes(&mut bytes)?;
-    let mut secrets = paqetz_tcpwire::cover::Secrets::default();
-    let (random, rest) = bytes.split_at(32);
-    let (session, rest) = rest.split_at(32);
-    let (share, grease) = rest.split_at(32);
-    secrets.random.copy_from_slice(random);
-    secrets.session_id.copy_from_slice(session);
-    secrets.key_share.copy_from_slice(share);
+    let mut secrets = cover::Secrets::default();
+    let mut at = 0usize;
+    let mut fill = |dst: &mut [u8]| {
+        if let Some(src) = bytes.get(at..at.saturating_add(dst.len())) {
+            dst.copy_from_slice(src);
+        }
+        at = at.saturating_add(dst.len());
+    };
+    fill(&mut secrets.random);
+    fill(&mut secrets.session_id);
+    fill(&mut secrets.key_share);
+    fill(&mut secrets.hybrid_x25519);
+    fill(&mut secrets.mlkem);
+    fill(&mut secrets.server_share);
+    fill(&mut secrets.ticket);
+    fill(&mut secrets.binder);
+    fill(&mut secrets.finished);
+    let mut grease = [0u8; 1];
+    fill(&mut grease);
     secrets.grease = grease.first().copied().unwrap_or(0);
     Ok(secrets)
 }
@@ -4213,18 +4424,23 @@ mod tests {
         // The decoy is worth having only as the *first* bytes of a connection,
         // so what matters is that beginning one arms it and sending it clears
         // it. With rotation that is every few seconds, and a decoy repeated per
-        // packet would be 517 bytes of overhead on each.
+        // packet would be a hello of overhead on each.
         let mut state = PeerState::new(None, crate::repeat::Limits::off());
-        assert!(
-            !state.cover_due,
+        assert_eq!(
+            state.cover_due,
+            Cover::Nothing,
             "nothing owed before there is a connection"
         );
 
         state.replace_carrier(raw_wire());
-        assert!(state.cover_due, "a new connection owes one");
-        state.cover_due = false;
+        assert_eq!(state.cover_due, Cover::Opening, "a new connection owes one");
+        state.cover_due = Cover::Nothing;
         state.replace_carrier(raw_wire());
-        assert!(state.cover_due, "and so does the next, after a move");
+        assert_eq!(
+            state.cover_due,
+            Cover::Opening,
+            "and so does the next, after a move"
+        );
     }
 
     #[test]
@@ -4248,6 +4464,52 @@ mod tests {
         let mut sealed = [0u8; 128];
         random_bytes(&mut sealed).expect("urandom");
         assert!(!paqetz_tcpwire::cover::is_cover(&sealed));
+    }
+
+    #[test]
+    fn a_hello_arrives_in_two_segments_and_both_are_read_as_cover() {
+        // A current hello does not fit in one segment. The far end reads the
+        // identifier out of the first and has to account for the second, which
+        // is the middle of a TLS record and looks like nothing on its own: fed
+        // to the AEAD it would be counted as the peer sending garbage, every
+        // few seconds, in the counter that exists to report exactly that.
+        use paqetz_tcpwire::cover;
+        let secrets = cover::Secrets::default();
+        let hello = cover::client_hello("www.example.com", &secrets).expect("builds");
+        assert!(hello.len() > 1428, "or there is nothing to split");
+
+        let (first, second) = hello.split_at(1428);
+        let owed = cover::owed_after_opening(first).expect("a first fragment");
+        assert_eq!(owed, second.len());
+        assert_eq!(
+            cover::session_id(first),
+            Some(secrets.session_id),
+            "everything the answering end needs is in the first segment"
+        );
+        // And the count drains exactly, so the packet after it is not eaten.
+        assert_eq!(owed.saturating_sub(second.len()), 0);
+    }
+
+    #[test]
+    fn the_flights_of_the_decoy_go_in_the_order_tls_has_them() {
+        // The order is the whole point: a hello, then an answer, then the
+        // client's Finished. A capture of the version before this showed the
+        // answer arriving eight seconds after the hello and behind a hundred
+        // bytes of application data.
+        use paqetz_tcpwire::cover;
+        let secrets = cover::Secrets::default();
+        let hello = cover::client_hello("www.example.com", &secrets).expect("builds");
+        let id = cover::session_id(&hello).expect("a hello carries one");
+        let answer = cover::server_hello(&id, &secrets);
+        let finished = cover::client_finished(&secrets);
+
+        // Each is recognised as cover by the end that receives it, and only the
+        // hello carries an identifier, which is how the answer is told from it.
+        for flight in [&hello, &answer, &finished] {
+            assert!(cover::is_cover(flight), "{:02x?}", flight.get(..8));
+        }
+        assert!(cover::session_id(&answer).is_none());
+        assert!(cover::session_id(&finished).is_none());
     }
 
     #[test]

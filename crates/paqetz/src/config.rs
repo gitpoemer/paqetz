@@ -134,6 +134,15 @@ pub(crate) struct Interface {
     /// anything reading past the hello walks straight into. Five bytes per
     /// packet, off the inner MTU.
     pub(crate) spoof_records: bool,
+    /// Whether this end answers inbound data with acknowledgements of its own.
+    ///
+    /// On by default, because a receiver that never acknowledges is not a
+    /// condition TCP has: a capture of a bulk transfer showed one side sending
+    /// two thousand segments and the other answering with a single data-less
+    /// one, which anything tracking the flow can see without reading a byte of
+    /// payload. The cost is one small packet per couple of inbound ones in the
+    /// direction that is otherwise idle, which is what a real receiver costs.
+    pub(crate) acknowledge: bool,
     /// Whether inbound packets are grouped into one write per run.
     ///
     /// Off by default. A TUN write is one packet however many buffers it is
@@ -485,6 +494,43 @@ impl Shape {
                 paqetz_dp::tun::DEFAULT_MTU + saved as u32 - records
             }
         }
+    }
+}
+
+impl Interface {
+    /// The maximum segment size the fake-TCP carrier should advertise.
+    ///
+    /// The profile's value describes a host on a 1500-byte Ethernet path, and
+    /// the carrier deliberately stays below that: the inner MTU leaves slack so
+    /// a hop that adds a header of its own does not have to fragment a packet
+    /// that forbids it. Advertising the profile's number anyway promised
+    /// segments the carrier never sends, so the largest payload of every
+    /// connection sat a fixed twenty bytes under the maximum for its whole
+    /// life -- which is the sort of constant anything can measure. A real host
+    /// on a smaller path advertises the smaller number, so this one does too.
+    ///
+    /// Never above the profile's, and never below the floor every stack
+    /// honours.
+    pub(crate) fn carrier_mss(&self) -> u16 {
+        /// The smallest maximum segment size any stack advertises.
+        const FLOOR: u16 = 536;
+        let payload = self.mtu
+            + u32::try_from(paqetz_core::framing::OVERHEAD).unwrap_or(0)
+            + if self.spoof_records {
+                u32::try_from(paqetz_tcpwire::cover::RECORD_HEADER).unwrap_or(0)
+            } else {
+                0
+            };
+        // The option block comes out of the segment, not out of the maximum
+        // segment size, which is why it is added back here: the number names
+        // what a segment carrying no options could hold.
+        let options = u32::try_from(paqetz_tcpwire::segment::option_len(
+            paqetz_tcpwire::segment::Kind::Data,
+            &self.profile,
+        ))
+        .unwrap_or(0);
+        let mss = u16::try_from(payload.saturating_add(options)).unwrap_or(u16::MAX);
+        mss.clamp(FLOOR, self.profile.mss)
     }
 }
 
@@ -956,6 +1002,8 @@ struct RawInterface {
     spoof_sni: Option<String>,
     #[serde(default)]
     spoof_records: Option<bool>,
+    #[serde(default)]
+    acknowledge: Option<bool>,
     coalesce: Option<bool>,
     #[serde(default)]
     manage_firewall: Option<bool>,
@@ -2108,6 +2156,7 @@ impl Config {
                 sequencing,
                 spoof_sni,
                 spoof_records,
+                acknowledge: iface.acknowledge.unwrap_or(true),
                 coalesce,
                 notes,
                 datapath,
@@ -2428,6 +2477,68 @@ mod tests {
     fn with_interface(lines: &str) -> Result<TunnelConfig> {
         Config::parse(&CLIENT.replace("[peer]", &format!("{lines}\n\n[peer]")))
             .map(|c| c.into_only().expect("one tunnel"))
+    }
+
+    /// The signal this removes: every segment of every connection a fixed
+    /// distance below the size the SYN promised.
+    #[test]
+    fn the_advertised_mss_is_the_one_the_carrier_can_fill() {
+        let largest = |c: &TunnelConfig| -> u32 {
+            c.interface.mtu
+                + u32::try_from(paqetz_core::framing::OVERHEAD).expect("small")
+                + if c.interface.spoof_records {
+                    u32::try_from(paqetz_tcpwire::cover::RECORD_HEADER).expect("five")
+                } else {
+                    0
+                }
+        };
+        for lines in [
+            "carrier = \"handshake\"\nspoof_sni = \"www.example.com\"",
+            "carrier = \"handshake\"",
+            "carrier = \"midstream\"\nmtu = 1200",
+        ] {
+            let c = with_interface(lines).expect("parses");
+            let options = u32::try_from(paqetz_tcpwire::segment::option_len(
+                paqetz_tcpwire::segment::Kind::Data,
+                &c.interface.profile,
+            ))
+            .expect("small");
+            assert_eq!(
+                u32::from(c.interface.carrier_mss()),
+                largest(&c) + options,
+                "{lines}: the number on the SYN has to be the one a data \
+                 segment reaches"
+            );
+            assert!(
+                c.interface.carrier_mss() <= c.interface.profile.mss,
+                "{lines}: never more than the profile would say"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiny_mtu_still_advertises_a_size_every_stack_honours() {
+        // Below 536 nothing is obliged to listen, and a number no host would
+        // send is a marking of its own.
+        let c = with_interface("mtu = 600").expect("parses");
+        assert!(
+            c.interface.carrier_mss() >= 536,
+            "{}",
+            c.interface.carrier_mss()
+        );
+    }
+
+    #[test]
+    fn acknowledging_is_on_unless_it_is_turned_off() {
+        // On by default: a receiver that never acknowledges is not a condition
+        // TCP has, and seeing that needs no payload inspection at all.
+        assert!(with_interface("").expect("parses").interface.acknowledge);
+        assert!(
+            !with_interface("acknowledge = false")
+                .expect("parses")
+                .interface
+                .acknowledge
+        );
     }
 
     #[test]

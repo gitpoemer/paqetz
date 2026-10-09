@@ -43,6 +43,19 @@
 //! Neither end needs to agree with the other: nothing here validates an inbound
 //! `seq` or `ack`. They are read only to compose our own.
 //!
+//! # Acknowledging like a receiver
+//!
+//! Nothing here needs an acknowledgement, because nothing is waiting to be
+//! released by one. So for a long time the carrier sent none at all, and a
+//! capture of a bulk transfer showed the receiving side answering two thousand
+//! segments with one data-less segment. No TCP connection looks like that under
+//! any conditions, and seeing it needs flow state but not a byte of payload
+//! inspection, which makes it cheaper than anything a filter could learn from
+//! the payload. [`Endpoint::owes_ack`] reports when a real receiver would have
+//! answered -- after [`ACK_EVERY`] payload-bearing segments with nothing sent
+//! back -- and the caller sends one. Traffic that flows both ways never reaches
+//! it, because every segment already carries the acknowledgement with it.
+//!
 //! # Windows
 //!
 //! Sequence and acknowledgement numbers are `u32` and wrap. All arithmetic here
@@ -53,6 +66,13 @@ use core::net::Ipv4Addr;
 use crate::profile::OsProfile;
 use crate::segment::{self, Fields, Kind, Segment};
 use crate::{Error, Result};
+
+/// How many payload-bearing segments may arrive before this end answers.
+///
+/// Two, which is where a delayed acknowledgement fires on every stack that has
+/// one. Higher would halve the cost of the reverse direction and start to look
+/// like a receiver that is not keeping up.
+pub const ACK_EVERY: u16 = 2;
 
 /// How the synthetic conversation begins.
 ///
@@ -175,6 +195,13 @@ pub struct Config {
     pub records: bool,
     /// Whether to set Don't Fragment on every packet.
     pub dont_fragment: bool,
+    /// The maximum segment size to advertise, when it is not the profile's.
+    ///
+    /// `None` keeps the profile's, which describes a host on a 1500-byte
+    /// Ethernet path. A carrier that deliberately stays below that should say
+    /// so, or the largest segment it ever sends sits a fixed distance under
+    /// what it promised. Clamped to the profile's value, never above it.
+    pub mss: Option<u16>,
 }
 
 /// How the sequence and acknowledgement numbers are chosen.
@@ -247,6 +274,18 @@ pub struct Endpoint {
     /// A retransmitted SYN carries the same sequence number as the original, so
     /// it must be counted once however many times it goes out.
     syn_counted: bool,
+    /// The maximum segment size this end advertises.
+    mss: u16,
+    /// Segments carrying payload received since this end last sent anything.
+    ///
+    /// A real receiver answers about every second segment. Nothing here needs
+    /// an acknowledgement -- there is no retransmission to release -- so the
+    /// carrier sent none, and a capture of a two-megabyte transfer showed the
+    /// receiving side answering with a single data-less segment. That is not a
+    /// condition TCP has, and recognising it needs flow state but no payload
+    /// inspection, which makes it the cheapest check anything on the path can
+    /// run. Counted here; [`Self::owes_ack`] decides.
+    unacked: u16,
 }
 
 impl Endpoint {
@@ -286,6 +325,17 @@ impl Endpoint {
             peer_ts_val: 0,
             counter: 0,
             syn_counted: !waits,
+            mss: match cfg.mss {
+                Some(mss) => {
+                    if mss < cfg.profile.mss {
+                        mss
+                    } else {
+                        cfg.profile.mss
+                    }
+                }
+                None => cfg.profile.mss,
+            },
+            unacked: 0,
         }
     }
 
@@ -459,7 +509,7 @@ impl Endpoint {
                 Ok(Some(n))
             }
             (Carrier::Handshake, Role::Responder, Phase::SynReceived) => {
-                self.emit_raw(Kind::SynAck, &[], out, now).map(Some)
+                self.emit_raw(Kind::SynAck, &[], out, now, false).map(Some)
             }
             _ => Ok(None),
         }
@@ -495,7 +545,7 @@ impl Endpoint {
             ack: 0,
             ts_val,
             ts_ecr: 0,
-            ..self.fields(Kind::Syn, now)
+            ..self.fields(Kind::Syn, now, false)
         };
         let n = segment::emit(Kind::Syn, &self.profile, &fields, &[], out)?;
         self.counter = self.counter.wrapping_add(1);
@@ -515,7 +565,7 @@ impl Endpoint {
         let fields = Fields {
             seq: self.next_seq().wrapping_sub(1),
             ack,
-            ..self.fields(Kind::SynAck, now)
+            ..self.fields(Kind::SynAck, now, false)
         };
         let n = segment::emit(Kind::SynAck, &self.profile, &fields, &[], out)?;
         self.counter = self.counter.wrapping_add(1);
@@ -528,7 +578,18 @@ impl Endpoint {
     /// # Errors
     /// Returns [`Error::Short`] if `out` cannot hold the segment.
     pub fn ack(&mut self, out: &mut [u8], now: u64) -> Result<usize> {
-        self.emit_raw(Kind::Ack, &[], out, now)
+        self.emit_raw(Kind::Ack, &[], out, now, false)
+    }
+
+    /// Whether a real receiver would have acknowledged by now.
+    ///
+    /// True once two payload-bearing segments have arrived with nothing sent
+    /// back, which is where a delayed acknowledgement fires. A segment this end
+    /// sends carries the acknowledgement with it, so bidirectional traffic
+    /// never reaches this and costs nothing.
+    #[must_use]
+    pub const fn owes_ack(&self) -> bool {
+        self.unacked >= ACK_EVERY
     }
 
     /// Takes up a connection the peer opened against a SYN+ACK this end sent
@@ -557,7 +618,7 @@ impl Endpoint {
     /// # Errors
     /// - [`Error::Short`] if `out` cannot hold the segment.
     /// - [`Error::NotEstablished`] if the connection is not yet open.
-    pub fn data(&mut self, payload: &[u8], out: &mut [u8], now: u64) -> Result<usize> {
+    pub fn data(&mut self, payload: &[u8], out: &mut [u8], now: u64, push: bool) -> Result<usize> {
         if !self.is_ready() {
             return Err(Error::NotEstablished);
         }
@@ -571,10 +632,13 @@ impl Endpoint {
         };
         let (n, written) = match header {
             Some(header) => (
-                self.emit_parts(Kind::Data, &[&header, payload], out, now)?,
+                self.emit_parts(Kind::Data, &[&header, payload], out, now, push)?,
                 payload.len() + header.len(),
             ),
-            None => (self.emit_raw(Kind::Data, payload, out, now)?, payload.len()),
+            None => (
+                self.emit_raw(Kind::Data, payload, out, now, push)?,
+                payload.len(),
+            ),
         };
         let len = u32::try_from(written).map_err(|_| Error::TooLong { len: written })?;
         self.sent = self.sent.wrapping_add(len);
@@ -589,11 +653,11 @@ impl Endpoint {
     ///
     /// # Errors
     /// As [`Self::data`].
-    pub fn bare(&mut self, payload: &[u8], out: &mut [u8], now: u64) -> Result<usize> {
+    pub fn bare(&mut self, payload: &[u8], out: &mut [u8], now: u64, push: bool) -> Result<usize> {
         if !self.is_ready() {
             return Err(Error::NotEstablished);
         }
-        let n = self.emit_raw(Kind::Data, payload, out, now)?;
+        let n = self.emit_raw(Kind::Data, payload, out, now, push)?;
         let len =
             u32::try_from(payload.len()).map_err(|_| Error::TooLong { len: payload.len() })?;
         self.sent = self.sent.wrapping_add(len);
@@ -608,7 +672,7 @@ impl Endpoint {
     /// # Errors
     /// Returns [`Error::Short`] if `out` cannot hold the segment.
     pub fn close(&mut self, out: &mut [u8], now: u64) -> Result<usize> {
-        let n = self.emit_raw(Kind::Fin, &[], out, now)?;
+        let n = self.emit_raw(Kind::Fin, &[], out, now, true)?;
         // A FIN occupies one sequence number.
         self.sent = self.sent.wrapping_add(1);
         self.phase = Phase::Closed;
@@ -630,8 +694,15 @@ impl Endpoint {
     /// segment occupies depends on whether it is a first transmission: a
     /// retransmitted SYN repeats its predecessor's number rather than taking a
     /// new one.
-    fn emit_raw(&mut self, kind: Kind, payload: &[u8], out: &mut [u8], now: u64) -> Result<usize> {
-        self.emit_parts(kind, &[payload], out, now)
+    fn emit_raw(
+        &mut self,
+        kind: Kind,
+        payload: &[u8],
+        out: &mut [u8],
+        now: u64,
+        push: bool,
+    ) -> Result<usize> {
+        self.emit_parts(kind, &[payload], out, now, push)
     }
 
     /// As [`Self::emit_raw`], with the payload in pieces.
@@ -641,15 +712,19 @@ impl Endpoint {
         parts: &[&[u8]],
         out: &mut [u8],
         now: u64,
+        push: bool,
     ) -> Result<usize> {
-        let fields = self.fields(kind, now);
+        let fields = self.fields(kind, now, push);
         let n = segment::emit_parts(kind, &self.profile, &fields, parts, out)?;
         self.counter = self.counter.wrapping_add(1);
+        // Every segment this end sends carries the current acknowledgement, so
+        // whatever was owed has now been said.
+        self.unacked = 0;
         Ok(n)
     }
 
     /// Assembles the volatile fields for one outbound segment.
-    fn fields(&self, kind: Kind, now: u64) -> Fields {
+    fn fields(&self, kind: Kind, now: u64, push: bool) -> Fields {
         Fields {
             src: self.local,
             dst: self.remote,
@@ -660,6 +735,8 @@ impl Endpoint {
             ts_val: self.ts_val(now),
             ts_ecr: self.peer_ts_val,
             dont_fragment: self.dont_fragment,
+            push,
+            mss: self.mss,
         }
     }
 
@@ -740,6 +817,9 @@ impl Endpoint {
     /// payload as untrusted until the tunnel layer has verified it, and should
     /// only call this for segments that arrived on the expected five-tuple.
     pub fn on_receive<'a>(&mut self, seg: &Segment<'a>) -> Option<&'a [u8]> {
+        if !seg.payload.is_empty() {
+            self.unacked = self.unacked.saturating_add(1);
+        }
         if let Some(ts) = seg.ts_val {
             // Recorded even for segments carrying no payload: a pure ACK has
             // the freshest timestamp, and echoing a stale one is exactly the
@@ -852,14 +932,30 @@ fn occupied(seg: &Segment<'_>) -> u32 {
     }
 }
 
+/// What a SYN+ACK needs that the SYN it answers does not supply.
+///
+/// Grouped because they travel together and come from one place: this end's
+/// configuration and its clock.
+#[derive(Debug, Clone, Copy)]
+pub struct Reply {
+    /// This end's initial sequence number.
+    pub isn: u32,
+    /// The timestamp to send, which the peer will echo.
+    pub ts_val: u32,
+    /// Whether to set Don't Fragment.
+    pub dont_fragment: bool,
+    /// The maximum segment size to advertise.
+    pub mss: u16,
+}
+
 /// The SYN+ACK answering `syn`, composed from it alone.
 ///
 /// Nothing is kept, so a repeated SYN draws the same answer and a flood of them
 /// costs nothing but the replies -- which is what lets a responder answer
 /// before it knows who is asking. The responder supplies its own sequence
-/// number and timestamp; the acknowledgement and the echoed timestamp come from
-/// the SYN, and the window is the profile's unscaled SYN window, as on any
-/// SYN. Once the peer answers, [`Endpoint::rejoin`] takes up the connection.
+/// number, timestamp and advertised `mss`; the acknowledgement and the echoed
+/// timestamp come from the SYN, and the window is the profile's unscaled SYN
+/// window, as on any SYN. Once the peer answers, [`Endpoint::rejoin`] takes up the connection.
 ///
 /// # Errors
 /// Returns [`Error::Short`] if `out` cannot hold the segment.
@@ -867,11 +963,15 @@ pub fn answer_syn(
     profile: &OsProfile,
     local: (Ipv4Addr, u16),
     syn: &Segment<'_>,
-    isn: u32,
-    ts_val: u32,
-    dont_fragment: bool,
+    reply: Reply,
     out: &mut [u8],
 ) -> Result<usize> {
+    let Reply {
+        isn,
+        ts_val,
+        dont_fragment,
+        mss,
+    } = reply;
     let fields = Fields {
         src: local,
         dst: syn.src,
@@ -886,6 +986,12 @@ pub fn answer_syn(
         ts_val,
         ts_ecr: syn.ts_val.unwrap_or(0),
         dont_fragment,
+        // A SYN+ACK is not a data segment, so the bit means nothing on it.
+        push: false,
+        // The same number this end's data segments will honour, or the
+        // connection promises one size on its first packet and keeps to
+        // another for the rest of its life.
+        mss: if mss < profile.mss { mss } else { profile.mss },
     };
     segment::emit(Kind::SynAck, profile, &fields, &[], out)
 }
@@ -921,6 +1027,7 @@ mod tests {
             sequencing: Sequencing::Stream,
             records: false,
             dont_fragment: true,
+            mss: None,
         }
     }
 
@@ -946,12 +1053,16 @@ mod tests {
         for i in 0..4u8 {
             let payload = [i; 600];
 
-            let n = client.data(&payload, &mut buf, 0).expect("client emits");
+            let n = client
+                .data(&payload, &mut buf, 0, true)
+                .expect("client emits");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("server parses");
             assert_eq!(seg.payload, &payload[..], "client -> server");
             server.on_receive(&seg);
 
-            let n = server.data(&payload, &mut buf, 0).expect("server emits");
+            let n = server
+                .data(&payload, &mut buf, 0, true)
+                .expect("server emits");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("client parses");
             assert_eq!(seg.payload, &payload[..], "server -> client");
             client.on_receive(&seg);
@@ -966,12 +1077,12 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [7u8; 600];
 
-        let n = client.data(&payload, &mut buf, 0).expect("emit");
+        let n = client.data(&payload, &mut buf, 0, true).expect("emit");
         let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
         assert_eq!(seg.payload, &payload[..]);
         server.on_receive(&seg);
 
-        let n = server.data(&payload, &mut buf, 0).expect("emit");
+        let n = server.data(&payload, &mut buf, 0, true).expect("emit");
         let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
         assert_eq!(seg.payload, &payload[..]);
     }
@@ -988,7 +1099,7 @@ mod tests {
         let syn = parse_ipv4(&buf[..n]).expect("parse");
         assert_eq!(syn.window, IOS_15.syn_window);
 
-        let n = e.data(&[0u8; 100], &mut buf, 0).expect("data");
+        let n = e.data(&[0u8; 100], &mut buf, 0, true).expect("data");
         let data = parse_ipv4(&buf[..n]).expect("parse");
         let floor = IOS_15.window - IOS_15.window / 8;
         assert!(
@@ -1014,7 +1125,7 @@ mod tests {
         let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
         let mut ids = Vec::new();
         for i in 0..8u64 {
-            let packet = emitted(|b| e.data(b"x", b, i));
+            let packet = emitted(|b| e.data(b"x", b, i, true));
             ids.push(u16::from_be_bytes([packet[4], packet[5]]));
         }
         for w in ids.windows(2) {
@@ -1028,7 +1139,7 @@ mod tests {
             isn: CLIENT_ISN ^ 0x5555_5555,
             ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
         });
-        let packet = emitted(|b| other.data(b"x", b, 0));
+        let packet = emitted(|b| other.data(b"x", b, 0, true));
         assert_ne!(
             u16::from_be_bytes([packet[4], packet[5]]),
             ids[0],
@@ -1043,7 +1154,7 @@ mod tests {
         let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, IOS_15));
         let mut seen = std::collections::BTreeSet::new();
         for i in 0..64u64 {
-            let packet = emitted(|b| e.data(b"x", b, i));
+            let packet = emitted(|b| e.data(b"x", b, i, true));
             seen.insert(u16::from_be_bytes([packet[4], packet[5]]));
         }
         assert!(
@@ -1071,7 +1182,20 @@ mod tests {
             (LINUX_6, false, false),
             (IOS_15, true, false),
         ] {
-            let reply = emitted(|b| answer_syn(&profile, SERVER, &syn, 77, 1, whole, b));
+            let reply = emitted(|b| {
+                answer_syn(
+                    &profile,
+                    SERVER,
+                    &syn,
+                    Reply {
+                        isn: 77,
+                        ts_val: 1,
+                        dont_fragment: whole,
+                        mss: LINUX_6.mss,
+                    },
+                    b,
+                )
+            });
             let id = u16::from_be_bytes([reply[4], reply[5]]);
             assert_eq!(
                 id == 0,
@@ -1097,7 +1221,7 @@ mod tests {
         let mut hi = 0u16;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..2000 {
-            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
             let w = parse_ipv4(buf.get(..n).expect("emitted"))
                 .expect("parse")
                 .window;
@@ -1133,7 +1257,7 @@ mod tests {
         let payload = [0u8; 600];
 
         for _ in 0..16 {
-            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
             assert!(
                 seg.window > 32_000,
@@ -1173,7 +1297,7 @@ mod tests {
 
         let mut seqs = Vec::new();
         for _ in 0..8 {
-            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
             seqs.push(seg.seq);
         }
@@ -1201,11 +1325,11 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
 
-        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
         let first = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .seq;
-        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
         let second = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .seq;
@@ -1228,14 +1352,14 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
 
-        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
         let before = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .ack;
 
         // Nothing arrives at all -- every inbound packet lost.
         for _ in 0..4 {
-            let n = e.data(&payload, &mut buf, 0).expect("emit");
+            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
             let ack = parse_ipv4(buf.get(..n).expect("emitted"))
                 .expect("parse")
                 .ack;
@@ -1251,11 +1375,11 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
 
-        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
         let first = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .ack;
-        let n = e.data(&payload, &mut buf, 0).expect("emit");
+        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
         let second = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .ack;
@@ -1304,7 +1428,7 @@ mod tests {
 
         // The initiator's first data segment carries the completing ACK, but an
         // explicit empty ACK is what a real stack sends first.
-        let n = c.data(b"", &mut buf, 2).expect("ack");
+        let n = c.data(b"", &mut buf, 2, true).expect("ack");
         let ack = parse_ipv4(&buf[..n]).expect("parse ack");
         s.on_receive(&ack);
     }
@@ -1334,7 +1458,7 @@ mod tests {
         assert_eq!(synack.ack, 1_000_001, "and acknowledges the SYN's one byte");
         c.on_receive(&synack);
 
-        let n = c.data(b"", &mut buf, 2).expect("ack");
+        let n = c.data(b"", &mut buf, 2, true).expect("ack");
         let ack = parse_ipv4(&buf[..n]).expect("parse");
         assert_eq!(ack.seq, 1_000_001, "past the SYN");
         assert_eq!(ack.ack, 9_000_001, "acknowledging the responder's SYN");
@@ -1348,7 +1472,7 @@ mod tests {
         let mut expected_seq = 1_000_001u32;
         for len in [1usize, 100, 1400, 7, 0, 512] {
             let payload = vec![0xAA; len];
-            let packet = emitted(|b| c.data(&payload, b, 10));
+            let packet = emitted(|b| c.data(&payload, b, 10, true));
             let seg = parse_ipv4(&packet).expect("parse");
             assert_eq!(seg.seq, expected_seq, "payload of {len} bytes");
             expected_seq = expected_seq.wrapping_add(u32::try_from(len).expect("fits"));
@@ -1364,12 +1488,12 @@ mod tests {
         let mut expected_ack = 1_000_001u32;
         for len in [10usize, 250, 1400] {
             let payload = vec![0xBB; len];
-            let packet = emitted(|b| c.data(&payload, b, 10));
+            let packet = emitted(|b| c.data(&payload, b, 10, true));
             let seg = parse_ipv4(&packet).expect("parse");
             s.on_receive(&seg);
             expected_ack = expected_ack.wrapping_add(u32::try_from(len).expect("fits"));
 
-            let reply = emitted(|b| s.data(b"", b, 11));
+            let reply = emitted(|b| s.data(b"", b, 11, true));
             let reply_seg = parse_ipv4(&reply).expect("parse");
             assert_eq!(reply_seg.ack, expected_ack);
         }
@@ -1383,12 +1507,12 @@ mod tests {
         for i in 0..500u32 {
             let payload = i.to_be_bytes();
 
-            let packet = emitted(|b| c.data(&payload, b, u64::from(i)));
+            let packet = emitted(|b| c.data(&payload, b, u64::from(i), true));
             let seg = parse_ipv4(&packet).expect("parse");
             assert_eq!(seg.seq, c.next_seq().wrapping_sub(4));
             s.on_receive(&seg);
 
-            let packet = emitted(|b| s.data(&payload, b, u64::from(i)));
+            let packet = emitted(|b| s.data(&payload, b, u64::from(i), true));
             let seg = parse_ipv4(&packet).expect("parse");
             c.on_receive(&seg);
         }
@@ -1409,7 +1533,7 @@ mod tests {
         connect(&mut c, &mut s);
 
         // The ISN plus the SYN's byte has already wrapped past zero.
-        let packet = emitted(|b| c.data(&[0u8; 100], b, 0));
+        let packet = emitted(|b| c.data(&[0u8; 100], b, 0, true));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.seq, u32::MAX.wrapping_add(1).wrapping_sub(5));
         s.on_receive(&seg);
@@ -1421,7 +1545,7 @@ mod tests {
         let mut c = client();
         let mut buf = vec![0u8; 2048];
         assert!(matches!(
-            c.data(b"too early", &mut buf, 0),
+            c.data(b"too early", &mut buf, 0, true),
             Err(Error::NotEstablished)
         ));
     }
@@ -1451,12 +1575,12 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"hello", b, 12_345));
+        let packet = emitted(|b| c.data(b"hello", b, 12_345, true));
         let seg = parse_ipv4(&packet).expect("parse");
         let client_ts = seg.ts_val.expect("linux profile sends timestamps");
         s.on_receive(&seg);
 
-        let reply = emitted(|b| s.data(b"hi", b, 12_400));
+        let reply = emitted(|b| s.data(b"hi", b, 12_400, true));
         let reply_seg = parse_ipv4(&reply).expect("parse");
         let opts_ecr = {
             // The echo is the second word of the timestamp option.
@@ -1473,12 +1597,12 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"", b, 50_000));
+        let packet = emitted(|b| c.data(b"", b, 50_000, true));
         let seg = parse_ipv4(&packet).expect("parse");
         let fresh = seg.ts_val.expect("timestamp");
         assert!(s.on_receive(&seg).is_none(), "empty payload yields nothing");
 
-        let reply = emitted(|b| s.data(b"x", b, 50_001));
+        let reply = emitted(|b| s.data(b"x", b, 50_001, true));
         let tcp = &reply[segment::IPV4_LEN..];
         let opts = &tcp[segment::TCP_LEN..];
         assert_eq!(
@@ -1491,7 +1615,7 @@ mod tests {
     fn the_timestamp_clock_does_not_start_at_zero() {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
-        let packet = emitted(|b| c.data(b"x", b, 0));
+        let packet = emitted(|b| c.data(b"x", b, 0, true));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.ts_val, Some(5_000), "ts_base offsets the clock");
     }
@@ -1504,7 +1628,7 @@ mod tests {
         let base = LINUX_6.window >> LINUX_6.window_scale.expect("linux scales");
         let mut seen = std::collections::BTreeSet::new();
         for i in 0..64u64 {
-            let packet = emitted(|b| c.data(b"x", b, i));
+            let packet = emitted(|b| c.data(b"x", b, i, true));
             let seg = parse_ipv4(&packet).expect("parse");
             seen.insert(seg.window);
             let w = u32::from(seg.window);
@@ -1561,6 +1685,8 @@ mod tests {
                 ts_val: 0,
                 ts_ecr: 0,
                 dont_fragment: true,
+                push: false,
+                mss: LINUX_6.mss,
             },
             &[],
             &mut buf,
@@ -1577,7 +1703,7 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"before roaming", b, 0));
+        let packet = emitted(|b| c.data(b"before roaming", b, 0, true));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
         let seq_before = s.next_seq();
@@ -1595,7 +1721,7 @@ mod tests {
         assert_eq!(s.next_ack(), ack_before);
         assert_eq!(s.remote(), roamed);
 
-        let reply = emitted(|b| s.data(b"after roaming", b, 1));
+        let reply = emitted(|b| s.data(b"after roaming", b, 1, true));
         let seg = parse_ipv4(&reply).expect("parse");
         assert_eq!(seg.dst, roamed, "and packets follow the peer");
         assert_eq!(seg.seq, seq_before);
@@ -1610,7 +1736,7 @@ mod tests {
         // A fresh responder that never saw a SYN has no sequence space to
         // reason about, so it must not fold the payload in.
         let mut fresh = server();
-        let packet = emitted(|b| c.data(b"orphan", b, 0));
+        let packet = emitted(|b| c.data(b"orphan", b, 0, true));
         let seg = parse_ipv4(&packet).expect("parse");
         assert!(fresh.on_receive(&seg).is_none());
         assert_eq!(fresh.next_ack(), None);
@@ -1622,7 +1748,7 @@ mod tests {
         connect(&mut c, &mut s);
 
         let payload = b"the inner packet";
-        let packet = emitted(|b| c.data(payload, b, 0));
+        let packet = emitted(|b| c.data(payload, b, 0, true));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(s.on_receive(&seg), Some(&payload[..]));
     }
@@ -1633,7 +1759,7 @@ mod tests {
         let mut s = Endpoint::new(cfg(Role::Responder, Carrier::Handshake, WINDOWS_11));
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"x", b, 1234));
+        let packet = emitted(|b| c.data(b"x", b, 1234, true));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.ts_val, None);
         assert!(s.on_receive(&seg).is_some());
@@ -1660,7 +1786,7 @@ mod tests {
         // already consistent.
         let (mut c, mut s) = midstream_pair();
 
-        let packet = emitted(|b| c.data(b"first ever packet", b, 0));
+        let packet = emitted(|b| c.data(b"first ever packet", b, 0, true));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.seq, CLIENT_ISN);
         assert_eq!(
@@ -1669,7 +1795,7 @@ mod tests {
         );
 
         s.on_receive(&seg);
-        let reply = emitted(|b| s.data(b"reply", b, 1));
+        let reply = emitted(|b| s.data(b"reply", b, 1, true));
         let reply_seg = parse_ipv4(&reply).expect("parse");
         assert_eq!(reply_seg.seq, SERVER_ISN);
         assert_eq!(reply_seg.ack, CLIENT_ISN.wrapping_add(17));
@@ -1680,9 +1806,9 @@ mod tests {
         let (mut c, mut s) = midstream_pair();
         for i in 0..500u32 {
             let payload = i.to_be_bytes();
-            let packet = emitted(|b| c.data(&payload, b, u64::from(i)));
+            let packet = emitted(|b| c.data(&payload, b, u64::from(i), true));
             s.on_receive(&parse_ipv4(&packet).expect("parse"));
-            let reply = emitted(|b| s.data(&payload, b, u64::from(i)));
+            let reply = emitted(|b| s.data(&payload, b, u64::from(i), true));
             c.on_receive(&parse_ipv4(&reply).expect("parse"));
         }
         assert_eq!(c.next_ack(), Some(s.next_seq()));
@@ -1710,6 +1836,8 @@ mod tests {
                 ts_val: 1,
                 ts_ecr: 0,
                 dont_fragment: true,
+                push: false,
+                mss: LINUX_6.mss,
             },
             &[],
             &mut buf,
@@ -1734,13 +1862,13 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let first = emitted(|b| c.data(&[1u8; 200], b, 0));
+        let first = emitted(|b| c.data(&[1u8; 200], b, 0, true));
         s.on_receive(&parse_ipv4(&first).expect("parse"));
 
         // This one never arrives.
-        let _lost = emitted(|b| c.data(&[2u8; 300], b, 1));
+        let _lost = emitted(|b| c.data(&[2u8; 300], b, 1, true));
 
-        let third = emitted(|b| c.data(&[3u8; 100], b, 2));
+        let third = emitted(|b| c.data(&[3u8; 100], b, 2, true));
         s.on_receive(&parse_ipv4(&third).expect("parse"));
 
         assert_eq!(s.next_ack(), Some(c.next_seq()));
@@ -1749,8 +1877,8 @@ mod tests {
     #[test]
     fn a_reordered_segment_does_not_pull_the_acknowledgement_back() {
         let (mut c, mut s) = midstream_pair();
-        let early = emitted(|b| c.data(&[1u8; 500], b, 0));
-        let late = emitted(|b| c.data(&[2u8; 500], b, 1));
+        let early = emitted(|b| c.data(&[1u8; 500], b, 0, true));
+        let late = emitted(|b| c.data(&[2u8; 500], b, 1, true));
 
         s.on_receive(&parse_ipv4(&late).expect("parse"));
         let ack = s.next_ack();
@@ -1770,14 +1898,14 @@ mod tests {
             CLIENT_ISN.wrapping_add(50_000_000),
         ] {
             let (mut c, mut s) = midstream_pair();
-            let packet = emitted(|b| c.data(&[1u8; 100], b, 0));
+            let packet = emitted(|b| c.data(&[1u8; 100], b, 0, true));
             s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
             let mut fresh = Endpoint::new(Config {
                 isn: base,
                 ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
             });
-            let packet = emitted(|b| fresh.data(&[2u8; 100], b, 1));
+            let packet = emitted(|b| fresh.data(&[2u8; 100], b, 1, true));
             s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
             assert_eq!(s.next_ack(), Some(base.wrapping_add(100)), "base {base}");
@@ -1787,7 +1915,7 @@ mod tests {
     #[test]
     fn a_peer_at_a_new_address_is_learned_from_its_first_segment() {
         let (mut c, mut s) = midstream_pair();
-        let packet = emitted(|b| c.data(&[1u8; 100], b, 0));
+        let packet = emitted(|b| c.data(&[1u8; 100], b, 0, true));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
         // Close behind, so only the move explains taking it.
@@ -1797,7 +1925,7 @@ mod tests {
             ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
         });
         s.set_remote(moved.local);
-        let packet = emitted(|b| moved.data(&[2u8; 10], b, 1));
+        let packet = emitted(|b| moved.data(&[2u8; 10], b, 1, true));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
         assert_eq!(s.next_ack(), Some(moved.next_seq()));
@@ -1813,7 +1941,7 @@ mod tests {
             isn: CLIENT_ISN.wrapping_sub(5_000),
             ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
         });
-        let packet = emitted(|b| stranger.data(&[1u8; 10], b, 0));
+        let packet = emitted(|b| stranger.data(&[1u8; 10], b, 0, true));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
         assert_eq!(s.next_ack(), Some(stranger.next_seq()));
     }
@@ -1830,7 +1958,7 @@ mod tests {
         assert!(c.wants_opening());
         assert!(!c.is_ready(), "nothing may go ahead of the SYN");
         assert!(matches!(
-            c.data(b"early", &mut buf, 0),
+            c.data(b"early", &mut buf, 0, true),
             Err(Error::NotEstablished)
         ));
 
@@ -1845,7 +1973,7 @@ mod tests {
         assert_eq!(c.handshake(&mut buf, 1).expect("again"), None);
         assert!(c.is_ready(), "and nothing waits for an answer");
 
-        let n = c.data(b"first", &mut buf, 2).expect("data");
+        let n = c.data(b"first", &mut buf, 2, true).expect("data");
         let data = parse_ipv4(&buf[..n]).expect("parse");
         assert_eq!(data.seq, CLIENT_ISN, "the byte after the SYN");
         assert!(
@@ -1867,7 +1995,7 @@ mod tests {
         assert_eq!(synack.seq, SERVER_ISN.wrapping_sub(1));
         assert_eq!(synack.ack, CLIENT_ISN);
 
-        let n = s.data(b"reply", &mut buf, 1).expect("data");
+        let n = s.data(b"reply", &mut buf, 1, true).expect("data");
         assert_eq!(parse_ipv4(&buf[..n]).expect("parse").seq, SERVER_ISN);
     }
 
@@ -1879,7 +2007,7 @@ mod tests {
         let syn = parse_ipv4(&syn).expect("parse");
 
         // A responder that has moved on since the numbers were derived.
-        let _ = emitted(|b| s.data(&[0u8; 700], b, 0));
+        let _ = emitted(|b| s.data(&[0u8; 700], b, 0, true));
         let synack = emitted(|b| s.answer(syn.seq.wrapping_add(1), b, 1));
         c.on_receive(&parse_ipv4(&synack).expect("parse"));
 
@@ -1917,7 +2045,20 @@ mod tests {
             seq: syn.seq.wrapping_add(9),
             ..syn
         };
-        let forged = emitted(|b| answer_syn(&LINUX_6, SERVER, &other, 77, 1, true, b));
+        let forged = emitted(|b| {
+            answer_syn(
+                &LINUX_6,
+                SERVER,
+                &other,
+                Reply {
+                    isn: 77,
+                    ts_val: 1,
+                    dont_fragment: true,
+                    mss: LINUX_6.mss,
+                },
+                b,
+            )
+        });
         c.on_receive(&parse_ipv4(&forged).expect("parse"));
         assert!(!c.is_ready(), "it does not acknowledge our SYN");
         assert!(c.wants_opening());
@@ -1929,7 +2070,20 @@ mod tests {
         let syn = opening(&mut c, 0);
         let syn = parse_ipv4(&syn).expect("parse");
 
-        let synack = emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 4_242, 9_999, true, b));
+        let synack = emitted(|b| {
+            answer_syn(
+                &LINUX_6,
+                SERVER,
+                &syn,
+                Reply {
+                    isn: 4_242,
+                    ts_val: 9_999,
+                    dont_fragment: true,
+                    mss: LINUX_6.mss,
+                },
+                b,
+            )
+        });
         let synack = parse_ipv4(&synack).expect("parse");
         assert_eq!(synack.flags, segment::flags::SYN | segment::flags::ACK);
         assert_eq!(synack.ack, CLIENT_ISN.wrapping_add(1));
@@ -1949,11 +2103,11 @@ mod tests {
         // The responder kept nothing, and takes up the connection from the
         // first segment the peer sends on it.
         let mut s = server();
-        let hello = emitted(|b| c.data(b"hello", b, 2));
+        let hello = emitted(|b| c.data(b"hello", b, 2, true));
         s.rejoin(&parse_ipv4(&hello).expect("parse"), 7_000);
         assert!(s.is_ready());
         assert_eq!(s.next_ack(), Some(CLIENT_ISN.wrapping_add(6)));
-        let reply = emitted(|b| s.data(b"hi", b, 3));
+        let reply = emitted(|b| s.data(b"hi", b, 3, true));
         let reply = parse_ipv4(&reply).expect("parse");
         assert_eq!(reply.seq, 4_243, "the byte after the SYN+ACK it never kept");
         c.on_receive(&reply);
@@ -1968,7 +2122,20 @@ mod tests {
         let mut c = client();
         let syn = opening(&mut c, 0);
         let syn = parse_ipv4(&syn).expect("parse");
-        let synack = emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 77, 1, true, b));
+        let synack = emitted(|b| {
+            answer_syn(
+                &LINUX_6,
+                SERVER,
+                &syn,
+                Reply {
+                    isn: 77,
+                    ts_val: 1,
+                    dont_fragment: true,
+                    mss: LINUX_6.mss,
+                },
+                b,
+            )
+        });
         let good = parse_ipv4(&synack).expect("parse");
         assert!(c.answers_syn(&good));
         for extra in [segment::flags::RST, segment::flags::FIN] {
@@ -1995,14 +2162,27 @@ mod tests {
         let mut c = client();
         let syn = opening(&mut c, 0);
         let syn = parse_ipv4(&syn).expect("parse");
-        let synack = emitted(|b| answer_syn(&LINUX_6, SERVER, &syn, 4_242, 1, true, b));
+        let synack = emitted(|b| {
+            answer_syn(
+                &LINUX_6,
+                SERVER,
+                &syn,
+                Reply {
+                    isn: 4_242,
+                    ts_val: 1,
+                    dont_fragment: true,
+                    mss: LINUX_6.mss,
+                },
+                b,
+            )
+        });
         let synack = parse_ipv4(&synack).expect("parse");
         c.on_receive(&synack);
 
         let mut s = server();
-        let hello = emitted(|b| c.data(b"hello", b, 1));
+        let hello = emitted(|b| c.data(b"hello", b, 1, true));
         s.rejoin(&parse_ipv4(&hello).expect("parse"), 7_000);
-        let reply = emitted(|b| s.data(&[0u8; 900], b, 2));
+        let reply = emitted(|b| s.data(&[0u8; 900], b, 2, true));
         c.on_receive(&parse_ipv4(&reply).expect("parse"));
         let ack = c.next_ack();
 
@@ -2014,7 +2194,7 @@ mod tests {
     fn a_peer_that_restarted_in_place_is_told_apart_by_its_acknowledgement() {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
-        let current = emitted(|b| c.data(b"same connection", b, 0));
+        let current = emitted(|b| c.data(b"same connection", b, 0, true));
         assert!(!s.names_another_connection(&parse_ipv4(&current).expect("parse")));
 
         let reborn = segment::Segment {
@@ -2068,18 +2248,21 @@ mod tests {
                 &LINUX_6,
                 SERVER,
                 &syn,
-                1,
-                timestamp(123_456, 10, LINUX_6.ts_hz),
-                true,
+                Reply {
+                    isn: 1,
+                    ts_val: timestamp(123_456, 10, LINUX_6.ts_hz),
+                    dont_fragment: true,
+                    mss: LINUX_6.mss,
+                },
                 b,
             )
         });
         c.on_receive(&parse_ipv4(&synack).expect("parse"));
-        let hello = emitted(|b| c.data(b"hello", b, 20));
+        let hello = emitted(|b| c.data(b"hello", b, 20, true));
 
         let mut s = server();
         s.rejoin(&parse_ipv4(&hello).expect("parse"), 123_456);
-        let reply = emitted(|b| s.data(b"hi", b, 30));
+        let reply = emitted(|b| s.data(b"hi", b, 30, true));
         assert_eq!(
             parse_ipv4(&reply).expect("parse").ts_val,
             Some(timestamp(123_456, 30, LINUX_6.ts_hz))
@@ -2093,7 +2276,7 @@ mod tests {
         let _ = c.handshake(&mut buf, 0).expect("syn");
         assert!(!c.is_ready());
         assert!(matches!(
-            c.data(b"early", &mut buf, 1),
+            c.data(b"early", &mut buf, 1, true),
             Err(Error::NotEstablished)
         ));
     }

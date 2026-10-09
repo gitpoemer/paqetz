@@ -70,9 +70,9 @@ pub enum Kind {
     Ack,
     /// Data segment.
     ///
-    /// Carries PSH because every tunnel packet is a complete inner packet, so
-    /// each one genuinely is the end of a write — which is precisely when a
-    /// real stack sets PSH.
+    /// Whether it carries PSH is [`Fields::push`]: a real stack sets the bit
+    /// when its send buffer empties, which is the end of a burst rather than
+    /// every segment of one.
     Data,
     /// Graceful close.
     Fin,
@@ -88,7 +88,7 @@ impl Kind {
             Self::Syn => flags::SYN,
             Self::SynAck => flags::SYN | flags::ACK,
             Self::Ack => flags::ACK,
-            Self::Data => flags::PSH | flags::ACK,
+            Self::Data => flags::ACK,
             Self::Fin => flags::FIN | flags::ACK,
             Self::Rst => flags::RST,
         }
@@ -127,6 +127,24 @@ pub struct Fields {
     pub ts_val: u32,
     /// Timestamp option echo reply.
     pub ts_ecr: u32,
+    /// Whether this segment ends a burst, which is when a real stack sets PSH.
+    ///
+    /// Every tunnel packet is a complete inner packet, so it was tempting to
+    /// read each one as the end of a write. On the wire that put PSH on a
+    /// hundred per cent of data segments in both directions, where a real bulk
+    /// transfer leaves it clear on all but the last of each burst -- a
+    /// single-bit test needing no payload inspection at all. It also stops a
+    /// receiver's own coalescing, which flushes on the bit.
+    pub push: bool,
+    /// The maximum segment size to advertise, on a SYN.
+    ///
+    /// The profile's value describes a host on a 1500-byte Ethernet path. This
+    /// carrier leaves deliberate slack below that, so advertising the profile's
+    /// number would promise segments it never sends: the largest payload would
+    /// sit a fixed distance below the maximum for the life of every connection,
+    /// which is as good a marker as the gap is wide. Derived from the MTU
+    /// actually in use instead, exactly as a host behind a smaller path does.
+    pub mss: u16,
     /// Whether to set Don't Fragment.
     ///
     /// Set, a hop too small to pass the packet says so and the tunnel can read
@@ -285,7 +303,15 @@ pub fn emit_parts(
         c.u32(fields.ack)?;
         let data_offset_words = u8::try_from(tcp_total / 4).unwrap_or(5);
         c.u8(data_offset_words << 4)?;
-        c.u8(kind.flags())?;
+        // PSH is the one flag the connection state does not decide: it says
+        // this segment ends a burst.
+        let flags = kind.flags()
+            | if fields.push && kind == Kind::Data {
+                flags::PSH
+            } else {
+                0
+            };
+        c.u8(flags)?;
         c.u16(fields.window)?;
         c.u16(0)?; // checksum, filled below
         c.u16(0)?; // urgent pointer
@@ -400,7 +426,7 @@ fn write_options(c: &mut Cursor<'_>, kind: Kind, profile: &OsProfile, f: &Fields
                 SynOption::Mss => {
                     c.u8(2)?;
                     c.u8(4)?;
-                    c.u16(profile.mss)?;
+                    c.u16(f.mss)?;
                 }
                 SynOption::SackPermitted => {
                     c.u8(4)?;
@@ -625,6 +651,8 @@ mod tests {
             ts_val: 0x0011_2233,
             ts_ecr: 0x4455_6677,
             dont_fragment: true,
+            push: true,
+            mss: LINUX_6.mss,
         }
     }
 
@@ -760,12 +788,71 @@ mod tests {
             (Kind::Syn, flags::SYN),
             (Kind::SynAck, flags::SYN | flags::ACK),
             (Kind::Ack, flags::ACK),
+            // The emitting fixture pushes, so this is the end-of-burst case.
             (Kind::Data, flags::PSH | flags::ACK),
             (Kind::Fin, flags::FIN | flags::ACK),
             (Kind::Rst, flags::RST),
         ] {
             let packet = emit_vec(kind, &LINUX_6, b"");
             assert_eq!(packet[IPV4_LEN + 13], expected, "{kind:?}");
+        }
+    }
+
+    /// The signal this exists to remove: PSH on every segment of a burst.
+    #[test]
+    fn only_the_end_of_a_burst_pushes() {
+        for (push, expected) in [(true, flags::PSH | flags::ACK), (false, flags::ACK)] {
+            let mut buf = vec![0u8; 2048];
+            let n = emit(
+                Kind::Data,
+                &LINUX_6,
+                &Fields { push, ..fields() },
+                b"payload",
+                &mut buf,
+            )
+            .expect("emit");
+            assert_eq!(buf[..n][IPV4_LEN + 13], expected, "push = {push}");
+        }
+    }
+
+    /// The bit means nothing on anything but data, and setting it there would
+    /// be a flag combination no stack sends.
+    #[test]
+    fn nothing_but_data_pushes() {
+        for kind in [Kind::Syn, Kind::SynAck, Kind::Ack, Kind::Fin, Kind::Rst] {
+            let mut buf = vec![0u8; 2048];
+            let n = emit(
+                kind,
+                &LINUX_6,
+                &Fields {
+                    push: true,
+                    ..fields()
+                },
+                b"",
+                &mut buf,
+            )
+            .expect("emit");
+            assert_eq!(buf[..n][IPV4_LEN + 13] & flags::PSH, 0, "{kind:?}");
+        }
+    }
+
+    /// A connection that promises one size on its SYN and never sends it is
+    /// marked by the gap for the rest of its life.
+    #[test]
+    fn a_syn_advertises_the_mss_it_was_given() {
+        for mss in [1440u16, 1380, LINUX_6.mss] {
+            let mut buf = vec![0u8; 2048];
+            let n = emit(
+                Kind::Syn,
+                &LINUX_6,
+                &Fields { mss, ..fields() },
+                b"",
+                &mut buf,
+            )
+            .expect("emit");
+            let opts = &buf[..n][IPV4_LEN + TCP_LEN..];
+            assert_eq!(opts[0], 2, "first option should be MSS");
+            assert_eq!(u16::from_be_bytes([opts[2], opts[3]]), mss);
         }
     }
 
