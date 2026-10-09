@@ -177,20 +177,38 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     //
     // `initiator` because rotation is the initiating side's alone: the side
     // that waits has to be findable, so its port cannot move.
+    //
+    // `spoof_sni` and what follows it are deliberately absent. They have no
+    // value in force to show, and more than that: a file naming the decoy, on a
+    // host chosen because it is reachable from somewhere that inspects hosts,
+    // is a description of the disguise sitting next to the disguise. The docs
+    // are the place for it.
     let tuning = |t: &mut String, initiator: bool, exit: bool| -> std::fmt::Result {
         writeln!(
             t,
             "\n# --- Optional. Values shown are the ones in force. ---"
         )?;
+        // Both lists come from the code that reads them rather than from here,
+        // because this one said "linux-6 | windows-11 | android-14" and
+        // "midstream | gre | rawip" for several releases after the other
+        // profiles and carriers existed -- a file telling an operator that what
+        // they want is not available.
         writeln!(
             t,
-            "# carrier = \"midstream\"       # midstream | gre | rawip"
+            "# carrier = \"midstream\"       # {}",
+            crate::config::CARRIERS.join(" | ")
         )?;
         writeln!(t, "# carrier_protocol = 143")?;
+        let profiles: Vec<&str> = paqetz_tcpwire::profile::ALL
+            .iter()
+            .map(|p| p.name)
+            .collect();
         writeln!(
             t,
-            "# profile = \"linux-6\"         # linux-6 | windows-11 | android-14"
+            "# profile = \"linux-6\"         # {}",
+            profiles.join(" | ")
         )?;
+        writeln!(t, "# sequencing = \"opaque\"       # opaque | stream")?;
         writeln!(t, "# fragment = \"never\"          # never | path")?;
         writeln!(t, "# mtu = 1400")?;
         writeln!(t, "# keepalive = true")?;
@@ -211,6 +229,7 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
         }
         writeln!(t, "#")?;
         writeln!(t, "# datapath = \"simple\"         # simple | batched")?;
+        writeln!(t, "# coalesce = false")?;
         writeln!(t, "# transmit = \"raw\"            # raw | afpacket")?;
         writeln!(t, "# manage_firewall = true")?;
         writeln!(
@@ -1193,7 +1212,9 @@ mod tests {
                 "retransmit_deadline",
                 "retransmit_asks",
                 "retransmit_reorder",
+                "sequencing",
                 "datapath",
+                "coalesce",
                 "transmit",
                 "log",
                 "health_interval",
@@ -1217,6 +1238,23 @@ mod tests {
                         && !bare.starts_with("rotate")
                         && !bare.starts_with("fragment"),
                     "{which} sets {bare:?} rather than showing it"
+                );
+            }
+        }
+
+        // The lists beside `carrier` and `profile` are built from the code that
+        // reads them, and this is what says so: both said three names for
+        // several releases after the other three existed, which is a file
+        // telling an operator that what they want is not available.
+        for (which, text) in [("server", &server), ("client", &client)] {
+            for name in crate::config::CARRIERS {
+                assert!(text.contains(name), "{which} does not offer carrier {name}");
+            }
+            for profile in paqetz_tcpwire::profile::ALL {
+                assert!(
+                    text.contains(profile.name),
+                    "{which} does not offer profile {}",
+                    profile.name
                 );
             }
         }

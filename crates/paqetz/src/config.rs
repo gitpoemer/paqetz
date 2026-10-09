@@ -539,6 +539,21 @@ impl Interface {
     }
 }
 
+/// Every value `carrier` accepts, in the order the parser reads them.
+///
+/// One source, so the error above, the file `init` writes and the parser itself
+/// cannot drift apart: the generated file listed three of these for a while
+/// after the other three were added, which is a file telling an operator that
+/// what they want is not available.
+pub(crate) const CARRIERS: &[&str] = &[
+    "midstream",
+    "midstream-fh",
+    "handshake",
+    "gre",
+    "icmp",
+    "rawip",
+];
+
 /// The profiles whose devices do, or do not, set Don't Fragment.
 ///
 /// Named from the list rather than written out, so a profile added later turns
@@ -1704,12 +1719,10 @@ impl Config {
                 Shape::Raw(paqetz_tcpwire::rawip::Shell::Bare(proto))
             }
             other => {
+                let names: Vec<String> = CARRIERS.iter().map(|c| format!("{c:?}")).collect();
                 return Err(invalid(
                     "interface.carrier",
-                    format!(
-                        "expected \"midstream\", \"midstream-fh\", \"handshake\", \"gre\", \
-                         \"icmp\" or \"rawip\", got {other:?}"
-                    ),
+                    format!("expected one of {}, got {other:?}", names.join(", ")),
                 ));
             }
         };
@@ -2490,6 +2503,29 @@ mod tests {
 
     /// The signal this removes: every segment of every connection a fixed
     /// distance below the size the SYN promised.
+    /// The list and the parser are both written by hand, and the file `init`
+    /// generates is built from the list.
+    #[test]
+    fn every_carrier_the_list_names_is_one_the_parser_takes() {
+        for name in CARRIERS {
+            let extra = if *name == "rawip" {
+                "\ncarrier_protocol = 143"
+            } else {
+                ""
+            };
+            assert!(
+                with_interface(&format!("carrier = {name:?}{extra}")).is_ok(),
+                "{name} is listed but not accepted"
+            );
+        }
+        // And nothing outside it, so the list is the whole set rather than a
+        // sample of it.
+        let err = with_interface("carrier = \"tls\"").expect_err("should refuse");
+        for name in CARRIERS {
+            assert!(err.to_string().contains(name), "{name} missing from {err}");
+        }
+    }
+
     #[test]
     fn the_advertised_mss_is_the_one_the_carrier_can_fill() {
         let largest = |c: &TunnelConfig| -> u32 {
