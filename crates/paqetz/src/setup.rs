@@ -178,11 +178,12 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
     // `initiator` because rotation is the initiating side's alone: the side
     // that waits has to be findable, so its port cannot move.
     //
-    // `spoof_sni` and what follows it are deliberately absent. They have no
-    // value in force to show, and more than that: a file naming the decoy, on a
-    // host chosen because it is reachable from somewhere that inspects hosts,
-    // is a description of the disguise sitting next to the disguise. The docs
-    // are the place for it.
+    // `spoof_sni` carries an example rather than a value, because it has no
+    // value in force: unset is what every tunnel starts as, and a name is a
+    // guess about what the path reads that nothing here can make. The two
+    // settings under it follow it, which is the one thing about them that would
+    // otherwise bite -- `spoof_records` alone is refused outright, and
+    // `acknowledge` alone is packets spent on a claim nothing is making.
     let tuning = |t: &mut String, initiator: bool, exit: bool| -> std::fmt::Result {
         writeln!(
             t,
@@ -209,6 +210,14 @@ pub(crate) fn render(plan: &Plan) -> Result<Pair, Box<dyn std::error::Error>> {
             profiles.join(" | ")
         )?;
         writeln!(t, "# sequencing = \"opaque\"       # opaque | stream")?;
+        writeln!(t, "#")?;
+        writeln!(
+            t,
+            "# spoof_sni = \"www.cloudflare.com\"   # needs carrier = \"handshake\""
+        )?;
+        writeln!(t, "# spoof_records = true        # with spoof_sni")?;
+        writeln!(t, "# acknowledge = true          # with spoof_sni")?;
+        writeln!(t, "#")?;
         writeln!(t, "# fragment = \"never\"          # never | path")?;
         writeln!(t, "# mtu = 1400")?;
         writeln!(t, "# keepalive = true")?;
@@ -1213,6 +1222,9 @@ mod tests {
                 "retransmit_asks",
                 "retransmit_reorder",
                 "sequencing",
+                "spoof_sni",
+                "spoof_records",
+                "acknowledge",
                 "datapath",
                 "coalesce",
                 "transmit",
@@ -1240,6 +1252,36 @@ mod tests {
                     "{which} sets {bare:?} rather than showing it"
                 );
             }
+        }
+
+        // The decoy's name is an example rather than a value in force, so it is
+        // the one line here that can be wrong in a way the others cannot: a
+        // name the parser refuses would be a file offering something that fails
+        // the moment it is uncommented.
+        for (which, text) in [("server", &server), ("client", &client)] {
+            let line = text
+                .lines()
+                .find(|l| l.contains("spoof_sni ="))
+                .unwrap_or_else(|| panic!("{which} has no spoof_sni line"));
+            let name = line
+                .split('"')
+                .nth(1)
+                .unwrap_or_else(|| panic!("{which}: no name in {line:?}"));
+            assert!(
+                crate::config::Config::parse(&format!(
+                    "[interface]\n\
+                     private_key = \"QEmpXFn5nJPQxCXi7ZKKlpJVCTMWEQKRJ1DzDDN2P2Y=\"\n\
+                     address = \"10.7.0.2/24\"\n\
+                     listen_port = 443\n\
+                     carrier = \"handshake\"\n\
+                     spoof_sni = {name:?}\n\
+                     \n[peer]\n\
+                     public_key = \"jWplENLSFXt49VMIq3NYGvZglSsry0gzDWL1bkNPLRc=\"\n\
+                     tunnel_address = \"10.7.0.1\"\n"
+                ))
+                .is_ok(),
+                "{which} offers a name the parser refuses: {name:?}"
+            );
         }
 
         // The lists beside `carrier` and `profile` are built from the code that
