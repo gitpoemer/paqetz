@@ -276,6 +276,14 @@ pub struct Endpoint {
     syn_counted: bool,
     /// The maximum segment size this end advertises.
     mss: u16,
+    /// Bytes of the record currently being written that are still to come.
+    ///
+    /// A record spans as many packets as the sender had ready, so this counts
+    /// down across them. Zero means the stream is at a record boundary, which
+    /// is the only place anything else -- a decoy flight, which is records of
+    /// its own -- may be written without breaking the chain of lengths an
+    /// observer follows.
+    record_left: usize,
     /// Segments carrying payload received since this end last sent anything.
     ///
     /// A real receiver answers about every second segment. Nothing here needs
@@ -325,6 +333,7 @@ impl Endpoint {
             peer_ts_val: 0,
             counter: 0,
             syn_counted: !waits,
+            record_left: 0,
             mss: match cfg.mss {
                 Some(mss) => {
                     if mss < cfg.profile.mss {
@@ -581,6 +590,16 @@ impl Endpoint {
         self.emit_raw(Kind::Ack, &[], out, now, false)
     }
 
+    /// Whether the stream is between records.
+    ///
+    /// A decoy flight is records of its own, so writing one in the middle of
+    /// another record would break the chain of lengths an observer follows from
+    /// the hello onward. Always true when nothing wears records.
+    #[must_use]
+    pub const fn at_record_boundary(&self) -> bool {
+        !self.records || self.record_left == 0
+    }
+
     /// Whether a real receiver would have acknowledged by now.
     ///
     /// True once two payload-bearing segments have arrived with nothing sent
@@ -615,21 +634,54 @@ impl Endpoint {
 
     /// Writes one data segment carrying `payload`.
     ///
+    /// `record` opens an application-data record of that many bytes, which may
+    /// be more than this packet carries: the rest of it follows in the packets
+    /// after this one, which pass `None`. A real session writes one record per
+    /// application write, so one record per burst of packets is what a burst
+    /// should look like. One per packet, which is what this did first, put a
+    /// record header at the start of every segment of every bulk transfer,
+    /// where a real session starts one in about twelve.
+    ///
     /// # Errors
     /// - [`Error::Short`] if `out` cannot hold the segment.
     /// - [`Error::NotEstablished`] if the connection is not yet open.
-    pub fn data(&mut self, payload: &[u8], out: &mut [u8], now: u64, push: bool) -> Result<usize> {
+    /// - [`Error::TooLong`] if `record` is longer than a record may be.
+    pub fn data(
+        &mut self,
+        payload: &[u8],
+        out: &mut [u8],
+        now: u64,
+        push: bool,
+        record: Option<usize>,
+    ) -> Result<usize> {
         if !self.is_ready() {
             return Err(Error::NotEstablished);
         }
         // The record header is on the wire, so it occupies sequence space like
         // anything else: counted here rather than in `emit`, which is told what
         // to write and not what it means.
-        let header = if self.records {
-            crate::cover::record_header(payload.len())
+        // A header goes in only at a boundary, whatever the caller asked for.
+        // The caller's figure is what it expects the burst to carry, and a
+        // packet it then decides not to send would leave the record short and
+        // every header after it inside the record before -- so the record this
+        // end is already writing always wins, and simply spans further than
+        // planned. That keeps the chain of lengths continuous, which is the one
+        // property an observer walking the stream depends on.
+        let opening = self.records && self.record_left == 0;
+        let header = if opening {
+            let total = record.unwrap_or(payload.len());
+            Some(crate::cover::record_header(total).ok_or(Error::TooLong { len: total })?)
         } else {
             None
         };
+        if self.records {
+            let total = if opening {
+                record.unwrap_or(payload.len())
+            } else {
+                self.record_left
+            };
+            self.record_left = total.saturating_sub(payload.len());
+        }
         let (n, written) = match header {
             Some(header) => (
                 self.emit_parts(Kind::Data, &[&header, payload], out, now, push)?,
@@ -1054,14 +1106,14 @@ mod tests {
             let payload = [i; 600];
 
             let n = client
-                .data(&payload, &mut buf, 0, true)
+                .data(&payload, &mut buf, 0, true, Some(payload.len()))
                 .expect("client emits");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("server parses");
             assert_eq!(seg.payload, &payload[..], "client -> server");
             server.on_receive(&seg);
 
             let n = server
-                .data(&payload, &mut buf, 0, true)
+                .data(&payload, &mut buf, 0, true, Some(payload.len()))
                 .expect("server emits");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("client parses");
             assert_eq!(seg.payload, &payload[..], "server -> client");
@@ -1077,12 +1129,16 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [7u8; 600];
 
-        let n = client.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = client
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
         assert_eq!(seg.payload, &payload[..]);
         server.on_receive(&seg);
 
-        let n = server.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = server
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
         assert_eq!(seg.payload, &payload[..]);
     }
@@ -1099,7 +1155,9 @@ mod tests {
         let syn = parse_ipv4(&buf[..n]).expect("parse");
         assert_eq!(syn.window, IOS_15.syn_window);
 
-        let n = e.data(&[0u8; 100], &mut buf, 0, true).expect("data");
+        let n = e
+            .data(&[0u8; 100], &mut buf, 0, true, Some(100))
+            .expect("data");
         let data = parse_ipv4(&buf[..n]).expect("parse");
         let floor = IOS_15.window - IOS_15.window / 8;
         assert!(
@@ -1125,7 +1183,7 @@ mod tests {
         let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, LINUX_6));
         let mut ids = Vec::new();
         for i in 0..8u64 {
-            let packet = emitted(|b| e.data(b"x", b, i, true));
+            let packet = emitted(|b| e.data(b"x", b, i, true, Some(1)));
             ids.push(u16::from_be_bytes([packet[4], packet[5]]));
         }
         for w in ids.windows(2) {
@@ -1139,7 +1197,7 @@ mod tests {
             isn: CLIENT_ISN ^ 0x5555_5555,
             ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
         });
-        let packet = emitted(|b| other.data(b"x", b, 0, true));
+        let packet = emitted(|b| other.data(b"x", b, 0, true, Some(1)));
         assert_ne!(
             u16::from_be_bytes([packet[4], packet[5]]),
             ids[0],
@@ -1154,7 +1212,7 @@ mod tests {
         let mut e = Endpoint::new(cfg(Role::Initiator, Carrier::Midstream, IOS_15));
         let mut seen = std::collections::BTreeSet::new();
         for i in 0..64u64 {
-            let packet = emitted(|b| e.data(b"x", b, i, true));
+            let packet = emitted(|b| e.data(b"x", b, i, true, Some(1)));
             seen.insert(u16::from_be_bytes([packet[4], packet[5]]));
         }
         assert!(
@@ -1221,7 +1279,9 @@ mod tests {
         let mut hi = 0u16;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..2000 {
-            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+            let n = e
+                .data(&payload, &mut buf, 0, true, Some(payload.len()))
+                .expect("emit");
             let w = parse_ipv4(buf.get(..n).expect("emitted"))
                 .expect("parse")
                 .window;
@@ -1257,7 +1317,9 @@ mod tests {
         let payload = [0u8; 600];
 
         for _ in 0..16 {
-            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+            let n = e
+                .data(&payload, &mut buf, 0, true, Some(payload.len()))
+                .expect("emit");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
             assert!(
                 seg.window > 32_000,
@@ -1297,7 +1359,9 @@ mod tests {
 
         let mut seqs = Vec::new();
         for _ in 0..8 {
-            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+            let n = e
+                .data(&payload, &mut buf, 0, true, Some(payload.len()))
+                .expect("emit");
             let seg = parse_ipv4(buf.get(..n).expect("emitted")).expect("parse");
             seqs.push(seg.seq);
         }
@@ -1325,11 +1389,15 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
 
-        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = e
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let first = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .seq;
-        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = e
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let second = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .seq;
@@ -1352,14 +1420,18 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
 
-        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = e
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let before = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .ack;
 
         // Nothing arrives at all -- every inbound packet lost.
         for _ in 0..4 {
-            let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+            let n = e
+                .data(&payload, &mut buf, 0, true, Some(payload.len()))
+                .expect("emit");
             let ack = parse_ipv4(buf.get(..n).expect("emitted"))
                 .expect("parse")
                 .ack;
@@ -1375,11 +1447,15 @@ mod tests {
         let mut buf = [0u8; 2048];
         let payload = [0u8; 1000];
 
-        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = e
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let first = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .ack;
-        let n = e.data(&payload, &mut buf, 0, true).expect("emit");
+        let n = e
+            .data(&payload, &mut buf, 0, true, Some(payload.len()))
+            .expect("emit");
         let second = parse_ipv4(buf.get(..n).expect("emitted"))
             .expect("parse")
             .ack;
@@ -1428,7 +1504,7 @@ mod tests {
 
         // The initiator's first data segment carries the completing ACK, but an
         // explicit empty ACK is what a real stack sends first.
-        let n = c.data(b"", &mut buf, 2, true).expect("ack");
+        let n = c.data(b"", &mut buf, 2, true, Some(0)).expect("ack");
         let ack = parse_ipv4(&buf[..n]).expect("parse ack");
         s.on_receive(&ack);
     }
@@ -1458,7 +1534,7 @@ mod tests {
         assert_eq!(synack.ack, 1_000_001, "and acknowledges the SYN's one byte");
         c.on_receive(&synack);
 
-        let n = c.data(b"", &mut buf, 2, true).expect("ack");
+        let n = c.data(b"", &mut buf, 2, true, Some(0)).expect("ack");
         let ack = parse_ipv4(&buf[..n]).expect("parse");
         assert_eq!(ack.seq, 1_000_001, "past the SYN");
         assert_eq!(ack.ack, 9_000_001, "acknowledging the responder's SYN");
@@ -1472,7 +1548,7 @@ mod tests {
         let mut expected_seq = 1_000_001u32;
         for len in [1usize, 100, 1400, 7, 0, 512] {
             let payload = vec![0xAA; len];
-            let packet = emitted(|b| c.data(&payload, b, 10, true));
+            let packet = emitted(|b| c.data(&payload, b, 10, true, Some(payload.len())));
             let seg = parse_ipv4(&packet).expect("parse");
             assert_eq!(seg.seq, expected_seq, "payload of {len} bytes");
             expected_seq = expected_seq.wrapping_add(u32::try_from(len).expect("fits"));
@@ -1488,15 +1564,123 @@ mod tests {
         let mut expected_ack = 1_000_001u32;
         for len in [10usize, 250, 1400] {
             let payload = vec![0xBB; len];
-            let packet = emitted(|b| c.data(&payload, b, 10, true));
+            let packet = emitted(|b| c.data(&payload, b, 10, true, Some(payload.len())));
             let seg = parse_ipv4(&packet).expect("parse");
             s.on_receive(&seg);
             expected_ack = expected_ack.wrapping_add(u32::try_from(len).expect("fits"));
 
-            let reply = emitted(|b| s.data(b"", b, 11, true));
+            let reply = emitted(|b| s.data(b"", b, 11, true, Some(0)));
             let reply_seg = parse_ipv4(&reply).expect("parse");
             assert_eq!(reply_seg.ack, expected_ack);
         }
+    }
+
+    /// The signal this exists to remove: a record header at the start of every
+    /// segment of a bulk transfer, where a real session starts one in about
+    /// twelve.
+    #[test]
+    fn one_record_covers_a_burst_and_the_chain_stays_continuous() {
+        let mut c = Endpoint::new(Config {
+            records: true,
+            ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+        });
+        let payload = [7u8; 1400];
+        // Eleven packets in one burst, which is what fits in one record at
+        // this size, then a twelfth that has to start another.
+        let run: usize = 11 * payload.len();
+        let mut stream = Vec::new();
+        for i in 0..11u64 {
+            let open = (i == 0).then_some(run);
+            let packet = emitted(|b| c.data(&payload, b, i, i == 10, open));
+            let seg = parse_ipv4(&packet).expect("parse");
+            stream.extend_from_slice(seg.payload);
+            if i == 0 {
+                assert_eq!(
+                    seg.payload.len(),
+                    payload.len() + 5,
+                    "the first of a burst carries the header"
+                );
+                assert!(!c.at_record_boundary(), "and the record is still open");
+            } else {
+                assert_eq!(
+                    seg.payload.len(),
+                    payload.len(),
+                    "packet {i} carries no header"
+                );
+            }
+        }
+        assert!(c.at_record_boundary(), "eleven packets fill the record");
+
+        // The chain: walk it as an observer would, by lengths alone.
+        let mut at = 0usize;
+        let mut headers = 0;
+        while at + 5 <= stream.len() {
+            assert_eq!(&stream[at..at + 3], &[0x17, 0x03, 0x03], "at {at}");
+            let len = usize::from(u16::from_be_bytes([stream[at + 3], stream[at + 4]]));
+            assert!(len <= crate::cover::MAX_SPAN);
+            at += 5 + len;
+            headers += 1;
+        }
+        assert_eq!(at, stream.len(), "the lengths reach the end exactly");
+        assert_eq!(headers, 1, "one record for the whole burst");
+    }
+
+    /// A packet the caller decides not to send after asking for a record would
+    /// otherwise leave it short, and every header after it inside the record
+    /// before.
+    #[test]
+    fn a_burst_that_sends_less_than_it_promised_keeps_the_chain() {
+        let mut c = Endpoint::new(Config {
+            records: true,
+            ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+        });
+        let payload = [3u8; 500];
+        // Promised three packets, sent one; the next burst promises its own and
+        // is refused, because the record already open has to be finished first.
+        let packet = emitted(|b| c.data(&payload, b, 0, true, Some(3 * payload.len())));
+        assert_eq!(
+            parse_ipv4(&packet).expect("parse").payload.len(),
+            payload.len() + 5
+        );
+        assert!(!c.at_record_boundary());
+        let mut stream = parse_ipv4(&packet).expect("parse").payload.to_vec();
+        for i in 1..3u64 {
+            let next = emitted(|b| c.data(&payload, b, i, true, Some(payload.len())));
+            let seg = parse_ipv4(&next).expect("parse");
+            assert_eq!(seg.payload.len(), payload.len(), "no second header");
+            stream.extend_from_slice(seg.payload);
+        }
+        assert!(
+            c.at_record_boundary(),
+            "the record is finished by later packets"
+        );
+        let len = usize::from(u16::from_be_bytes([stream[3], stream[4]]));
+        assert_eq!(5 + len, stream.len(), "the one length reaches the end");
+    }
+
+    /// What the far end does with it, which is the half that decides whether a
+    /// spanning record is readable at all.
+    #[test]
+    fn a_continuation_is_not_mistaken_for_a_header() {
+        let mut c = Endpoint::new(Config {
+            records: true,
+            ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
+        });
+        let payload = [0x11u8; 1400];
+        let first = emitted(|b| c.data(&payload, b, 0, false, Some(2 * payload.len())));
+        let second = emitted(|b| c.data(&payload, b, 1, true, None));
+        let a = parse_ipv4(&first).expect("parse");
+        let b = parse_ipv4(&second).expect("parse");
+        assert_eq!(
+            crate::cover::unwrap_record(a.payload),
+            Some(&payload[..]),
+            "the header comes off the first"
+        );
+        assert_eq!(
+            crate::cover::unwrap_record(b.payload),
+            None,
+            "and nothing comes off the second"
+        );
     }
 
     #[test]
@@ -1507,12 +1691,12 @@ mod tests {
         for i in 0..500u32 {
             let payload = i.to_be_bytes();
 
-            let packet = emitted(|b| c.data(&payload, b, u64::from(i), true));
+            let packet = emitted(|b| c.data(&payload, b, u64::from(i), true, Some(payload.len())));
             let seg = parse_ipv4(&packet).expect("parse");
             assert_eq!(seg.seq, c.next_seq().wrapping_sub(4));
             s.on_receive(&seg);
 
-            let packet = emitted(|b| s.data(&payload, b, u64::from(i), true));
+            let packet = emitted(|b| s.data(&payload, b, u64::from(i), true, Some(payload.len())));
             let seg = parse_ipv4(&packet).expect("parse");
             c.on_receive(&seg);
         }
@@ -1533,7 +1717,7 @@ mod tests {
         connect(&mut c, &mut s);
 
         // The ISN plus the SYN's byte has already wrapped past zero.
-        let packet = emitted(|b| c.data(&[0u8; 100], b, 0, true));
+        let packet = emitted(|b| c.data(&[0u8; 100], b, 0, true, Some(100)));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.seq, u32::MAX.wrapping_add(1).wrapping_sub(5));
         s.on_receive(&seg);
@@ -1545,7 +1729,7 @@ mod tests {
         let mut c = client();
         let mut buf = vec![0u8; 2048];
         assert!(matches!(
-            c.data(b"too early", &mut buf, 0, true),
+            c.data(b"too early", &mut buf, 0, true, Some(b"too early".len())),
             Err(Error::NotEstablished)
         ));
     }
@@ -1575,12 +1759,12 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"hello", b, 12_345, true));
+        let packet = emitted(|b| c.data(b"hello", b, 12_345, true, Some(5)));
         let seg = parse_ipv4(&packet).expect("parse");
         let client_ts = seg.ts_val.expect("linux profile sends timestamps");
         s.on_receive(&seg);
 
-        let reply = emitted(|b| s.data(b"hi", b, 12_400, true));
+        let reply = emitted(|b| s.data(b"hi", b, 12_400, true, Some(b"hi".len())));
         let reply_seg = parse_ipv4(&reply).expect("parse");
         let opts_ecr = {
             // The echo is the second word of the timestamp option.
@@ -1597,12 +1781,12 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"", b, 50_000, true));
+        let packet = emitted(|b| c.data(b"", b, 50_000, true, Some(0)));
         let seg = parse_ipv4(&packet).expect("parse");
         let fresh = seg.ts_val.expect("timestamp");
         assert!(s.on_receive(&seg).is_none(), "empty payload yields nothing");
 
-        let reply = emitted(|b| s.data(b"x", b, 50_001, true));
+        let reply = emitted(|b| s.data(b"x", b, 50_001, true, Some(1)));
         let tcp = &reply[segment::IPV4_LEN..];
         let opts = &tcp[segment::TCP_LEN..];
         assert_eq!(
@@ -1615,7 +1799,7 @@ mod tests {
     fn the_timestamp_clock_does_not_start_at_zero() {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
-        let packet = emitted(|b| c.data(b"x", b, 0, true));
+        let packet = emitted(|b| c.data(b"x", b, 0, true, Some(1)));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.ts_val, Some(5_000), "ts_base offsets the clock");
     }
@@ -1628,7 +1812,7 @@ mod tests {
         let base = LINUX_6.window >> LINUX_6.window_scale.expect("linux scales");
         let mut seen = std::collections::BTreeSet::new();
         for i in 0..64u64 {
-            let packet = emitted(|b| c.data(b"x", b, i, true));
+            let packet = emitted(|b| c.data(b"x", b, i, true, Some(1)));
             let seg = parse_ipv4(&packet).expect("parse");
             seen.insert(seg.window);
             let w = u32::from(seg.window);
@@ -1703,7 +1887,8 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"before roaming", b, 0, true));
+        let packet =
+            emitted(|b| c.data(b"before roaming", b, 0, true, Some(b"before roaming".len())));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
         let seq_before = s.next_seq();
@@ -1721,7 +1906,7 @@ mod tests {
         assert_eq!(s.next_ack(), ack_before);
         assert_eq!(s.remote(), roamed);
 
-        let reply = emitted(|b| s.data(b"after roaming", b, 1, true));
+        let reply = emitted(|b| s.data(b"after roaming", b, 1, true, Some(b"after roaming".len())));
         let seg = parse_ipv4(&reply).expect("parse");
         assert_eq!(seg.dst, roamed, "and packets follow the peer");
         assert_eq!(seg.seq, seq_before);
@@ -1736,7 +1921,7 @@ mod tests {
         // A fresh responder that never saw a SYN has no sequence space to
         // reason about, so it must not fold the payload in.
         let mut fresh = server();
-        let packet = emitted(|b| c.data(b"orphan", b, 0, true));
+        let packet = emitted(|b| c.data(b"orphan", b, 0, true, Some(b"orphan".len())));
         let seg = parse_ipv4(&packet).expect("parse");
         assert!(fresh.on_receive(&seg).is_none());
         assert_eq!(fresh.next_ack(), None);
@@ -1748,7 +1933,7 @@ mod tests {
         connect(&mut c, &mut s);
 
         let payload = b"the inner packet";
-        let packet = emitted(|b| c.data(payload, b, 0, true));
+        let packet = emitted(|b| c.data(payload, b, 0, true, Some(payload.len())));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(s.on_receive(&seg), Some(&payload[..]));
     }
@@ -1759,7 +1944,7 @@ mod tests {
         let mut s = Endpoint::new(cfg(Role::Responder, Carrier::Handshake, WINDOWS_11));
         connect(&mut c, &mut s);
 
-        let packet = emitted(|b| c.data(b"x", b, 1234, true));
+        let packet = emitted(|b| c.data(b"x", b, 1234, true, Some(1)));
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.ts_val, None);
         assert!(s.on_receive(&seg).is_some());
@@ -1786,7 +1971,15 @@ mod tests {
         // already consistent.
         let (mut c, mut s) = midstream_pair();
 
-        let packet = emitted(|b| c.data(b"first ever packet", b, 0, true));
+        let packet = emitted(|b| {
+            c.data(
+                b"first ever packet",
+                b,
+                0,
+                true,
+                Some(b"first ever packet".len()),
+            )
+        });
         let seg = parse_ipv4(&packet).expect("parse");
         assert_eq!(seg.seq, CLIENT_ISN);
         assert_eq!(
@@ -1795,7 +1988,7 @@ mod tests {
         );
 
         s.on_receive(&seg);
-        let reply = emitted(|b| s.data(b"reply", b, 1, true));
+        let reply = emitted(|b| s.data(b"reply", b, 1, true, Some(b"reply".len())));
         let reply_seg = parse_ipv4(&reply).expect("parse");
         assert_eq!(reply_seg.seq, SERVER_ISN);
         assert_eq!(reply_seg.ack, CLIENT_ISN.wrapping_add(17));
@@ -1806,9 +1999,9 @@ mod tests {
         let (mut c, mut s) = midstream_pair();
         for i in 0..500u32 {
             let payload = i.to_be_bytes();
-            let packet = emitted(|b| c.data(&payload, b, u64::from(i), true));
+            let packet = emitted(|b| c.data(&payload, b, u64::from(i), true, Some(payload.len())));
             s.on_receive(&parse_ipv4(&packet).expect("parse"));
-            let reply = emitted(|b| s.data(&payload, b, u64::from(i), true));
+            let reply = emitted(|b| s.data(&payload, b, u64::from(i), true, Some(payload.len())));
             c.on_receive(&parse_ipv4(&reply).expect("parse"));
         }
         assert_eq!(c.next_ack(), Some(s.next_seq()));
@@ -1862,13 +2055,13 @@ mod tests {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
 
-        let first = emitted(|b| c.data(&[1u8; 200], b, 0, true));
+        let first = emitted(|b| c.data(&[1u8; 200], b, 0, true, Some(200)));
         s.on_receive(&parse_ipv4(&first).expect("parse"));
 
         // This one never arrives.
-        let _lost = emitted(|b| c.data(&[2u8; 300], b, 1, true));
+        let _lost = emitted(|b| c.data(&[2u8; 300], b, 1, true, Some(300)));
 
-        let third = emitted(|b| c.data(&[3u8; 100], b, 2, true));
+        let third = emitted(|b| c.data(&[3u8; 100], b, 2, true, Some(100)));
         s.on_receive(&parse_ipv4(&third).expect("parse"));
 
         assert_eq!(s.next_ack(), Some(c.next_seq()));
@@ -1877,8 +2070,8 @@ mod tests {
     #[test]
     fn a_reordered_segment_does_not_pull_the_acknowledgement_back() {
         let (mut c, mut s) = midstream_pair();
-        let early = emitted(|b| c.data(&[1u8; 500], b, 0, true));
-        let late = emitted(|b| c.data(&[2u8; 500], b, 1, true));
+        let early = emitted(|b| c.data(&[1u8; 500], b, 0, true, Some(500)));
+        let late = emitted(|b| c.data(&[2u8; 500], b, 1, true, Some(500)));
 
         s.on_receive(&parse_ipv4(&late).expect("parse"));
         let ack = s.next_ack();
@@ -1898,14 +2091,14 @@ mod tests {
             CLIENT_ISN.wrapping_add(50_000_000),
         ] {
             let (mut c, mut s) = midstream_pair();
-            let packet = emitted(|b| c.data(&[1u8; 100], b, 0, true));
+            let packet = emitted(|b| c.data(&[1u8; 100], b, 0, true, Some(100)));
             s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
             let mut fresh = Endpoint::new(Config {
                 isn: base,
                 ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
             });
-            let packet = emitted(|b| fresh.data(&[2u8; 100], b, 1, true));
+            let packet = emitted(|b| fresh.data(&[2u8; 100], b, 1, true, Some(100)));
             s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
             assert_eq!(s.next_ack(), Some(base.wrapping_add(100)), "base {base}");
@@ -1915,7 +2108,7 @@ mod tests {
     #[test]
     fn a_peer_at_a_new_address_is_learned_from_its_first_segment() {
         let (mut c, mut s) = midstream_pair();
-        let packet = emitted(|b| c.data(&[1u8; 100], b, 0, true));
+        let packet = emitted(|b| c.data(&[1u8; 100], b, 0, true, Some(100)));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
         // Close behind, so only the move explains taking it.
@@ -1925,7 +2118,7 @@ mod tests {
             ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
         });
         s.set_remote(moved.local);
-        let packet = emitted(|b| moved.data(&[2u8; 10], b, 1, true));
+        let packet = emitted(|b| moved.data(&[2u8; 10], b, 1, true, Some(10)));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
 
         assert_eq!(s.next_ack(), Some(moved.next_seq()));
@@ -1941,7 +2134,7 @@ mod tests {
             isn: CLIENT_ISN.wrapping_sub(5_000),
             ..cfg(Role::Initiator, Carrier::Midstream, LINUX_6)
         });
-        let packet = emitted(|b| stranger.data(&[1u8; 10], b, 0, true));
+        let packet = emitted(|b| stranger.data(&[1u8; 10], b, 0, true, Some(10)));
         s.on_receive(&parse_ipv4(&packet).expect("parse"));
         assert_eq!(s.next_ack(), Some(stranger.next_seq()));
     }
@@ -1958,7 +2151,7 @@ mod tests {
         assert!(c.wants_opening());
         assert!(!c.is_ready(), "nothing may go ahead of the SYN");
         assert!(matches!(
-            c.data(b"early", &mut buf, 0, true),
+            c.data(b"early", &mut buf, 0, true, Some(b"early".len())),
             Err(Error::NotEstablished)
         ));
 
@@ -1973,7 +2166,9 @@ mod tests {
         assert_eq!(c.handshake(&mut buf, 1).expect("again"), None);
         assert!(c.is_ready(), "and nothing waits for an answer");
 
-        let n = c.data(b"first", &mut buf, 2, true).expect("data");
+        let n = c
+            .data(b"first", &mut buf, 2, true, Some(b"first".len()))
+            .expect("data");
         let data = parse_ipv4(&buf[..n]).expect("parse");
         assert_eq!(data.seq, CLIENT_ISN, "the byte after the SYN");
         assert!(
@@ -1995,7 +2190,9 @@ mod tests {
         assert_eq!(synack.seq, SERVER_ISN.wrapping_sub(1));
         assert_eq!(synack.ack, CLIENT_ISN);
 
-        let n = s.data(b"reply", &mut buf, 1, true).expect("data");
+        let n = s
+            .data(b"reply", &mut buf, 1, true, Some(b"reply".len()))
+            .expect("data");
         assert_eq!(parse_ipv4(&buf[..n]).expect("parse").seq, SERVER_ISN);
     }
 
@@ -2007,7 +2204,7 @@ mod tests {
         let syn = parse_ipv4(&syn).expect("parse");
 
         // A responder that has moved on since the numbers were derived.
-        let _ = emitted(|b| s.data(&[0u8; 700], b, 0, true));
+        let _ = emitted(|b| s.data(&[0u8; 700], b, 0, true, Some(700)));
         let synack = emitted(|b| s.answer(syn.seq.wrapping_add(1), b, 1));
         c.on_receive(&parse_ipv4(&synack).expect("parse"));
 
@@ -2103,11 +2300,11 @@ mod tests {
         // The responder kept nothing, and takes up the connection from the
         // first segment the peer sends on it.
         let mut s = server();
-        let hello = emitted(|b| c.data(b"hello", b, 2, true));
+        let hello = emitted(|b| c.data(b"hello", b, 2, true, Some(5)));
         s.rejoin(&parse_ipv4(&hello).expect("parse"), 7_000);
         assert!(s.is_ready());
         assert_eq!(s.next_ack(), Some(CLIENT_ISN.wrapping_add(6)));
-        let reply = emitted(|b| s.data(b"hi", b, 3, true));
+        let reply = emitted(|b| s.data(b"hi", b, 3, true, Some(b"hi".len())));
         let reply = parse_ipv4(&reply).expect("parse");
         assert_eq!(reply.seq, 4_243, "the byte after the SYN+ACK it never kept");
         c.on_receive(&reply);
@@ -2180,9 +2377,9 @@ mod tests {
         c.on_receive(&synack);
 
         let mut s = server();
-        let hello = emitted(|b| c.data(b"hello", b, 1, true));
+        let hello = emitted(|b| c.data(b"hello", b, 1, true, Some(5)));
         s.rejoin(&parse_ipv4(&hello).expect("parse"), 7_000);
-        let reply = emitted(|b| s.data(&[0u8; 900], b, 2, true));
+        let reply = emitted(|b| s.data(&[0u8; 900], b, 2, true, Some(900)));
         c.on_receive(&parse_ipv4(&reply).expect("parse"));
         let ack = c.next_ack();
 
@@ -2194,7 +2391,15 @@ mod tests {
     fn a_peer_that_restarted_in_place_is_told_apart_by_its_acknowledgement() {
         let (mut c, mut s) = (client(), server());
         connect(&mut c, &mut s);
-        let current = emitted(|b| c.data(b"same connection", b, 0, true));
+        let current = emitted(|b| {
+            c.data(
+                b"same connection",
+                b,
+                0,
+                true,
+                Some(b"same connection".len()),
+            )
+        });
         assert!(!s.names_another_connection(&parse_ipv4(&current).expect("parse")));
 
         let reborn = segment::Segment {
@@ -2258,11 +2463,11 @@ mod tests {
             )
         });
         c.on_receive(&parse_ipv4(&synack).expect("parse"));
-        let hello = emitted(|b| c.data(b"hello", b, 20, true));
+        let hello = emitted(|b| c.data(b"hello", b, 20, true, Some(5)));
 
         let mut s = server();
         s.rejoin(&parse_ipv4(&hello).expect("parse"), 123_456);
-        let reply = emitted(|b| s.data(b"hi", b, 30, true));
+        let reply = emitted(|b| s.data(b"hi", b, 30, true, Some(b"hi".len())));
         assert_eq!(
             parse_ipv4(&reply).expect("parse").ts_val,
             Some(timestamp(123_456, 30, LINUX_6.ts_hz))
@@ -2276,7 +2481,7 @@ mod tests {
         let _ = c.handshake(&mut buf, 0).expect("syn");
         assert!(!c.is_ready());
         assert!(matches!(
-            c.data(b"early", &mut buf, 1, true),
+            c.data(b"early", &mut buf, 1, true, Some(b"early".len())),
             Err(Error::NotEstablished)
         ));
     }

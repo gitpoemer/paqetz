@@ -1052,9 +1052,10 @@ impl Wire {
         out: &mut [u8],
         now: Millis,
         push: bool,
+        record: Option<usize>,
     ) -> core::result::Result<usize, paqetz_tcpwire::Error> {
         match self {
-            Self::Tcp(c) => c.data(payload, out, now, push),
+            Self::Tcp(c) => c.data(payload, out, now, push, record),
             // No clock: nothing in a GRE header is a function of time. The
             // fake-TCP carrier needs one for its timestamp option.
             Self::Raw(c) => c.data(payload, out),
@@ -1075,6 +1076,16 @@ impl Wire {
             // No clock: nothing in a GRE header is a function of time. The
             // fake-TCP carrier needs one for its timestamp option.
             Self::Raw(c) => c.data(payload, out),
+        }
+    }
+
+    /// Whether the stream is between records, which is the only place a decoy
+    /// flight may be written: it is records of its own, and one written inside
+    /// another breaks the chain of lengths an observer follows.
+    fn at_record_boundary(&self) -> bool {
+        match self {
+            Self::Tcp(c) => c.at_record_boundary(),
+            Self::Raw(_) => true,
         }
     }
 
@@ -1711,7 +1722,14 @@ impl Tunnel {
         if state.cover_due == Cover::Nothing {
             return;
         }
-        if state.carrier.as_ref().is_none_or(|c| !c.is_ready()) {
+        if state
+            .carrier
+            .as_ref()
+            .is_none_or(|c| !c.is_ready() || !c.at_record_boundary())
+        {
+            // Mid-record: a flight written here would sit inside a record and
+            // break the chain of lengths. The next packet comes with the next
+            // boundary, which during a transfer is microseconds away.
             return;
         }
         let secrets = match cover_secrets() {
@@ -2284,6 +2302,33 @@ impl Tunnel {
                 }
             }
 
+            // One record per burst, which is what a session writing one record
+            // per application write looks like. A record header on every packet
+            // put one at the start of every segment of every bulk transfer,
+            // where a real session starts one in about twelve. Capped at what a
+            // record may declare, which is eleven packets at this MTU.
+            let mut opens = [None; sys::BATCH];
+            {
+                let mut at = 0usize;
+                while at < count {
+                    let mut total = 0usize;
+                    let mut end = at;
+                    while end < count {
+                        let n =
+                            lens.get(end).copied().unwrap_or(0) + paqetz_core::framing::OVERHEAD;
+                        if end > at && total + n > paqetz_tcpwire::cover::MAX_SPAN {
+                            break;
+                        }
+                        total += n;
+                        end += 1;
+                    }
+                    if let Some(slot) = opens.get_mut(at) {
+                        *slot = Some(total);
+                    }
+                    at = end.max(at.saturating_add(1));
+                }
+            }
+
             // Encrypt each into its own frame buffer, then send them together.
             dsts.clear();
             let mut inner_lens = [0usize; sys::BATCH];
@@ -2303,7 +2348,13 @@ impl Tunnel {
                 // the burst is this batch: the drain above took everything the
                 // device had queued, so the last of them is where a real
                 // stack's send buffer would have emptied.
-                match self.seal_into(packet, &mut sealed, frame, i + 1 == count) {
+                match self.seal_into(
+                    packet,
+                    &mut sealed,
+                    frame,
+                    i + 1 == count,
+                    opens.get(i).copied().flatten(),
+                ) {
                     Ok(Some((written, dst))) => {
                         if let Some(slot) = lens.get_mut(ready) {
                             *slot = written;
@@ -2407,7 +2458,10 @@ impl Tunnel {
     /// Encrypts one inner packet and transmits it immediately.
     fn send_inner(&self, packet: &[u8], sealed: &mut [u8], frame: &mut [u8]) -> Result<()> {
         // One packet on its own is the whole burst.
-        let Some((written, dst)) = self.seal_into(packet, sealed, frame, true)? else {
+        // One packet on its own is the whole burst, and a record of its own.
+        let sealed_len = packet.len() + paqetz_core::framing::OVERHEAD;
+        let Some((written, dst)) = self.seal_into(packet, sealed, frame, true, Some(sealed_len))?
+        else {
             return Ok(());
         };
         let Some(out) = frame.get(..written) else {
@@ -2423,13 +2477,16 @@ impl Tunnel {
     /// that is not up yet looks like from above.
     ///
     /// `push` says this is the last packet of the batch, which is where a real
-    /// stack's send buffer empties and so where it sets PSH.
+    /// stack's send buffer empties and so where it sets PSH. `record` opens an
+    /// application-data record of that many bytes, covering this packet and the
+    /// ones after it in the same burst.
     fn seal_into(
         &self,
         packet: &[u8],
         sealed: &mut [u8],
         frame: &mut [u8],
         push: bool,
+        record: Option<usize>,
     ) -> Result<Option<(usize, Ipv4Addr)>> {
         if !worth_carrying(packet) {
             return Ok(None);
@@ -2487,7 +2544,7 @@ impl Tunnel {
         // small packets, one per batch -- pushed on two segments in five, which
         // matches neither a bulk sender nor a client writing small frames.
         let push = push || !self.fills_a_segment(payload.len());
-        let written = carrier.data(payload, frame, now, push)?;
+        let written = carrier.data(payload, frame, now, push, record)?;
         let dst = *carrier.remote().ip();
 
         // Half of the liveness question -- but only for a packet carrying data.
@@ -3193,7 +3250,7 @@ impl Tunnel {
             return Ok(());
         };
 
-        let written = carrier.data(msg2, reply, now, true)?;
+        let written = carrier.data(msg2, reply, now, true, Some(msg2.len()))?;
 
         state.accept(session);
         state.pending = None;
@@ -3930,7 +3987,7 @@ impl Tunnel {
         let Some(carrier) = state.carrier.as_mut() else {
             return Ok(());
         };
-        let written = carrier.data(msg1, frame, now, true)?;
+        let written = carrier.data(msg1, frame, now, true, Some(msg1.len()))?;
         let dst = *peer.ip();
 
         state.pending = Some(initiator);

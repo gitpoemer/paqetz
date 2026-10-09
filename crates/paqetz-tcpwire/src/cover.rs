@@ -454,19 +454,31 @@ pub fn client_finished(secrets: &Secrets) -> Vec<u8> {
     out
 }
 
-/// The header that turns a payload into one application-data record.
+/// The largest a TLS 1.3 record declares.
+///
+/// The plaintext limit, a content type byte and the tag: what every
+/// implementation writes on a bulk transfer, and what a capture of one shows.
+pub const MAX_SPAN: usize = MAX_RECORD + 1 + 16;
+
+/// The header that opens an application-data record of `total` bytes.
 ///
 /// What a session sends after its handshake, and so what the tunnel's own
 /// packets wear once a decoy handshake has claimed to be one: without it the
 /// stream is a handshake followed by bytes that are not records at all, which
 /// anything parsing past the hello walks straight into.
 ///
-/// `None` for a payload too long to be a record, which nothing here produces:
-/// the MTU is a fifth of the limit.
+/// `total` is the whole record, which may be more than the packet carrying this
+/// header: a record spans as many packets as the sender had ready. One record
+/// per packet was what this did at first, and it put a record header at the
+/// start of every segment of every bulk transfer, where a real session starts
+/// one in about twelve. The reason it is safe to span is in
+/// [`unwrap_record`].
+///
+/// `None` for a record longer than one may be.
 #[must_use]
-pub fn record_header(payload_len: usize) -> Option<[u8; RECORD_HEADER]> {
-    let len = u16::try_from(payload_len).ok()?;
-    if payload_len > MAX_RECORD {
+pub fn record_header(total: usize) -> Option<[u8; RECORD_HEADER]> {
+    let len = u16::try_from(total).ok()?;
+    if total > MAX_SPAN {
         return None;
     }
     let [hi, lo] = len.to_be_bytes();
@@ -475,10 +487,24 @@ pub fn record_header(payload_len: usize) -> Option<[u8; RECORD_HEADER]> {
 
 /// The payload inside an application-data record, if that is what this is.
 ///
-/// Length-checked rather than type-checked alone, so a sealed packet that
-/// happens to begin with these three bytes is not unwrapped unless it also
-/// describes its own length exactly -- about one packet in a thousand billion,
-/// against a carrier that already tolerates loss.
+/// # Why a length that is merely plausible is enough
+///
+/// A record may span several packets, so the header on the first of them
+/// declares more than that packet carries and the packets after it carry no
+/// header at all. So this cannot ask for the length to match exactly, and the
+/// question becomes how often a packet carrying no header is mistaken for one
+/// that does.
+///
+/// A continuation packet is sealed bytes: a masked session index, a counter and
+/// ciphertext, all of it uniform. For it to be read as a header it must begin
+/// with these three bytes, which is one in sixteen million, and then declare a
+/// length between what it carries and the record limit, which is about one in
+/// four. Call it one packet in seventy million, and the cost of one is that
+/// packet, on a carrier that already tolerates loss. The old rule, that the
+/// length match to the byte, was one in a thousand billion and bought one
+/// record per packet: a record header at the start of every segment of every
+/// bulk transfer, which is not a thing a real session does and is visible to
+/// anything already parsing the records to read the server name.
 #[must_use]
 pub fn unwrap_record(payload: &[u8]) -> Option<&[u8]> {
     let (head, rest) = payload.split_at_checked(RECORD_HEADER)?;
@@ -492,7 +518,7 @@ pub fn unwrap_record(payload: &[u8]) -> Option<&[u8]> {
         head.get(3).copied()?,
         head.get(4).copied()?,
     ]));
-    (len == rest.len()).then_some(rest)
+    (len >= rest.len() && len <= MAX_SPAN).then_some(rest)
 }
 
 /// Whether this payload is one of these decoys rather than something to
