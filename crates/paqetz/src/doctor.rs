@@ -151,6 +151,8 @@ pub(crate) fn run(path: &Path) -> bool {
             findings.push(check_acknowledge(
                 t.interface.acknowledge,
                 t.interface.carrier_mss(),
+                t.interface.spoof_sni.is_some(),
+                matches!(t.interface.shape, crate::config::Shape::Tcp(c) if c.opens()),
             ));
         }
         // What the file asked for that it cannot quite have. Reported here as
@@ -640,20 +642,50 @@ fn check_datapath(
 /// answering two thousand segments with one data-less one, and a carrier
 /// advertising the profile's maximum segment size never came within twenty
 /// bytes of it. Neither needs payload inspection to see.
-fn check_acknowledge(acknowledge: bool, mss: u16) -> Finding {
-    if !acknowledge {
+///
+/// Whether the silence matters depends on whether anything is modelling the
+/// flow. A decoy handshake asks for the flow to be read as a TLS connection,
+/// and a SYN invites a middlebox to model the connection whether or not a decoy
+/// went with it; either way there is something an unacknowledged stream
+/// contradicts. A carrier that opens nothing and claims nothing has nothing to
+/// contradict, which is why the default follows the decoy.
+fn check_acknowledge(acknowledge: bool, mss: u16, decoy: bool, opens: bool) -> Finding {
+    if acknowledge {
+        return Finding::pass(
+            "receiver",
+            format!("acknowledging inbound data, advertising mss {mss}"),
+        );
+    }
+    if decoy {
         return Finding::warn(
             "receiver",
             format!(
-                "acknowledge is off: this end will answer inbound data with nothing, and                  advertises mss {mss}"
+                "acknowledge is off while spoof_sni is on: this end answers inbound data with \
+                 nothing, on a flow whose first packet asks to be read as a TLS connection. \
+                 Advertising mss {mss}"
             ),
-            "a receiver that never acknowledges is not a condition TCP has, and recognising              it needs no payload inspection. Drop `acknowledge = false` unless the packets              it saves are worth more than that"
+            "a receiver that never acknowledges is not a condition TCP has, and seeing it needs \
+             no payload inspection at all. Drop `acknowledge = false` unless the packets it \
+             saves are worth more than the decoy"
+                .to_owned(),
+        );
+    }
+    if opens {
+        return Finding::warn(
+            "receiver",
+            format!(
+                "acknowledge is off on a carrier that opens its connection: the SYN invites a \
+                 middlebox to model the flow, and an unacknowledged stream is what it would \
+                 then see. Advertising mss {mss}"
+            ),
+            "write acknowledge = true to answer inbound data, or carrier = \"midstream\" to \
+             stop inviting the flow to be modelled at all"
                 .to_owned(),
         );
     }
     Finding::pass(
         "receiver",
-        format!("acknowledging inbound data, advertising mss {mss}"),
+        format!("not acknowledging, which nothing here claims to be doing; advertising mss {mss}"),
     )
 }
 

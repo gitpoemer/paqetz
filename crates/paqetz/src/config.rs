@@ -136,12 +136,17 @@ pub(crate) struct Interface {
     pub(crate) spoof_records: bool,
     /// Whether this end answers inbound data with acknowledgements of its own.
     ///
-    /// On by default, because a receiver that never acknowledges is not a
-    /// condition TCP has: a capture of a bulk transfer showed one side sending
-    /// two thousand segments and the other answering with a single data-less
-    /// one, which anything tracking the flow can see without reading a byte of
-    /// payload. The cost is one small packet per couple of inbound ones in the
-    /// direction that is otherwise idle, which is what a real receiver costs.
+    /// A receiver that never acknowledges is not a condition TCP has: a capture
+    /// of a bulk transfer showed one side sending two thousand segments and the
+    /// other answering with a single data-less one, which anything tracking the
+    /// flow can see without reading a byte of payload.
+    ///
+    /// On by default wherever `spoof_sni` is, and off otherwise. The decoy is
+    /// what claims this flow is a TLS connection somebody should recognise, and
+    /// a claim like that is worth making coherently; without it the flow claims
+    /// nothing, and the packets are better spent carrying traffic. The cost is
+    /// one small packet per few inbound ones in whichever direction is
+    /// otherwise idle, which is what a real receiver costs.
     pub(crate) acknowledge: bool,
     /// Whether inbound packets are grouped into one write per run.
     ///
@@ -1820,6 +1825,10 @@ impl Config {
             });
         }
         let spoof_records = iface.spoof_records.unwrap_or(spoof_sni.is_some());
+        // Both follow the decoy for the same reason: it is the decoy that
+        // claims this flow is a connection somebody should recognise, and a
+        // claim like that is worth making coherently or not at all.
+        let acknowledge = iface.acknowledge.unwrap_or(spoof_sni.is_some());
         if spoof_records && spoof_sni.is_none() {
             return Err(invalid(
                 "interface.spoof_records",
@@ -2156,7 +2165,7 @@ impl Config {
                 sequencing,
                 spoof_sni,
                 spoof_records,
-                acknowledge: iface.acknowledge.unwrap_or(true),
+                acknowledge,
                 coalesce,
                 notes,
                 datapath,
@@ -2529,12 +2538,29 @@ mod tests {
     }
 
     #[test]
-    fn acknowledging_is_on_unless_it_is_turned_off() {
-        // On by default: a receiver that never acknowledges is not a condition
-        // TCP has, and seeing that needs no payload inspection at all.
-        assert!(with_interface("").expect("parses").interface.acknowledge);
+    fn acknowledging_follows_the_decoy_unless_it_is_asked_for() {
+        // The decoy is what claims the flow is a TLS connection, and a receiver
+        // that never acknowledges contradicts the claim in a way that needs no
+        // payload inspection to see. Without the claim there is nothing to
+        // contradict, and the packets are better spent on traffic.
+        let decoy = "carrier = \"handshake\"\nspoof_sni = \"www.example.com\"";
         assert!(
-            !with_interface("acknowledge = false")
+            with_interface(decoy).expect("parses").interface.acknowledge,
+            "on with the decoy"
+        );
+        assert!(
+            !with_interface("").expect("parses").interface.acknowledge,
+            "off without it"
+        );
+        // And either way, what the file says wins.
+        assert!(
+            !with_interface(&format!("{decoy}\nacknowledge = false"))
+                .expect("parses")
+                .interface
+                .acknowledge
+        );
+        assert!(
+            with_interface("acknowledge = true")
                 .expect("parses")
                 .interface
                 .acknowledge
